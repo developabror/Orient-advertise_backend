@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logback configuration. Picks up at startup before Spring beans wire — that's why the
+  TelegramAppender uses a static buffer: events emitted between Logback init and bot
+  registration are captured and replayed once the forwarder is running.
+-->
+<configuration>
+
+    <!-- Reuse Spring Boot's default console pattern + colored encoder so dev output stays the same. -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+
+    <!--
+      Telegram appender: buffers WARN+ events; the Spring-managed TelegramLogForwarder
+      drains the buffer once the bot is registered. The ThresholdFilter is a hard
+      WARN floor — INFO/DEBUG are dropped before any work happens, even though the
+      appender's append() method also re-checks defensively.
+    -->
+    <appender name="TELEGRAM" class="uz.orientadvertise.services.infra.telegram.TelegramAppender">
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="TELEGRAM"/>
+    </root>
+
+    <!-- Quiet known-noisy frameworks down at WARN to avoid filling the bot buffer. -->
+    <logger name="org.springframework" level="INFO"/>
+    <logger name="org.hibernate" level="WARN"/>
+    <logger name="com.zaxxer.hikari" level="INFO"/>
+    <!--
+      Defense-in-depth: also raise the threshold for the Telegram client itself and our
+      telegram subsystem to ERROR. The appender filters by package prefix anyway, but if
+      a future maintainer toggles the prefix list, this floor still blocks the recursion.
+    -->
+    <logger name="org.telegram" level="ERROR"/>
+    <logger name="uz.orientadvertise.services.infra.telegram" level="WARN"/>
+
+</configuration>

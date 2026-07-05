@@ -1,0 +1,57 @@
+# Build outputs — pulled in fresh by the Dockerfile compile step.
+**/build/
+**/.gradle/
+.gradle/
+
+# Tests inside Docker run against a fresh DB anyway; their artifacts have no place in
+# the image context.
+**/build/test-results/
+**/build/reports/
+
+# Version control history. The Dockerfile doesn't read git metadata.
+.git/
+.gitignore
+.gitattributes
+
+# IDE noise.
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS noise.
+.DS_Store
+Thumbs.db
+
+# Local logs / runtime artifacts that can grow into hundreds of MB.
+logs/
+*.log
+
+# Local environment files — must NEVER ship in an image.
+.env
+.env.*
+!.env.example
+
+# Docker / compose files: the build doesn't need them either.
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
+
+# Documentation that bloats context without affecting the build.
+*.md
+!README.md
+
+# Editor swap files.
+*.swp
+*.swo
+*~
+
+# Python / node detritus that shouldn't be here but if it is, skip it.
+__pycache__/
+node_modules/
+
+# Saved jar and tar artifacts at the root.
+*.jar
+*.tar
+*.zip

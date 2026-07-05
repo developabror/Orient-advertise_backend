@@ -1,0 +1,114 @@
+package uz.orientadvertise.services.domain.repository;
+
+import java.time.Instant;
+import java.util.List;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import uz.orientadvertise.services.domain.model.ContentAssignment;
+
+public interface ContentAssignmentRepository extends JpaRepository<ContentAssignment, Long> {
+
+    @Query("SELECT ca FROM ContentAssignment ca " +
+           "WHERE ca.targetType = :targetType AND ca.targetId = :targetId " +
+           "AND ca.deletedAt IS NULL " +
+           "AND ca.status = 'CONFIRMED' " +
+           "AND ca.startTime < :end AND ca.endTime > :start")
+    List<ContentAssignment> findOverlapping(
+            @Param("targetType") ContentAssignment.TargetType targetType,
+            @Param("targetId") Long targetId,
+            @Param("start") Instant start,
+            @Param("end") Instant end);
+
+    @Query("SELECT ca FROM ContentAssignment ca " +
+           "WHERE ca.targetType = :targetType AND ca.targetId = :targetId " +
+           "AND ca.deletedAt IS NULL " +
+           "AND ca.status = 'CONFIRMED' " +
+           "AND ca.startTime < :end AND ca.endTime > :start " +
+           "AND ca.id <> :excludeId")
+    List<ContentAssignment> findOverlappingExcluding(
+            @Param("targetType") ContentAssignment.TargetType targetType,
+            @Param("targetId") Long targetId,
+            @Param("start") Instant start,
+            @Param("end") Instant end,
+            @Param("excludeId") Long excludeId);
+
+    List<ContentAssignment> findByTargetTypeAndTargetIdAndDeletedAtIsNull(
+            ContentAssignment.TargetType targetType, Long targetId);
+
+    @Query("SELECT ca FROM ContentAssignment ca " +
+           "WHERE ca.deletedAt IS NULL " +
+           "AND ca.status = 'CONFIRMED' " +
+           "AND ca.startTime <= :now AND ca.endTime > :now " +
+           "ORDER BY ca.priority DESC")
+    List<ContentAssignment> findActiveAtTime(@Param("now") Instant now);
+
+    /**
+     * Active assignments that reference a specific playlist. Drives the playlist-
+     * mutation instant-push path ({@code PlaylistReorderedSyncPushListener}) — when
+     * an operator edits a playlist, every device currently bound to it via an
+     * active assignment should receive a SYNC notification within ~1s. Mirrors
+     * {@link #findActiveAtTime} (time-window predicate) and
+     * {@link #countActiveAssignmentsByPlaylistId} (playlist filter).
+     */
+    @Query("SELECT ca FROM ContentAssignment ca " +
+           "WHERE ca.playlist.id = :playlistId " +
+           "AND ca.deletedAt IS NULL " +
+           "AND ca.status = 'CONFIRMED' " +
+           "AND ca.startTime <= :now AND ca.endTime > :now")
+    List<ContentAssignment> findActiveByPlaylistId(@Param("playlistId") Long playlistId,
+                                                    @Param("now") Instant now);
+
+    @Query("SELECT ca FROM ContentAssignment ca " +
+           "WHERE ca.status = 'DRAFT' " +
+           "AND ca.deletedAt IS NULL " +
+           "AND ca.createdAt < :threshold")
+    List<ContentAssignment> findExpiredDrafts(@Param("threshold") Instant threshold);
+
+    /**
+     * Count of <i>active</i> assignments referencing a playlist. "Active" here means
+     * neither {@code DRAFT} (not yet committed) nor {@code CANCELLED} (logically gone)
+     * and not soft-deleted. Drives the 409 guard from {@code DELETE /api/playlists/{id}} —
+     * removing a playlist that an in-flight assignment relies on would silently break
+     * scheduled playback, so the API refuses and the operator must cancel the assignments
+     * first.
+     */
+    @Query("SELECT COUNT(ca) FROM ContentAssignment ca " +
+           "WHERE ca.playlist.id = :playlistId " +
+           "AND ca.deletedAt IS NULL " +
+           "AND ca.status NOT IN ('DRAFT', 'CANCELLED')")
+    long countActiveAssignmentsByPlaylistId(@Param("playlistId") Long playlistId);
+
+    /**
+     * Count of CONFIRMED, non-soft-deleted assignments targeting a specific device
+     * group. Drives the 409 guard from {@code DELETE /api/device-groups/{id}}: deleting
+     * a group still wired to a confirmed assignment would leave the assignment dangling
+     * (its target id no longer resolves), so the API refuses and the operator must
+     * retarget or cancel the assignment first.
+     *
+     * <p>{@code DRAFT} assignments don't count — they're not yet committed and the
+     * operator can revise them. {@code CANCELLED} assignments don't count — they're
+     * logically gone.
+     */
+    @Query("SELECT COUNT(ca) FROM ContentAssignment ca " +
+           "WHERE ca.targetType = 'DEVICE_GROUP' " +
+           "AND ca.targetId = :deviceGroupId " +
+           "AND ca.status = 'CONFIRMED' " +
+           "AND ca.deletedAt IS NULL")
+    long countConfirmedAssignmentsForDeviceGroup(@Param("deviceGroupId") Long deviceGroupId);
+
+    /**
+     * Count of CONFIRMED, non-soft-deleted assignments targeting a specific facility.
+     * Drives the 409 guard from {@code DELETE /api/facilities/{id}} — same pattern as
+     * {@link #countConfirmedAssignmentsForDeviceGroup}, mutatis mutandis. {@code DRAFT}
+     * (not yet committed) and {@code CANCELLED} (logically gone) assignments do not
+     * count.
+     */
+    @Query("SELECT COUNT(ca) FROM ContentAssignment ca " +
+           "WHERE ca.targetType = 'FACILITY' " +
+           "AND ca.targetId = :facilityId " +
+           "AND ca.status = 'CONFIRMED' " +
+           "AND ca.deletedAt IS NULL")
+    long countConfirmedAssignmentsForFacility(@Param("facilityId") Long facilityId);
+}

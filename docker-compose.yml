@@ -1,0 +1,138 @@
+# Host-side port mappings are bumped off the defaults so this compose file works on a
+# developer machine that already runs Postgres / Redis / MinIO / a Spring app locally.
+# Container-internal ports stay at the canonical defaults (5432, 6379, 9000, 9001, 8080)
+# and the `app` service connects over the docker network using those defaults — nothing
+# inside the network changed, only the *host* port mappings.
+#
+# Defaults are in the high-numbered range (15000–19999) — far above the well-known
+# Postgres/Redis/MinIO defaults that are typically already in use on a dev box.
+#
+# Override any port without editing this file via a `.env` file (auto-loaded by compose)
+# or shell exports. Copy `.env.example` to `.env` as a starting point. Defaults below
+# match the `.env.example` block — only override when even those collide:
+#
+#   POSTGRES_HOST_PORT=15432
+#   REDIS_HOST_PORT=16379
+#   MINIO_HOST_PORT=19000
+#   MINIO_CONSOLE_HOST_PORT=19001
+#   APP_HOST_PORT=8080
+#
+# Compose's ${VAR:-default} expansion picks the env value when set; otherwise the
+# safe high-numbered fallback below.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "${MINIO_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+#    image: developabror/orient-advertise-backend:1.0.0
+    build: .
+    ports:
+      - "${APP_HOST_PORT:-8080}:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # JWT signing secret — MUST be ≥32 bytes. The prod profile has NO fallback, so the
+      # app fails fast at startup if it's missing. Supplied from the host `.env` only
+      # (never hard-coded here). The `:?` makes `docker compose up` abort with this
+      # message if JWT_SECRET is unset. Generate one with: openssl rand -base64 48
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET must be set in .env (>=32 bytes, e.g. openssl rand -base64 48)}"
+      # Internal docker-network hostnames + container ports — unaffected by the host
+      # port remapping above. Do NOT change these unless you also rewire the network.
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: appdb
+      DB_USERNAME: appuser
+      DB_PASSWORD: apppass
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      MINIO_URL: http://minio:9000
+      # Endpoint embedded in presigned URLs returned to browsers / TV-Box players. The
+      # backend talks to MinIO over the docker network (MINIO_URL above), but clients
+      # outside the network can't resolve "minio" — they need the host-published port
+      # (MINIO_HOST_PORT, default 9000). Override via .env to match a deployed hostname.
+      MINIO_PUBLIC_URL: "${MINIO_PUBLIC_URL:-http://localhost:${MINIO_HOST_PORT:-9000}}"
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_PRESIGNED_EXPIRY: 120
+      # Swagger UI lockdown — prod profile requires ROLE_ADMIN by default. Override to
+      # false for local docker so you can browse /swagger-ui.html anonymously.
+      # Re-enable in real production deployments by removing this line.
+      APP_OPENAPI_ADMIN_ONLY: "false"
+      # Local-development seed data — pre-registers N fake Android TV devices on boot
+      # so content-assignment flows can be exercised without a real TV-Box. Override
+      # via `.env` (APP_SEED_ENABLED=false) to disable. NEVER ship to real production.
+      APP_SEED_ENABLED: "${APP_SEED_ENABLED:-true}"
+      APP_SEED_DEVICE_COUNT: "${APP_SEED_DEVICE_COUNT:-5}"
+      # Telegram bot — disabled by default. To enable, set TELEGRAM_BOT_ENABLED=true
+      # and TELEGRAM_BOT_TOKEN=<token-from-BotFather> in your `.env` file (NOT here).
+      # The token is loaded from the host env only — never commit a real value.
+      TELEGRAM_BOT_ENABLED: "${TELEGRAM_BOT_ENABLED:-false}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_BOT_USERNAME: "${TELEGRAM_BOT_USERNAME:-}"
+      # Comma-separated chat ids that are allowed to BOTH receive notifications AND
+      # send commands. Empty means "no chats authorized" — the bot still boots, but
+      # every send becomes a no-op. See `application.yml` telegram.bot.authorized-chat-ids.
+      TELEGRAM_BOT_AUTHORIZED_CHAT_IDS: "${TELEGRAM_BOT_AUTHORIZED_CHAT_IDS:-}"
+      # Password-management email (Gmail SMTP) — disabled by default. To enable, set
+      # APP_MAIL_ENABLED=true plus MAIL_USERNAME / MAIL_PASSWORD (a Gmail App Password) and
+      # APP_MAIL_FROM in your `.env` file (NOT here). APP_FRONTEND_BASE_URL is the SPA origin
+      # the emailed reset link points at. Secrets are loaded from the host env only.
+      APP_MAIL_ENABLED: "${APP_MAIL_ENABLED:-false}"
+      MAIL_USERNAME: "${MAIL_USERNAME:-}"
+      MAIL_PASSWORD: "${MAIL_PASSWORD:-}"
+      APP_MAIL_FROM: "${APP_MAIL_FROM:-}"
+      APP_MAIL_FROM_NAME: "${APP_MAIL_FROM_NAME:-Orient Advertise}"
+      APP_FRONTEND_BASE_URL: "${APP_FRONTEND_BASE_URL:-http://localhost:5173}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  miniodata:

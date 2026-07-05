@@ -1,0 +1,8 @@
+dependencies {
+    api project(':common')
+    api 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'jakarta.validation:jakarta.validation-api'
+    // Swagger annotations only — used for OpenAPI metadata on enums and entities that
+    // surface through the API. No runtime dependency on the swagger libraries.
+    implementation 'io.swagger.core.v3:swagger-annotations:2.2.25'
+}

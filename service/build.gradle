@@ -1,0 +1,17 @@
+dependencies {
+    implementation project(':domain')
+    implementation project(':infra')
+    implementation project(':common')
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    // BCrypt password hashing/verification (AuthService). Standalone crypto module — does
+    // not pull in spring-security-web; the full security chain lives in the api module.
+    implementation 'org.springframework.security:spring-security-crypto'
+    // SecurityContextHolder + Authentication for OperatorScopeResolver — the operator project
+    // scope is resolved in the service layer from the JWT principal. Core only (no web chain).
+    implementation 'org.springframework.security:spring-security-core'
+    // Jackson for ASSIGN_CONTENT payload validation in BulkRemoteActionService — the
+    // service parses the FE-supplied JSON to extract playlistId before iterating devices.
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+    implementation 'org.apache.poi:poi-ooxml:5.3.0'
+}

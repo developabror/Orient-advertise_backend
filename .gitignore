@@ -1,0 +1,43 @@
+# --- Gradle ---
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+# --- IDE: IntelliJ IDEA ---
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# --- IDE: Eclipse / VS Code ---
+.classpath
+.project
+.settings/
+bin/
+.vscode/
+
+# --- Java / OS ---
+*.class
+*.log
+.DS_Store
+Thumbs.db
+
+# --- Spring Boot ---
+HELP.md
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# --- Local env / secrets ---
+# Match a bare `.env` (which `*.env` does NOT) so a developer can't accidentally
+# commit a real Telegram token, MinIO key, or DB password.
+.env
+.env.*
+!.env.example
+*.env
+application-local.yml
+application-local.properties

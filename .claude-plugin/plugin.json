@@ -1,0 +1,11 @@
+{
+  "name": "spring-boot-plugin",
+  "description": "Complete Spring Boot development template with agents, skills, and best practices for enterprise Java applications. Includes JPA patterns, code quality checks, and Spring Boot 3.x support.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Abror Abduganiev"
+  },
+  "repository": "https://github.com/developabror/Orient-advertise-backend",
+  "keywords": ["spring-boot", "java", "maven", "enterprise", "jpa", "testing", "spring"],
+  "license": "Apache-2.0"
+}

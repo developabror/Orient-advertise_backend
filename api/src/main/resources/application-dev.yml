@@ -1,0 +1,40 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:devdb;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+    hikari:
+      pool-name: dev-pool
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 5000
+      idle-timeout: 300000
+      max-lifetime: 600000
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+  h2:
+    console:
+      enabled: true
+  flyway:
+    locations: classpath:db/migration
+  # Redis intentionally NOT redeclared here — the base application.yml binds it from
+  # ${REDIS_HOST:localhost} / ${REDIS_PORT:6379}, which works for both bare-machine
+  # dev (env unset → localhost) AND docker-compose (env set → "redis" service).
+
+app:
+  error:
+    include-stacktrace: true
+  # Mail stays disabled in dev (No-Op sender). log-reset-link=true makes the No-Op sender print
+  # the full reset URL at INFO so the forgot/reset flow is testable locally without SMTP.
+  mail:
+    log-reset-link: true
+  # Dev-only JWT secret so local boot works without setting JWT_SECRET. The base
+  # application.yml no longer carries a default — never use this value in production.
+  jwt:
+    secret: ${JWT_SECRET:dev-only-jwt-secret-not-for-production-use!!}
+  seed:
+    enabled: true
+    device-count: 5

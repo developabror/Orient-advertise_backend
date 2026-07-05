@@ -1,0 +1,9 @@
+DROP INDEX IF EXISTS idx_remote_action_device_type_status;
+DROP INDEX IF EXISTS idx_remote_action_expires;
+DROP INDEX IF EXISTS idx_remote_action_status;
+DROP INDEX IF EXISTS idx_remote_action_device;
+DROP TABLE IF EXISTS remote_action;
+DROP INDEX IF EXISTS idx_entity_audit_changed_by;
+DROP INDEX IF EXISTS idx_entity_audit_changed_at;
+DROP INDEX IF EXISTS idx_entity_audit_entity;
+DROP TABLE IF EXISTS entity_audit_log;

@@ -1,0 +1,207 @@
+spring:
+  application:
+    name: Orient-advertise-backend
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    show-sql: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    fail-on-missing-locations: true
+    baseline-on-migrate: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000
+  # Gmail SMTP for password-reset / changed-notice email. Secrets default to empty (mirrors
+  # the Telegram block's discipline) — supplied via env only. The password is a 16-char Gmail
+  # App Password, NEVER the account password. The sender is wired only when app.mail.enabled=true.
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:}          # the Gmail address
+    password: ${MAIL_PASSWORD:}          # 16-char Gmail App Password (NOT the account password)
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+
+app:
+  cache:
+    session-ttl-minutes: 30
+    token-ttl-minutes: 60
+  jwt:
+    # No inline default: a blank/short secret fails startup (JwtTokenProvider). Prod sets
+    # JWT_SECRET (≥32 bytes); dev uses application-dev.yml; tests use application-test.yml.
+    secret: ${JWT_SECRET:}
+    access-token-expiry-minutes: 15
+    refresh-token-expiry-days: 7
+    # SameSite policy on the refresh_token cookie. Strict (default) works when FE
+    # and API share a registrable domain. Switch to None for cross-site under TLS —
+    # the cookie's Secure flag is always on, so plain HTTP will not deliver it.
+    # Lax is rarely the right answer for an auth cookie; pick Strict or None.
+    refresh-cookie-samesite: ${REFRESH_COOKIE_SAMESITE:Strict}
+  playback:
+    max-clock-skew-seconds: 30
+  sync:
+    # Cap on the device-id set published to AssignmentConfirmedSyncPushListener
+    # when an assignment is confirmed. Targets larger than this fall back to the
+    # heartbeat-poll path for the remainder — same fallback offline devices use,
+    # so no information is lost, only latency. Defaults to 5000.
+    push-on-confirm-cap: ${APP_SYNC_PUSH_ON_CONFIRM_CAP:5000}
+    # Synchronized multi-device playback (Variant A) — coordinated cut-over timing.
+    # activation-min-lead: how far ahead of "now" the shared activateAt (== loop anchor) is set when
+    #   a content version is first activated. Devices download during this lead and flip together.
+    # activation-max-lead-cap: bounds the readiness poll's look-back window (a straggler past this
+    #   still joins at the live position). ISO-8601 Durations, mirroring the @Scheduled poll style.
+    activation-min-lead: ${APP_SYNC_ACTIVATION_MIN_LEAD:PT2M}
+    activation-max-lead-cap: ${APP_SYNC_ACTIVATION_MAX_LEAD_CAP:PT15M}
+    activation-poll-interval: ${APP_SYNC_ACTIVATION_POLL_INTERVAL:PT1M}
+  device:
+    # Region id used when a TV-Box self-registers without knowing its placement.
+    # Defaults to -1, the "Unassigned" sentinel seeded by V13__device_registration.
+    # If this row is missing at registration time the service lazily re-seeds it,
+    # so the first registration never fails on missing seed data. Override via
+    # APP_DEVICE_DEFAULT_REGION_ID only when pointing at a real region id that
+    # already exists in the target database.
+    default-region-id: ${APP_DEVICE_DEFAULT_REGION_ID:-1}
+  content:
+    # On startup, backfill size+checksum for legacy READY files that predate checksum
+    # recording (transcoded before the metadata was captured). Idempotent and self-completing
+    # — only matches files with a null checksum, streams each stored object once to derive its
+    # true size + SHA-256, never re-transcodes. Set false to disable (e.g. very large libraries).
+    reconcile-on-startup: ${APP_CONTENT_RECONCILE_ON_STARTUP:true}
+  minio:
+    # Backend ↔ MinIO endpoint. In docker-compose this is the in-network hostname
+    # (http://minio:9000); on a bare dev box it's http://localhost:9000.
+    url: ${MINIO_URL:http://localhost:9000}
+    # Endpoint baked into presigned URLs handed to browsers / TV-Box players. Must be
+    # reachable from THOSE clients, not from the backend. Leave unset to reuse `url`
+    # (correct when backend and clients share a network); set to e.g.
+    # http://localhost:9000 when the backend runs in docker and clients run on the host.
+    public-url: ${MINIO_PUBLIC_URL:}
+    # Preconfigure the S3 region on the MinIO clients. MinIO defaults to us-east-1.
+    # If unset, the SDK probes the endpoint to discover the region on first use —
+    # that probe runs against `public-url` for the presign client and breaks when
+    # the public URL isn't reachable from the backend (the typical docker case).
+    region: ${MINIO_REGION:us-east-1}
+    access-key: ${MINIO_ACCESS_KEY:minioadmin}
+    secret-key: ${MINIO_SECRET_KEY:minioadmin}
+    buckets:
+      - uploads
+      - content-raw
+      - content-processed
+      - content-thumbnails
+    presigned-url-expiry-minutes: ${MINIO_PRESIGNED_EXPIRY:60}
+    raw-bucket: content-raw
+    # Stays in sync with FileStorageService.thumbnailBucket — overridable per env if
+    # the bucket name differs (e.g. multi-tenant deployment).
+    thumbnail-bucket: ${MINIO_THUMBNAIL_BUCKET:content-thumbnails}
+    orphan-cleanup-after-hours: 24
+  error:
+    include-stacktrace: false
+  # Password-management email (Gmail SMTP). Disabled by default — when off, a No-Op sender is
+  # wired and no SMTP socket opens. Enable per environment with APP_MAIL_ENABLED=true and supply
+  # APP_MAIL_FROM (usually identical to MAIL_USERNAME). log-reset-link logs the reset URL at INFO
+  # for dev only (NEVER set true in prod — it would leak live reset links into the logs).
+  mail:
+    enabled: ${APP_MAIL_ENABLED:false}
+    from: ${APP_MAIL_FROM:}                       # usually identical to MAIL_USERNAME
+    from-name: ${APP_MAIL_FROM_NAME:Orient Advertise}
+    reset-token-ttl-minutes: ${APP_MAIL_RESET_TTL_MINUTES:30}
+    log-reset-link: ${APP_MAIL_LOG_RESET_LINK:false}
+  # SPA origin used to build the emailed reset link (${base-url}/reset-password?token=...).
+  frontend:
+    base-url: ${APP_FRONTEND_BASE_URL:http://localhost:5173}
+  auth:
+    # Forgot-password throttle (PasswordResetRateLimiter): per-IP and per-email caps per window.
+    forgot-max-per-window: ${APP_FORGOT_MAX_PER_WINDOW:5}
+    forgot-max-per-email: ${APP_FORGOT_MAX_PER_EMAIL:3}
+    forgot-window-minutes: ${APP_FORGOT_WINDOW_MINUTES:15}
+    reset-max-per-window: ${APP_RESET_MAX_PER_WINDOW:10}
+  # Local-development seed data. Default OFF — opt in per environment by setting
+  # APP_SEED_ENABLED=true (or app.seed.enabled in a profile). When enabled, the
+  # FakeDeviceSeeder inserts N pre-registered Android TV devices on boot so the
+  # operator can exercise content-assignment flows without a real TV-Box. The
+  # seeder is idempotent: serials use a deterministic prefix and existing rows
+  # are left untouched.
+  seed:
+    enabled: ${APP_SEED_ENABLED:false}
+    device-count: ${APP_SEED_DEVICE_COUNT:5}
+  cors:
+    # Allowed FE origins for HTTP CORS preflights. Default lists the FE dev servers
+    # (Vite default + CRA default). Production overrides via application-prod.yml or
+    # the APP_CORS_ALLOWED_ORIGINS env var. WebSocket endpoints are NOT subject to
+    # this — they enforce Origin checks at handshake separately.
+    allowed-origins:
+      - http://localhost:5173
+      - http://localhost:3000
+
+spring.servlet.multipart:
+  max-file-size: 50MB
+  max-request-size: 50MB
+
+# Pagination is 0-indexed (Spring default): ?page=0 returns the first page. The FE
+# converts its 1-based UI page numbers to 0-based on the wire (page - 1) — that
+# contract is owned by the FE, the wire stays 0-based to keep things idiomatic with
+# the rest of Spring Data.
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,flyway
+  health:
+    # The auto-configured mail health indicator opens a LIVE SMTP connection to Gmail on every
+    # /actuator/health call (the public liveness probe). Password mail is best-effort/async and
+    # must never gate app liveness — and because spring.mail.host defaults to smtp.gmail.com, the
+    # JavaMailSender bean (hence this check) exists even when mail is DISABLED, so it would report
+    # DOWN with empty creds on every deploy. Keep it off; SMTP reachability is not app health.
+    mail:
+      enabled: ${MANAGEMENT_HEALTH_MAIL_ENABLED:false}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: alpha
+    tags-sorter: alpha
+    display-request-duration: true
+  show-actuator: false
+  default-produces-media-type: application/json
+
+# Telegram bot. Default OFF — opt in per environment by setting telegram.bot.enabled=true
+# AND providing TELEGRAM_BOT_TOKEN. The token is intentionally read from the env only
+# (the fallback is the empty string, never a real value baked into source). Committing
+# a real token here would expose the bot to anyone with read access to the repo.
+telegram:
+  bot:
+    enabled: ${TELEGRAM_BOT_ENABLED:false}
+    # No committed secret default — set TELEGRAM_BOT_TOKEN in the environment. The leaked
+    # value previously here MUST be rotated via BotFather and purged from git history.
+    token: ${TELEGRAM_BOT_TOKEN:}
+    username: ${TELEGRAM_BOT_USERNAME:oriendAdvertiseInfoBot}
+    # Comma-separated list — Spring's StringToCollectionConverter binds it to Set<Long>.
+    # Allow-list controls BOTH outbound notifications and inbound command authorization.
+    # Empty is allowed (the bot still boots) but every send becomes a no-op and inbound
+    # is silently dropped — see TelegramBotProperties javadoc.
+    authorized-chat-ids: ${TELEGRAM_BOT_AUTHORIZED_CHAT_IDS:}

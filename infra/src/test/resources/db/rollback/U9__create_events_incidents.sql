@@ -1,0 +1,9 @@
+DROP INDEX IF EXISTS idx_incident_device_type_status;
+DROP INDEX IF EXISTS idx_incident_status;
+DROP INDEX IF EXISTS idx_incident_device;
+DROP TABLE IF EXISTS incident;
+DROP INDEX IF EXISTS idx_event_priority;
+DROP INDEX IF EXISTS idx_event_occurred;
+DROP INDEX IF EXISTS idx_event_type;
+DROP INDEX IF EXISTS idx_event_device;
+DROP TABLE IF EXISTS event;
