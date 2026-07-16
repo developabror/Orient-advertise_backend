@@ -6,6 +6,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -18,8 +19,10 @@ import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.PlaylistItem;
+import uz.orientadvertise.services.domain.model.SyncGroupPlaybackOverride;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.PlaylistItemRepository;
+import uz.orientadvertise.services.domain.repository.SyncGroupPlaybackOverrideRepository;
 
 /**
  * Computes the diff a device must apply to reach the server-side expected content state.
@@ -48,14 +51,7 @@ public class DeviceSyncService {
     private final PlaylistItemRepository playlistItemRepository;
     private final FileStorageService fileStorageService;
     private final PlaybackScheduleService playbackScheduleService;
-
-    /**
-     * Fallback slot length for a deliverable item that has no effective duration (an image with
-     * neither an operator dwell nor a natural duration). Emitting a 0-ms slot would collapse the loop
-     * and break {@code floorMod(now - anchor, loopDuration)} positioning, so such an item dwells for a
-     * defined default instead. It is logged so ops can supply a real dwell.
-     */
-    private static final long DEFAULT_SLOT_DURATION_SECONDS = 10L;
+    private final SyncGroupPlaybackOverrideRepository overrideRepository;
 
     /**
      * Sync URLs are signed for longer than ad-hoc download URLs because devices over
@@ -69,13 +65,15 @@ public class DeviceSyncService {
                               ContentVersionService contentVersionService,
                               PlaylistItemRepository playlistItemRepository,
                               FileStorageService fileStorageService,
-                              PlaybackScheduleService playbackScheduleService) {
+                              PlaybackScheduleService playbackScheduleService,
+                              SyncGroupPlaybackOverrideRepository overrideRepository) {
         this.deviceRepository = deviceRepository;
         this.assignmentService = assignmentService;
         this.contentVersionService = contentVersionService;
         this.playlistItemRepository = playlistItemRepository;
         this.fileStorageService = fileStorageService;
         this.playbackScheduleService = playbackScheduleService;
+        this.overrideRepository = overrideRepository;
     }
 
     @Transactional
@@ -161,30 +159,31 @@ public class DeviceSyncService {
         // once undeliverable items are filtered out) and the EFFECTIVE per-item duration
         // (override ?? the file's natural duration) so a held file with no override still carries
         // a usable duration — /sync filesToAdd excludes held files, so this is its only source.
-        // Also accumulate the synchronized-playback slot timeline (§1.3): a running prefix sum
-        // `slotStartMs` and per-item `slotDurationMs = effectiveSeconds * 1000`. The slot set is
-        // BY CONSTRUCTION identical to `playlistOrder` (same iteration, same deliverable filter,
-        // same `index`), so a device never holds a slot for a file it won't play, or vice versa.
-        List<PlaylistEntry> playlistOrder = new java.util.ArrayList<>();
-        int index = 0;
-        long slotStartMs = 0L;
-        for (PlaylistItem it : items) {
-            ContentFile f = it.getContentFile();
-            if (f == null || !deliverableFileIds.contains(f.getId())) {
-                continue;
-            }
-            Integer effective = it.getDurationSeconds() != null
-                    ? it.getDurationSeconds() : f.getDurationSeconds();
-            long slotDurationMs = slotDurationMs(effective, f.getId());
-            playlistOrder.add(new PlaylistEntry(index++, it.getPosition(), f.getId(), effective,
-                    slotStartMs, slotDurationMs));
-            slotStartMs += slotDurationMs;
-        }
-        long loopDurationMs = slotStartMs; // Σ slotDurationMs (0 when nothing is deliverable)
+        // Also the synchronized-playback slot timeline (§1.3): a running prefix sum `slotStartMs`
+        // and per-item `slotDurationMs`. The slot set is BY CONSTRUCTION identical to
+        // `playlistOrder` (same deliverable-filtered iteration, same `index`), so a device never
+        // holds a slot for a file it won't play, or vice versa. The slot MATH is shared with the
+        // group-jump service via {@link PlaybackSlotTimeline} so a jump's slotStart[index] matches.
+        List<PlaylistItem> deliverableOrdered = items.stream()
+                .filter(it -> {
+                    ContentFile f = it.getContentFile();
+                    return f != null && deliverableFileIds.contains(f.getId());
+                })
+                .toList();
+        PlaybackSlotTimeline.Timeline timeline = PlaybackSlotTimeline.of(deliverableOrdered);
+        List<PlaylistEntry> playlistOrder = timeline.slots().stream()
+                .map(s -> new PlaylistEntry(s.index(), s.position(), s.fileId(), s.effectiveSeconds(),
+                        s.slotStartMs(), s.slotDurationMs()))
+                .toList();
+        long loopDurationMs = timeline.loopDurationMs(); // Σ slotDurationMs (0 when nothing is deliverable)
 
         String expectedVersion = contentVersionService.computeForAssignment(assignment);
 
         // Anchor the group's shared cut-over/loop T0 for this version (lazy, immutable per version).
+        // An operator "group jump" re-anchors it via a MUTABLE per-sync-group override (V42) that
+        // takes precedence over the base immutable per-version anchor (V40) while the group stays on
+        // the same (assignment, version, contentVersion); a version change makes the override stale
+        // and it is cleaned up here, then the base anchor is used.
         // Best-effort: if the anchor can't be obtained, the device simply free-runs this cycle and
         // re-anchors on its next /sync — the schedule block is additive and must never fail the sync.
         String syncGroupId = device.getSyncGroupId();
@@ -192,14 +191,37 @@ public class DeviceSyncService {
         Long activateAtEpochMs = null;
         if (expectedVersion != null && !playlistOrder.isEmpty()) {
             try {
-                var schedule = playbackScheduleService.getOrCreate(
-                        assignment.getId(), assignment.getVersionNumber(), expectedVersion);
-                if (schedule != null) {
-                    anchorEpochMs = schedule.getAnchorEpochMs();
-                    activateAtEpochMs = schedule.getActivateAtEpochMs();
+                // The NUMERIC sync-group id (nullable) — NOT device.getSyncGroupId() (the sg-/fac-
+                // wire string). An override applies only to devices in an EXPLICIT sync group;
+                // facility/region-grouped devices have no numeric key and use the base anchor.
+                Long groupId = device.getSyncGroup() != null ? device.getSyncGroup().getId() : null;
+                Optional<SyncGroupPlaybackOverride> override = groupId == null
+                        ? Optional.empty()
+                        : overrideRepository.findBySyncGroupId(groupId);
+                if (override.isPresent() && overrideMatches(override.get(), assignment, expectedVersion)) {
+                    // Operator group-jump re-anchor wins over the base per-version anchor.
+                    anchorEpochMs = override.get().getAnchorEpochMs();
+                    activateAtEpochMs = override.get().getActivateAtEpochMs();
+                } else {
+                    // Clean up a genuinely stale override ONLY when THIS device is still on the
+                    // assignment the jump was written for but its content moved on (a playlist/dwell
+                    // edit — contentVersion is a pure function of the assignment, so EVERY member on
+                    // that assignment agrees, making the mismatch a group-wide signal). A device that
+                    // has drifted to a DIFFERENT assignment (e.g. a higher-priority subset assignment)
+                    // must NOT delete the shared override — that would cancel the jump for members
+                    // still on the original assignment; it just uses the base anchor for itself.
+                    if (override.isPresent() && override.get().getAssignmentId().equals(assignment.getId())) {
+                        overrideRepository.deleteBySyncGroupId(groupId);
+                    }
+                    var schedule = playbackScheduleService.getOrCreate(
+                            assignment.getId(), assignment.getVersionNumber(), expectedVersion);
+                    if (schedule != null) {
+                        anchorEpochMs = schedule.getAnchorEpochMs();
+                        activateAtEpochMs = schedule.getActivateAtEpochMs();
+                    }
                 }
             } catch (Exception e) {
-                log.warn("Playback schedule anchor unavailable [device={}, assignment={}]: {} — "
+                log.warn("Playback anchor/override unavailable [device={}, assignment={}]: {} — "
                         + "device free-runs this cycle", deviceId, assignment.getId(), e.getMessage());
             }
         }
@@ -288,19 +310,15 @@ public class DeviceSyncService {
     }
 
     /**
-     * Slot length in ms for the synchronized-playback loop. Guards the null/non-positive case: a
-     * deliverable item with no usable effective duration (an image with neither an operator dwell nor a
-     * natural duration) must never yield a 0-ms slot — that would collapse {@code loopDurationMs} and
-     * break {@code floorMod} positioning — so it falls back to {@link #DEFAULT_SLOT_DURATION_SECONDS}.
+     * True iff a group-jump override still applies to the device's current content: same assignment,
+     * same version number, and same content-version hash. Any mismatch means the group has moved on
+     * (a content or dwell edit yields a new {@code contentVersion}), so the override is stale.
      */
-    private static long slotDurationMs(Integer effectiveSeconds, Long fileId) {
-        if (effectiveSeconds != null && effectiveSeconds > 0) {
-            return effectiveSeconds * 1000L;
-        }
-        log.warn("Deliverable file {} has no positive effective duration ({}) — using default {}s dwell "
-                + "for its sync slot; supply a dwell to fix the loop timing",
-                fileId, effectiveSeconds, DEFAULT_SLOT_DURATION_SECONDS);
-        return DEFAULT_SLOT_DURATION_SECONDS * 1000L;
+    private static boolean overrideMatches(SyncGroupPlaybackOverride o, ContentAssignment assignment,
+                                           String expectedVersion) {
+        return o.getAssignmentId().equals(assignment.getId())
+                && o.getVersionNumber() == assignment.getVersionNumber()
+                && o.getContentVersion().equals(expectedVersion);
     }
 
     private SyncFileToAdd tryBuildFileToAdd(ContentFile f) {
@@ -419,8 +437,8 @@ public class DeviceSyncService {
      *
      * <p>{@code slotStartMs}/{@code slotDurationMs} are the synchronized-playback slot timeline
      * (§1.3): the loop-relative start offset (prefix sum) and length in ms. {@code slotDurationMs} is
-     * always positive — a null/zero effective duration falls back to {@link #DEFAULT_SLOT_DURATION_SECONDS}
-     * so the loop can never collapse.
+     * always positive — a null/zero effective duration falls back to a default dwell (see
+     * {@link PlaybackSlotTimeline}) so the loop can never collapse.
      */
     public record PlaylistEntry(int index, int position, Long fileId, Integer durationSeconds,
                                 long slotStartMs, long slotDurationMs) {}

@@ -29,7 +29,9 @@ jobs:
       - store_test_results:
           path: service/build/test-results/test
       - store_test_results:
-          path: service/build/test-results/test
+          path: api/build/test-results/test
+      - store_test_results:
+          path: infra/build/test-results/test
       - store_test_results:
           path: common/build/test-results/test
       - store_test_results:

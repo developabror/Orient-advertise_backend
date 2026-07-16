@@ -155,7 +155,7 @@ class DeviceStatusViewActivePlaylistFilterTest {
 
     private Map<String, DeviceStatusView> myRows(Boolean hasActivePlaylist) {
         var page = repository.findFiltered(null, null, null, null, null, null, null, null, null,
-                hasActivePlaylist, null, PageRequest.of(0, 200));
+                hasActivePlaylist, null /* syncUnassigned */, null /* projectIds */, PageRequest.of(0, 200));
         return page.getContent().stream()
                 .filter(v -> v.getSerialNumber() != null && v.getSerialNumber().startsWith("SN-AP-"))
                 .collect(Collectors.toMap(DeviceStatusView::getSerialNumber, Function.identity()));

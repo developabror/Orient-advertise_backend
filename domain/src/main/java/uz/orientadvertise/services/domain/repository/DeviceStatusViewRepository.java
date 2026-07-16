@@ -35,6 +35,11 @@ public interface DeviceStatusViewRepository extends JpaRepository<DeviceStatusVi
      *   <li>{@code false} → only devices with no active playlist ({@code active_playlist_id IS NULL}),
      *       the "needs content" bucket.</li>
      * </ul>
+     *
+     * <p>{@code syncUnassigned} is a third independent tri-state {@link Boolean}, on a DIFFERENT
+     * axis from {@code unassigned} ({@code device_group_id IS NULL}): {@code true} requires
+     * {@code sync_group_id IS NULL} — the "not yet in a sync group / sales point" bucket that
+     * feeds the FE sync-group member picker. {@code null}/{@code false} → no constraint.
      */
     @Query("SELECT v FROM DeviceStatusView v " +
            "WHERE (:status IS NULL OR v.computedStatus = :status) " +
@@ -48,6 +53,7 @@ public interface DeviceStatusViewRepository extends JpaRepository<DeviceStatusVi
            "AND (:hasActivePlaylist IS NULL " +
            "     OR (:hasActivePlaylist = TRUE  AND v.activePlaylistId IS NOT NULL) " +
            "     OR (:hasActivePlaylist = FALSE AND v.activePlaylistId IS NULL)) " +
+           "AND (:syncUnassigned IS NULL OR :syncUnassigned = FALSE OR v.syncGroupId IS NULL) " +
            "AND (CAST(:serialContains AS string) IS NULL OR LOWER(v.serialNumber) LIKE LOWER(CONCAT('%', CAST(:serialContains AS string), '%'))) " +
            "AND (CAST(:nameContains AS string) IS NULL OR LOWER(v.name) LIKE LOWER(CONCAT('%', CAST(:nameContains AS string), '%'))) " +
            "AND (CAST(:facilityNameContains AS string) IS NULL OR LOWER(v.facilityName) LIKE LOWER(CONCAT('%', CAST(:facilityNameContains AS string), '%'))) " +
@@ -65,6 +71,7 @@ public interface DeviceStatusViewRepository extends JpaRepository<DeviceStatusVi
             @Param("nameContains") String nameContains,
             @Param("facilityNameContains") String facilityNameContains,
             @Param("hasActivePlaylist") Boolean hasActivePlaylist,
+            @Param("syncUnassigned") Boolean syncUnassigned,
             @Param("projectIds") Collection<Long> projectIds,
             Pageable pageable);
 

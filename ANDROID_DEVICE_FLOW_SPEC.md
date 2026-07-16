@@ -72,7 +72,7 @@ There are **8 REST endpoints you need + 1 WebSocket + MinIO GETs.** `GET /…/pl
 
 **MUST:**
 - Derive `serialNumber` from a **stable** identity (hardware serial, else a persisted UUID). The server keys the device on this — a changing serial creates duplicate devices.
-- Treat `syncGroupId` here as provisional — a freshly-registered device usually sits on the region-level fallback until an operator places it. The **authoritative** group is delivered on every **heartbeat** (§4); re-read it there. `null` ⇒ free-run solo.
+- Treat `syncGroupId` here as provisional **and opaque** (never parse the prefix) — a freshly-registered device usually sits on the region-level fallback until an operator places it into a sync group (a `"sg-…"` sales point). The **authoritative** group is delivered on every **heartbeat** (§4); re-read it there. `null` ⇒ free-run solo.
 - Persist the response **token first, then the `deviceId`** (so a crash can never leave a device row without a usable token).
 - Treat **201 and 200 identically** — both yield a valid `deviceId`+`deviceToken`. (200 = the serial already existed; **the returned token is fresh and the previous token is now invalid** — overwrite it.)
 - Skip the network call when you already hold **both** a `deviceId` and a token.
@@ -107,7 +107,7 @@ There are **8 REST endpoints you need + 1 WebSocket + MinIO GETs.** `GET /…/pl
 - **`syncRequired == true`** → stage a sync: remember `expectedContentVersion` as the target and trigger the sync flow (§5). As of backend v1.0.111 this flag is `true` when **either** your reported version ≠ `expectedContentVersion` **or** a `SYNC_CONTENT` action is pending — so it is now a complete "you should sync" signal.
 - **`desiredVolume`** (int, 0–100, always present) → the operator-set target output volume. **Set your audio output to this value** and keep reporting your current `volume` on each beat. This is the convergence loop: *report current → obey `desiredVolume`*. Persistent desired state — an offline/reset device self-heals to the right volume on its next beat. (The one-off `VOLUME_SET` pending action still exists for ad-hoc immediate pokes; both paths are valid.)
 - **`pendingActions[]`** (independent of `syncRequired`) → ingest and execute (§6). Always present-or-empty.
-- **`syncGroupId`** (string, nullable) → the **authoritative** synchronized-playback group (`facility ?? group ?? region`, prefixed). Devices sharing it are one playback group; re-read it every beat (operators relocate devices). `null` ⇒ free-run solo. Only devices sharing `syncGroupId` **and** the same resolved content version end up frame-aligned. Used only by the sync-time layer (§9); ignore it if you are not implementing synchronized playback.
+- **`syncGroupId`** (string, nullable) → the **authoritative** synchronized-playback group (`sync group ?? facility ?? device group ?? region`, prefixed — e.g. `"sg-9"` / `"fac-42"` / `"grp-7"` / `"reg-3"`; the `sg-` tier is an operator-assigned "sales point" and sits on top). **Treat it as opaque** — never parse the prefix. Devices sharing it are one playback group; re-read it every beat (operators relocate and re-group devices). `null` ⇒ free-run solo. Only devices sharing `syncGroupId` **and** the same resolved content version end up frame-aligned. Used only by the sync-time layer (§9); ignore it if you are not implementing synchronized playback.
 
 **Request `volume`** (optional, 0–100) is your device's *current* output volume; the server stores it for the operator console and never fails the beat on a bad/missing value. Omit it only if you genuinely can't read it.
 
@@ -178,6 +178,7 @@ This is a strict, gated pipeline. Run it whenever a sync is staged (heartbeat `s
 > - `positionInLoop()`: if `syncedNow < activateAt` hold the previous version; else `elapsed = floorMod(syncedNow − anchorEpochMs, loopDurationMs)`, then the item is the last slot with `slotStartMs ≤ elapsed`, offset `elapsed − slotStartMs`.
 > - A device that reboots/reconnects re-derives the **live** position and seeks straight there — it **never restarts the loop at item 0**. Devices flip to a new version together at `activateAt`; a straggler that misses it joins at the live position when ready.
 > - `slotDurationMs` is authoritative and always positive (a null-duration image falls back to a default dwell). Audio stays out-of-band via heartbeat `desiredVolume` + `VOLUME_SET` — **not** a sync concern. A device that ignores these fields free-runs solo exactly as before.
+> - **`anchorEpochMs` is no longer guaranteed to equal the version's original T0** (backend v1.0.129): an operator **group jump** re-anchors it so the whole sync group converges on a chosen item at `activateAt`. The device rule is unchanged — **always trust the latest `/sync` `anchorEpochMs`/`activateAt`** and re-derive `positionInLoop()`; on a jump you seek to the new live position at `activateAt`, exactly like a version cut-over. **No new field, no new action.** The jump self-clears when the content version changes (the next `/sync` returns the base anchor again).
 
 ### 5.2 Download + verify each file (MinIO)
 **Call:** `GET <presignedUrl>` (support `Range: bytes=<resumeFrom>-` to resume partials).
@@ -231,7 +232,7 @@ Actions arrive two ways and the device handles them identically:
 | `PLAYBACK_PAUSE` | `{}` | Pause playback |
 | `PLAYBACK_RESUME` | `{}` | Resume playback |
 | `GET_DIAGNOSTICS` | `{}` | Gather diagnostics, return them in the confirm `result` |
-| `PLAYLIST_CONTROL` | `{"action":"PREV"|"NEXT"|"JUMP","position":N}` | Transport control. For `JUMP`, **`position` is the 0-based `index` into your delivered playlist** (the same contiguous `index` from `/sync` `playlistOrder` — **not** the raw `position` field). The server validates it against the deliverable count; treat an out-of-range value defensively (clamp/ignore). |
+| `PLAYLIST_CONTROL` | `{"action":"PREV"|"NEXT"|"JUMP","position":N}` | **Solo/manual** transport control. For `JUMP`, **`position` is the 0-based `index` into your delivered playlist** (the same contiguous `index` from `/sync` `playlistOrder` — **not** the raw `position` field). The server validates it against the deliverable count; treat an out-of-range value defensively (clamp/ignore). **For a device in a sync group the coordinated mechanism is the server-side *group jump* (a `/sync` re-anchor, §5.1), not this per-device command** — a solo `JUMP` on a synced device is expected to be overridden by the next `positionInLoop()` tick. |
 
 `expiresAt` is ~5 min after issue (`PLAYLIST_CONTROL` ~10 min). Actions are best-effort; an expired action you confirm late is still recorded (see below).
 

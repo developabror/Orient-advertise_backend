@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.127`
+`1.0.129`
 
 ## Architecture
 
@@ -1193,6 +1193,70 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
 
+### Sync-group "Jump to video N" — group re-anchor over `/sync` (v1.0.129)
+
+Lets an operator make **every device in a sync group jump to a chosen playlist index in lockstep** —
+pick the 7th video and all member TVs converge on it and stay frame-aligned, wherever each was in the
+loop. Ships **entirely over the existing `/sync` wire** (no new device field, no `PLAYLIST_CONTROL`
+action) — a sync-honoring Android device needs **zero changes**. **DB migration
+`V42__sync_group_playback_override.sql`** (new mutable `sync_group_playback_override` table, one row
+per group, `ON DELETE CASCADE` with the group).
+
+- **`GET /api/sync-groups/{id}/playback`** — the pickable deliverable timeline (`index`, `fileId`,
+  `title`, `durationSeconds`, `slotStartMs`, `slotDurationMs`) + `loopDurationMs`, `memberCount`, and
+  the current `activeJump`. When members are not content-coherent (different playlist/version, a
+  member with no active playlist, or an empty group) → `coherent: false` + a `reason`, empty items.
+  Roles: ADMIN/OPERATOR/VIEWER.
+- **`POST /api/sync-groups/{id}/playback/jump`** `{ "index": 6 }` → **200**. Re-anchors the group's
+  loop (`anchorEpochMs = activateAt − slotStart[index]`) so at the coordinated cut-over every member
+  resolves to `index`; delivered via the existing `SYNC_CONTENT` push, so offline members converge on
+  their next heartbeat. **409** empty / not content-coherent; **400** index out of range
+  `[0, deliverableCount)`; **404** unknown/out-of-scope. Roles: ADMIN/OPERATOR (never `ROLE_DEVICE`).
+- **Design (re-anchor-on-jump):** a MUTABLE per-group override overrides the immutable per-version
+  base anchor (V40 `playback_sync_schedule`) **only while** the group stays on the same
+  `(assignment, version, contentVersion)`; a content/version change makes it stale and it is ignored
+  (and cleaned up) at `/sync` time — the group falls back to the base anchor. A re-jump overwrites the
+  override in place. The one behavior change is in `DeviceSyncService.computeSyncPlan`, which now
+  prefers a matching override; the slot timeline was extracted to a shared `PlaybackSlotTimeline`
+  helper so `/sync` and the jump service compute an identical timeline.
+- **Config:** `app.sync.jump-min-lead` (env `APP_SYNC_JUMP_MIN_LEAD`, default **PT5S**) — a short jump
+  lead distinct from the version cut-over lead (`activation-min-lead`, PT2M): a jump needs no download,
+  only push delivery + clock-offset convergence.
+
+`ANDROID_DEVICE_FLOW_SPEC.md` (§5.1 sync-time layer, §6 `PLAYLIST_CONTROL` row) and
+`frontend/docs/openapi.json` updated. **No** content-hash, assignment-resolution, or base-anchor
+change.
+
+### SyncGroup management — `/api/sync-groups` + a `sg-` sync-group tier (v1.0.128)
+
+Adds the **SyncGroup** aggregate the admin frontend's `/settings/sync-groups` page expects — a
+**project-scoped "sales point"** (one sales point = one sync group), distinct from
+region/facility/device_group. Fixes the FE 404 *"No endpoint found for GET api/sync-groups"*.
+**DB migration `V41__sync_groups.sql`** (new `sync_group` table + nullable `device.sync_group_id`
+FK; `device_status_view` recreated to expose `sync_group_id`).
+
+- **`/api/sync-groups` CRUD + membership** — `GET` (list, paginated, `projectId`/`name` filters),
+  `GET /{id}` (detail with members), `POST` (create → 201), `PUT /{id}` (rename), `DELETE /{id}`
+  (**hard** delete, ADMIN-only, `[SENSITIVE]`), `POST /{id}/devices` (set members — move-not-reject,
+  reports `movedFrom`), `DELETE /{id}/devices/{deviceId}` (remove). Modeled on the device-group
+  stack **minus volume, minus bulk-actions**; the single delete guard is *"has N active
+  device(s)"* (a sync group can never be a `ContentAssignment` target). Reads:
+  ADMIN/OPERATOR/VIEWER; writes: ADMIN/OPERATOR; delete: ADMIN. Operator scope (V35) collapses
+  out-of-scope to 404.
+- **Device member field is `status`** (heartbeat-derived `computed_status`), not `computedStatus`;
+  no volume fields on sync-group members.
+- **`syncGroupId` wire label gains an `sg-` top tier** — `Device.getSyncGroupId()` is now
+  `sg-{syncGroup.id} ?? fac-{facilityId} ?? grp-{deviceGroupId} ?? reg-{regionId} ?? null`. The
+  value stays **opaque** to devices and is re-read every heartbeat, so the Android app needs **zero
+  changes**; removing a device from its sync group reverts the label to the derived fallback.
+- **Device surface** — `GET /api/devices` gains a `syncUnassigned=true` filter (`sync_group_id IS
+  NULL`, a DISTINCT axis from `unassigned`); the device list item carries the numeric `syncGroupId`,
+  and device detail carries `syncGroupId` + `syncGroupName`.
+
+`ANDROID_DEVICE_FLOW_SPEC.md` (§3/§4) and `frontend/docs/openapi.json` updated. **No** content-hash,
+assignment-resolution, or `playback_sync_schedule` change — membership propagates solely via the
+heartbeat `syncGroupId` echo.
+
 ### Synchronized multi-device playback — time layer (v1.0.127)
 
 Backend surface for **Variant A** (server-anchored deterministic schedule) from
@@ -1205,9 +1269,11 @@ staging/promote flow, download+verify gates, and the volume/audio path are untou
 - **`GET /api/devices/{id}/time` → `{ "serverUnixMs": <long> }`** — a deliberately cheap clock
   endpoint (no DB write, no status recompute — does **not** route through `DeviceHeartbeatService`)
   the device pings a few times to estimate its clock offset. `hasRole('DEVICE')` + path-id binding.
-- **`syncGroupId`** on heartbeat / sync / register — `facility_id ?? device_group_id ?? region_id`,
-  prefixed (`"fac-42"` / `"grp-7"` / `"reg-3"`). Derived server-side (no schema change); echoed every
-  beat so a relocated device re-groups promptly. `null` ⇒ the device free-runs solo (today's behavior).
+- **`syncGroupId`** on heartbeat / sync / register — `sync_group ?? facility_id ?? device_group_id ??
+  region_id`, prefixed (`"sg-9"` / `"fac-42"` / `"grp-7"` / `"reg-3"`). The `sg-` tier (an explicit
+  operator-assigned SyncGroup / sales point) sits at the TOP as of v1.0.128; the rest are derived
+  server-side. Echoed every beat so a relocated or re-grouped device re-groups promptly. `null` ⇒ the
+  device free-runs solo (today's behavior).
 - **Schedule block on `/sync`** — per item `slotStartMs`/`slotDurationMs` (a prefix-sum slot timeline,
   `slotDurationMs = effectiveSeconds × 1000`), plus loop-level `anchorEpochMs`, `loopDurationMs`
   (`= Σ slotDurationMs`), and `activateAt`. **Epoch-millisecond `long`s** (deliberately not ISO-8601);

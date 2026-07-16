@@ -32,11 +32,21 @@ public interface DeviceRepository extends JpaRepository<Device, Long> {
 
     List<Device> findByDeviceGroupIdAndDeletedAtIsNull(Long deviceGroupId);
 
+    // Explicit @Query (not a derived name): "SyncGroupId" would otherwise be resolved by the
+    // derived-query parser to the non-persistent String getter Device.getSyncGroupId(), not to
+    // the syncGroup.id path — a PathElementException at repository-factory startup.
+    @Query("SELECT d FROM Device d WHERE d.syncGroup.id = :syncGroupId AND d.deletedAt IS NULL")
+    List<Device> findBySyncGroupIdAndDeletedAtIsNull(@Param("syncGroupId") Long syncGroupId);
+
     long countByRegionIdAndDeletedAtIsNull(Long regionId);
 
     long countByFacilityIdAndDeletedAtIsNull(Long facilityId);
 
     long countByDeviceGroupIdAndDeletedAtIsNull(Long deviceGroupId);
+
+    /** Explicit @Query for the same reason as {@link #findBySyncGroupIdAndDeletedAtIsNull}. */
+    @Query("SELECT COUNT(d) FROM Device d WHERE d.syncGroup.id = :syncGroupId AND d.deletedAt IS NULL")
+    long countBySyncGroupIdAndDeletedAtIsNull(@Param("syncGroupId") Long syncGroupId);
 
     /**
      * Per-group active-device counts in a single round trip. Drives the device-group
@@ -49,6 +59,17 @@ public interface DeviceRepository extends JpaRepository<Device, Long> {
            "WHERE d.deviceGroup.id IN :groupIds AND d.deletedAt IS NULL " +
            "GROUP BY d.deviceGroup.id")
     List<Object[]> countActiveDevicesPerGroup(@Param("groupIds") Collection<Long> groupIds);
+
+    /**
+     * Per-sync-group active-device counts in a single round trip — the {@code deviceCount}
+     * column of the sync-group listing. Mirrors {@link #countActiveDevicesPerGroup}: only
+     * groups with at least one non-deleted device appear, so the caller zero-fills the rest.
+     * A missing count silently drops the FE row, so this batch feeds every listed group.
+     */
+    @Query("SELECT d.syncGroup.id, COUNT(d) FROM Device d " +
+           "WHERE d.syncGroup.id IN :groupIds AND d.deletedAt IS NULL " +
+           "GROUP BY d.syncGroup.id")
+    List<Object[]> countActiveDevicesPerSyncGroup(@Param("groupIds") Collection<Long> groupIds);
 
     /**
      * Synchronized-playback readiness rollup (§1.4): among the given group device ids, how many have
@@ -172,4 +193,17 @@ public interface DeviceRepository extends JpaRepository<Device, Long> {
     @Query("UPDATE Device d SET d.desiredVolume = NULL, d.updatedAt = :now " +
            "WHERE d.deviceGroup.id = :groupId AND d.deletedAt IS NULL")
     int bulkClearDesiredVolumeByGroup(@Param("groupId") Long groupId, @Param("now") Instant now);
+
+    /**
+     * Detach every device (deleted or not) from a sync group so its {@code fk_device_sync_group}
+     * reference no longer dangles when the group is HARD-deleted. The sync-group delete path
+     * already refuses while any <i>active</i> device remains, so in practice this only nulls the
+     * {@code sync_group_id} of already soft-deleted devices — which keep the column set (soft
+     * delete doesn't clear FKs) and would otherwise fail the DELETE with a foreign-key violation
+     * (an unmapped {@code DataIntegrityViolationException} → 500). {@code deletedAt IS NULL} is
+     * intentionally omitted here.
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE Device d SET d.syncGroup = NULL, d.updatedAt = :now WHERE d.syncGroup.id = :syncGroupId")
+    int bulkClearSyncGroup(@Param("syncGroupId") Long syncGroupId, @Param("now") Instant now);
 }

@@ -14,8 +14,11 @@ import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.Playlist;
 import uz.orientadvertise.services.domain.model.PlaybackSyncSchedule;
 import uz.orientadvertise.services.domain.model.PlaylistItem;
+import uz.orientadvertise.services.domain.model.SyncGroup;
+import uz.orientadvertise.services.domain.model.SyncGroupPlaybackOverride;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.PlaylistItemRepository;
+import uz.orientadvertise.services.domain.repository.SyncGroupPlaybackOverrideRepository;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -37,6 +40,7 @@ class DeviceSyncServiceTest {
     private PlaylistItemRepository playlistItemRepository;
     private FileStorageService fileStorageService;
     private PlaybackScheduleService playbackScheduleService;
+    private SyncGroupPlaybackOverrideRepository overrideRepository;
     private DeviceSyncService syncService;
 
     @BeforeEach
@@ -47,8 +51,10 @@ class DeviceSyncServiceTest {
         playlistItemRepository = mock(PlaylistItemRepository.class);
         fileStorageService = mock(FileStorageService.class);
         playbackScheduleService = mock(PlaybackScheduleService.class);
+        overrideRepository = mock(SyncGroupPlaybackOverrideRepository.class);
         syncService = new DeviceSyncService(deviceRepository, assignmentService,
-                contentVersionService, playlistItemRepository, fileStorageService, playbackScheduleService);
+                contentVersionService, playlistItemRepository, fileStorageService, playbackScheduleService,
+                overrideRepository);
 
         Field f = DeviceSyncService.class.getDeclaredField("presignedUrlExpiryMinutes");
         f.setAccessible(true);
@@ -1013,6 +1019,137 @@ class DeviceSyncServiceTest {
         assertTrue(slot.slotDurationMs() > 0, "a null-duration image must NEVER produce a 0-ms slot");
         assertEquals(10_000L, slot.slotDurationMs(), "falls back to the defined 10s default dwell");
         assertEquals(10_000L, plan.loopDurationMs());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Group-jump override (V42) — overrides the base per-version anchor while it matches
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void computeSyncPlan_groupWithMatchingOverride_usesOverrideAnchor_notBaseSchedule() {
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(40L);
+        when(device.getSyncGroupId()).thenReturn("sg-9");
+        SyncGroup sg = mock(SyncGroup.class);
+        when(sg.getId()).thenReturn(9L);
+        when(device.getSyncGroup()).thenReturn(sg);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(40L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(400L);
+        when(assignment.getVersionNumber()).thenReturn(2);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(4000L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile f1 = readyFile(41L, "key/41.mp4");
+        PlaylistItem item1 = item(0, f1, 10);   // build the mock before thenReturn (Mockito nesting trap)
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(4000L)).thenReturn(List.of(item1));
+        when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("https://minio/x");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-40");
+
+        SyncGroupPlaybackOverride override = mock(SyncGroupPlaybackOverride.class);
+        when(override.getAssignmentId()).thenReturn(400L);
+        when(override.getVersionNumber()).thenReturn(2);
+        when(override.getContentVersion()).thenReturn("v-40");
+        when(override.getAnchorEpochMs()).thenReturn(1_000_000_000_000L);
+        when(override.getActivateAtEpochMs()).thenReturn(1_000_000_005_000L);
+        when(overrideRepository.findBySyncGroupId(9L)).thenReturn(Optional.of(override));
+
+        var plan = syncService.computeSyncPlan(40L, null, Set.of());
+
+        assertEquals(1_000_000_000_000L, plan.anchorEpochMs(), "override anchor wins over the base schedule");
+        assertEquals(1_000_000_005_000L, plan.activateAt());
+        org.mockito.Mockito.verify(playbackScheduleService, org.mockito.Mockito.never())
+                .getOrCreate(any(), anyInt(), anyString());
+        org.mockito.Mockito.verify(overrideRepository, org.mockito.Mockito.never())
+                .deleteBySyncGroupId(any());
+    }
+
+    @Test
+    void computeSyncPlan_groupWithStaleOverride_deletesIt_andUsesBaseAnchor() {
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(50L);
+        when(device.getSyncGroupId()).thenReturn("sg-9");
+        SyncGroup sg = mock(SyncGroup.class);
+        when(sg.getId()).thenReturn(9L);
+        when(device.getSyncGroup()).thenReturn(sg);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(50L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(500L);
+        when(assignment.getVersionNumber()).thenReturn(3);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(5000L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile f1 = readyFile(51L, "key/51.mp4");
+        PlaylistItem item1 = item(0, f1, 10);   // build the mock before thenReturn (Mockito nesting trap)
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(5000L)).thenReturn(List.of(item1));
+        when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("https://minio/x");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-new");
+
+        // Stale: the override was written for an OLD content version — a content edit moved it on.
+        SyncGroupPlaybackOverride stale = mock(SyncGroupPlaybackOverride.class);
+        when(stale.getAssignmentId()).thenReturn(500L);
+        when(stale.getVersionNumber()).thenReturn(3);
+        when(stale.getContentVersion()).thenReturn("v-OLD");
+        when(overrideRepository.findBySyncGroupId(9L)).thenReturn(Optional.of(stale));
+
+        java.time.Instant activateAt = java.time.Instant.ofEpochMilli(2_000_000_000_000L);
+        when(playbackScheduleService.getOrCreate(eq(500L), eq(3), eq("v-new")))
+                .thenReturn(new PlaybackSyncSchedule(500L, 3, "v-new", activateAt));
+
+        var plan = syncService.computeSyncPlan(50L, null, Set.of());
+
+        org.mockito.Mockito.verify(overrideRepository).deleteBySyncGroupId(9L);
+        assertEquals(2_000_000_000_000L, plan.anchorEpochMs(), "stale override ignored → base anchor used");
+        assertEquals(2_000_000_000_000L, plan.activateAt());
+    }
+
+    @Test
+    void computeSyncPlan_memberDriftedToDifferentAssignment_keepsGroupOverride_usesBaseAnchor() {
+        // A member that drifts to a DIFFERENT assignment (e.g. a higher-priority subset assignment)
+        // must NOT delete the group-shared override — that would cancel the jump for members still on
+        // the original assignment. It just uses the base anchor for itself.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(60L);
+        when(device.getSyncGroupId()).thenReturn("sg-9");
+        SyncGroup sg = mock(SyncGroup.class);
+        when(sg.getId()).thenReturn(9L);
+        when(device.getSyncGroup()).thenReturn(sg);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(60L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(600L);   // drifted: NOT the jumped assignment (500)
+        when(assignment.getVersionNumber()).thenReturn(1);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(6000L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile f1 = readyFile(61L, "key/61.mp4");
+        PlaylistItem item1 = item(0, f1, 10);   // build the mock before thenReturn (Mockito nesting trap)
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(6000L)).thenReturn(List.of(item1));
+        when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("https://minio/x");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-600");
+
+        // The override belongs to a jump on assignment 500 (members still on 500 rely on it).
+        SyncGroupPlaybackOverride otherJump = mock(SyncGroupPlaybackOverride.class);
+        when(otherJump.getAssignmentId()).thenReturn(500L);
+        when(overrideRepository.findBySyncGroupId(9L)).thenReturn(Optional.of(otherJump));
+
+        java.time.Instant activateAt = java.time.Instant.ofEpochMilli(3_000_000_000_000L);
+        when(playbackScheduleService.getOrCreate(eq(600L), eq(1), eq("v-600")))
+                .thenReturn(new PlaybackSyncSchedule(600L, 1, "v-600", activateAt));
+
+        var plan = syncService.computeSyncPlan(60L, null, Set.of());
+
+        org.mockito.Mockito.verify(overrideRepository, org.mockito.Mockito.never()).deleteBySyncGroupId(any());
+        assertEquals(3_000_000_000_000L, plan.anchorEpochMs(), "drifted member falls back to its own base anchor");
+        assertEquals(3_000_000_000_000L, plan.activateAt());
     }
 
     private static ContentFile readyFile(Long id, String processedKey) {

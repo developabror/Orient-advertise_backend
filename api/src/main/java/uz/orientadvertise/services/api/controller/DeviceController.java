@@ -373,10 +373,15 @@ public class DeviceController {
             // a group-less device can still get a playlist via a REGION-targeted assignment.
             // A non-boolean value (e.g. ?hasActivePlaylist=notabool) is a 400 (type mismatch).
             @RequestParam(required = false) Boolean hasActivePlaylist,
+            // syncUnassigned=true → only devices with sync_group_id IS NULL (the "not yet in a
+            // sync group / sales point" bucket, used by the FE sync-group member picker). A
+            // DISTINCT axis from `unassigned` (device_group_id IS NULL) — do NOT overload that
+            // param. Unset/false: no constraint. Orthogonal to every other filter (no guard).
+            @RequestParam(required = false) Boolean syncUnassigned,
             Pageable pageable) {
         // Empty page (zero results) is returned naturally by Spring Data — never 404.
         var page = managementService.list(status, regionId, projectId, facilityId, deviceGroupId,
-                unassigned, serial, name, facilityName, hasActivePlaylist, pageable);
+                unassigned, serial, name, facilityName, hasActivePlaylist, syncUnassigned, pageable);
         return ResponseEntity.ok(page.map(DeviceListItem::from));
     }
 
@@ -385,7 +390,7 @@ public class DeviceController {
     public ResponseEntity<DeviceDetail> getById(@PathVariable Long id) {
         var device = managementService.getById(id);
         return ResponseEntity.ok(DeviceDetail.from(device, managementService.computedStatus(id),
-                managementService.effectiveVolume(id)));
+                managementService.effectiveVolume(id), managementService.syncGroupName(id)));
     }
 
     @PutMapping("/{id}")
@@ -394,7 +399,7 @@ public class DeviceController {
                                                 @Valid @RequestBody UpdateDeviceRequest request) {
         var device = managementService.update(id, request.name());
         return ResponseEntity.ok(DeviceDetail.from(device, managementService.computedStatus(id),
-                managementService.effectiveVolume(id)));
+                managementService.effectiveVolume(id), managementService.syncGroupName(id)));
     }
 
     /**
@@ -418,7 +423,7 @@ public class DeviceController {
                                                      @Valid @RequestBody SetLocationRequest request) {
         var device = managementService.setLocation(id, request.regionId(), request.facilityId());
         return ResponseEntity.ok(DeviceDetail.from(device, managementService.computedStatus(id),
-                managementService.effectiveVolume(id)));
+                managementService.effectiveVolume(id), managementService.syncGroupName(id)));
     }
 
     /**
@@ -514,13 +519,17 @@ public class DeviceController {
 
     public record DeviceListItem(Long id, String serialNumber, String name, String computedStatus,
                                   Long regionId, Long facilityId, String facilityName,
-                                  Long deviceGroupId, Instant lastHeartbeatAt,
+                                  Long deviceGroupId,
+                                  // The numeric sync_group entity id (NEVER the prefixed "sg-" wire
+                                  // string) sourced from the view. The FE picker's numOrNull parser
+                                  // throws on a string and then drops every device row.
+                                  Long syncGroupId, Instant lastHeartbeatAt,
                                   Long activePlaylistId, String activePlaylistName) {
         public static DeviceListItem from(DeviceStatusView v) {
             return new DeviceListItem(v.getId(), v.getSerialNumber(), v.getName(),
                     v.getComputedStatus().name(), v.getRegionId(),
                     v.getFacilityId(), v.getFacilityName(),
-                    v.getDeviceGroupId(), v.getLastHeartbeatAt(),
+                    v.getDeviceGroupId(), v.getSyncGroupId(), v.getLastHeartbeatAt(),
                     v.getActivePlaylistId(), v.getActivePlaylistName());
         }
     }
@@ -684,16 +693,23 @@ public class DeviceController {
 
     public record DeviceDetail(Long id, String serialNumber, String name, String computedStatus,
                                 Long regionId, Long facilityId, Long deviceGroupId,
+                                // syncGroupId: the numeric sync-group entity id (proxy-safe via
+                                // getSyncGroup().getId()); syncGroupName: resolved inside the service
+                                // tx (getSyncGroup().getName() is lazy — reading it here, after the tx
+                                // closes under open-in-view:false, would 500). Both null ⇒ ungrouped.
+                                Long syncGroupId, String syncGroupName,
                                 Instant lastHeartbeatAt, Instant registeredAt,
                                 Instant createdAt, Instant updatedAt, Instant deletedAt,
                                 boolean deleted,
                                 Integer reportedVolume, Integer volumeOverride, int effectiveVolume) {
-        public static DeviceDetail from(Device d, Device.Status computedStatus, int effectiveVolume) {
+        public static DeviceDetail from(Device d, Device.Status computedStatus, int effectiveVolume,
+                                        String syncGroupName) {
             return new DeviceDetail(d.getId(), d.getSerialNumber(), d.getName(),
                     computedStatus != null ? computedStatus.name() : null,
                     d.getRegion() != null ? d.getRegion().getId() : null,
                     d.getFacility() != null ? d.getFacility().getId() : null,
                     d.getDeviceGroup() != null ? d.getDeviceGroup().getId() : null,
+                    d.getSyncGroup() != null ? d.getSyncGroup().getId() : null, syncGroupName,
                     d.getLastHeartbeatAt(), d.getRegisteredAt(),
                     d.getCreatedAt(), d.getUpdatedAt(), d.getDeletedAt(),
                     d.isDeleted(),

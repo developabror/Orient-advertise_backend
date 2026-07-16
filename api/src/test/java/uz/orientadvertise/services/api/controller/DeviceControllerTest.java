@@ -999,7 +999,7 @@ class DeviceControllerTest {
     @org.springframework.security.test.context.support.WithMockUser(roles = "VIEWER")
     void list_unassignedTrueWithDeviceGroupId_returns400() throws Exception {
         when(managementService.list(any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new IllegalArgumentException(
                         "unassigned=true is mutually exclusive with deviceGroupId"));
 
@@ -1016,7 +1016,7 @@ class DeviceControllerTest {
     @org.springframework.security.test.context.support.WithMockUser(roles = "VIEWER")
     void list_hasActivePlaylist_trueFalseOmitted_allReturn200() throws Exception {
         when(managementService.list(any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(org.springframework.data.domain.Page.empty());
 
         mockMvc.perform(get("/api/devices").param("hasActivePlaylist", "true"))
@@ -1045,7 +1045,7 @@ class DeviceControllerTest {
         when(v.getActivePlaylistId()).thenReturn(15L);
         when(v.getActivePlaylistName()).thenReturn("Summer Promo");
         when(managementService.list(any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new org.springframework.data.domain.PageImpl<>(List.of(v)));
 
         mockMvc.perform(get("/api/devices").param("hasActivePlaylist", "true"))
@@ -1058,7 +1058,7 @@ class DeviceControllerTest {
     @org.springframework.security.test.context.support.WithMockUser(roles = "VIEWER")
     void list_hasActivePlaylist_combinedWithUnassignedOrGroup_returns200_noGuard() throws Exception {
         when(managementService.list(any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(org.springframework.data.domain.Page.empty());
 
         // hasActivePlaylist is orthogonal to unassigned AND to deviceGroupId — no 400.
@@ -1074,7 +1074,7 @@ class DeviceControllerTest {
     @org.springframework.security.test.context.support.WithMockUser(roles = "VIEWER")
     void list_filtersByProjectId() throws Exception {
         when(managementService.list(any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(org.springframework.data.domain.Page.empty());
 
         mockMvc.perform(get("/api/devices").param("projectId", "77"))
@@ -1093,6 +1093,7 @@ class DeviceControllerTest {
                 eq(null),   // name
                 eq(null),   // facilityName
                 eq(null),   // hasActivePlaylist
+                eq(null),   // syncUnassigned
                 any());     // pageable
     }
 

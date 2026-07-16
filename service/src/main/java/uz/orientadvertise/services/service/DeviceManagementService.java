@@ -84,6 +84,7 @@ public class DeviceManagementService {
                                         Long deviceGroupId, Boolean unassigned,
                                         String serialContains, String nameContains,
                                         String facilityNameContains, Boolean hasActivePlaylist,
+                                        Boolean syncUnassigned,
                                         Pageable pageable) {
         if (Boolean.TRUE.equals(unassigned) && deviceGroupId != null) {
             throw new IllegalArgumentException(
@@ -97,6 +98,7 @@ public class DeviceManagementService {
                 unassigned,
                 trimmed(serialContains), trimmed(nameContains), trimmed(facilityNameContains),
                 hasActivePlaylist,
+                syncUnassigned,
                 scope.narrowingIds(),
                 pageable);
     }
@@ -158,6 +160,23 @@ public class DeviceManagementService {
         }
         return deviceRepository.findAllByIdInAndDeletedAtIsNull(ids).stream()
                 .collect(Collectors.toMap(Device::getId, DeviceVolumeResolver::resolveEffectiveVolume));
+    }
+
+    /**
+     * The device's sync-group name, resolved inside the transaction so the lazy
+     * {@code syncGroup.getName()} access is safe under {@code open-in-view: false}. Returns
+     * {@code null} when the device is in no sync group. Mirrors {@link #effectiveVolume(Long)}:
+     * the device-detail DTO is assembled by the controller after the service tx closes, and
+     * touching {@code getSyncGroup().getName()} there would otherwise throw
+     * {@code LazyInitializationException}. (The numeric sync-group id is proxy-safe via
+     * {@code getSyncGroup().getId()} and is read directly in the DTO.)
+     */
+    @Transactional(readOnly = true)
+    public String syncGroupName(Long id) {
+        var device = deviceRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Device", id));
+        var syncGroup = device.getSyncGroup();
+        return syncGroup != null ? syncGroup.getName() : null;
     }
 
     /**

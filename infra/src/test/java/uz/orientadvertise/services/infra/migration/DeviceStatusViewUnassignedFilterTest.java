@@ -99,6 +99,7 @@ class DeviceStatusViewUnassignedFilterTest {
                 Boolean.TRUE,     // unassigned — under test
                 null, null, null, // serial, name, facilityName
                 null,             // hasActivePlaylist — unset
+                null,             // syncUnassigned — unset
                 null,             // projectIds — unrestricted
                 PageRequest.of(0, 50));
 
@@ -121,6 +122,7 @@ class DeviceStatusViewUnassignedFilterTest {
                 null,             // unassigned unset → no filter
                 null, null, null,
                 null,             // hasActivePlaylist — unset
+                null,             // syncUnassigned — unset
                 null,             // projectIds — unrestricted
                 PageRequest.of(0, 50));
 
@@ -135,10 +137,61 @@ class DeviceStatusViewUnassignedFilterTest {
                 Boolean.FALSE,    // explicit false → no filter
                 null, null, null,
                 null,             // hasActivePlaylist — unset
+                null,             // syncUnassigned — unset
                 null,             // projectIds — unrestricted
                 PageRequest.of(0, 50));
 
         assertEquals(5, page.getContent().size(),
                 "unassigned=false must behave like unset — no filter applied");
+    }
+
+    @Test
+    void findFiltered_syncUnassignedTrue_returnsOnlyDevicesWithNullSyncGroup() throws Exception {
+        // Place two of the region-200 devices into a sync group; the syncUnassigned=true filter
+        // must then exclude exactly those two and return the sync-group-less remainder. This also
+        // exercises the recreated device_status_view exposing d.sync_group_id.
+        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("INSERT INTO sync_group (id, project_id, name, created_at, updated_at) "
+                    + "VALUES (400, 200, 'SalesPointA', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            stmt.execute("UPDATE device SET sync_group_id = 400 WHERE id IN (2001, 2003)");
+        }
+
+        var page = repository.findFiltered(
+                null, 200L, null, null, null,
+                null,             // unassigned — unset
+                null, null, null,
+                null,             // hasActivePlaylist — unset
+                Boolean.TRUE,     // syncUnassigned — under test
+                null,             // projectIds — unrestricted
+                PageRequest.of(0, 50));
+
+        var serials = page.getContent().stream()
+                .map(v -> v.getSerialNumber())
+                .sorted()
+                .toList();
+        assertEquals(List.of("SN-G-2", "SN-U-2", "SN-U-3"), serials,
+                "syncUnassigned=true must return ONLY rows with sync_group_id IS NULL");
+        page.getContent().forEach(v ->
+                assertTrue(v.getSyncGroupId() == null,
+                        "Every returned row must have a null syncGroupId; got "
+                                + v.getSyncGroupId() + " for " + v.getSerialNumber()));
+    }
+
+    @Test
+    void deviceStatusView_exposesSyncGroupId_forGroupedDevices() throws Exception {
+        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("INSERT INTO sync_group (id, project_id, name, created_at, updated_at) "
+                    + "VALUES (401, 200, 'SalesPointB', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            stmt.execute("UPDATE device SET sync_group_id = 401 WHERE id = 2002");
+        }
+
+        var page = repository.findFiltered(
+                null, 200L, null, null, null, null, null, null, null, null, null, null,
+                PageRequest.of(0, 50));
+        var grouped = page.getContent().stream()
+                .filter(v -> "SN-G-2".equals(v.getSerialNumber()))
+                .findFirst().orElseThrow();
+        assertEquals(401L, grouped.getSyncGroupId(),
+                "device_status_view must surface the numeric sync_group_id");
     }
 }

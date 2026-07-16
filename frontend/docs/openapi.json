@@ -74,6 +74,9 @@
     "name" : "External",
     "description" : "Partner integration via X-API-Key"
   }, {
+    "name" : "Sync Groups",
+    "description" : "SyncGroup CRUD and membership (synchronized-playback sales points)"
+  }, {
     "name" : "Auth",
     "description" : "Current user profile"
   }, {
@@ -93,10 +96,152 @@
     "description" : "Operational incident lifecycle"
   } ],
   "paths" : {
+    "/api/sync-groups/{id}" : {
+      "get" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Sync group detail (with member device list)",
+        "operationId" : "detail",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "404" : {
+            "description" : "Unknown id, or out of operator scope",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Group detail",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Rename a sync group",
+        "operationId" : "rename",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/RenameSyncGroupRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "404" : {
+            "description" : "Unknown id, or out of operator scope",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "Duplicate (project_id, name) for the new name",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Renamed",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Validation failed",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete" : {
+        "tags" : [ "Sensitive", "Sync Groups" ],
+        "summary" : "[SENSITIVE] Delete a sync group",
+        "operationId" : "delete",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "404" : {
+            "description" : "Unknown id, or out of operator scope"
+          },
+          "403" : {
+            "description" : "Caller is not ADMIN"
+          },
+          "409" : {
+            "description" : "Group still has active member devices"
+          },
+          "204" : {
+            "description" : "Deleted (hard delete)"
+          }
+        }
+      }
+    },
     "/api/schedules/{id}" : {
       "get" : {
         "tags" : [ "schedule-controller" ],
-        "operationId" : "detail",
+        "operationId" : "detail_1",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -156,7 +301,7 @@
       },
       "delete" : {
         "tags" : [ "schedule-controller" ],
-        "operationId" : "delete",
+        "operationId" : "delete_1",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -177,7 +322,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "Region detail (with facility list)",
-        "operationId" : "detail_1",
+        "operationId" : "detail_2",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -291,7 +436,7 @@
         "tags" : [ "Sensitive", "Devices" ],
         "summary" : "[SENSITIVE] Hard-delete a region",
         "description" : "Two sequential 409 guards: active devices, then facilities. Regions are not soft-deleted — once a region passes every guard, the row is removed permanently.",
-        "operationId" : "delete_1",
+        "operationId" : "delete_2",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -430,7 +575,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "Project detail (with immediate child regions and device groups)",
-        "operationId" : "detail_2",
+        "operationId" : "detail_3",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -466,7 +611,7 @@
       "put" : {
         "tags" : [ "Sensitive", "Devices" ],
         "summary" : "[SENSITIVE] Rename a project",
-        "operationId" : "rename",
+        "operationId" : "rename_1",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -543,7 +688,7 @@
         "tags" : [ "Sensitive", "Devices" ],
         "summary" : "[SENSITIVE] Hard-delete a project",
         "description" : "Refuses with 409 if any region or device group still belongs to this project (two sequential guards: regions, then device groups). Operators must remove the project's regions (with their facilities / devices) and its device groups first. Once empty, the row is removed permanently — projects are not soft-deleted.",
-        "operationId" : "delete_2",
+        "operationId" : "delete_3",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -573,7 +718,7 @@
       "get" : {
         "tags" : [ "Content" ],
         "summary" : "Playlist detail (with ordered items)",
-        "operationId" : "detail_3",
+        "operationId" : "detail_4",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -609,7 +754,7 @@
       "put" : {
         "tags" : [ "Content" ],
         "summary" : "Rename a playlist",
-        "operationId" : "rename_1",
+        "operationId" : "rename_2",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -685,7 +830,7 @@
       "delete" : {
         "tags" : [ "Content", "Sensitive" ],
         "summary" : "[SENSITIVE] Soft-delete a playlist",
-        "operationId" : "delete_3",
+        "operationId" : "delete_4",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -977,7 +1122,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "Facility detail (with active member device list)",
-        "operationId" : "detail_4",
+        "operationId" : "detail_5",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -1091,7 +1236,7 @@
         "tags" : [ "Sensitive", "Devices" ],
         "summary" : "[SENSITIVE] Hard-delete a facility",
         "description" : "Two sequential 409 guards: active devices, then CONFIRMED assignments. Facilities are not soft-deleted — once a facility passes both guards, the row is removed permanently.",
-        "operationId" : "delete_4",
+        "operationId" : "delete_5",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -1180,7 +1325,7 @@
       },
       "delete" : {
         "tags" : [ "device-controller" ],
-        "operationId" : "delete_5",
+        "operationId" : "delete_6",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -1314,7 +1459,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "Device group detail (with member device list)",
-        "operationId" : "detail_5",
+        "operationId" : "detail_6",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -1350,7 +1495,7 @@
       "put" : {
         "tags" : [ "Devices" ],
         "summary" : "Rename a device group",
-        "operationId" : "rename_2",
+        "operationId" : "rename_3",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -1426,7 +1571,7 @@
       "delete" : {
         "tags" : [ "Sensitive", "Devices" ],
         "summary" : "[SENSITIVE] Soft-delete a device group",
-        "operationId" : "delete_6",
+        "operationId" : "delete_7",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -1729,10 +1874,294 @@
         }
       }
     },
+    "/api/sync-groups" : {
+      "get" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "List sync groups (filtered, paginated)",
+        "operationId" : "list_1",
+        "parameters" : [ {
+          "name" : "projectId",
+          "in" : "query",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }, {
+          "name" : "name",
+          "in" : "query",
+          "required" : false,
+          "schema" : {
+            "type" : "string"
+          }
+        }, {
+          "name" : "pageable",
+          "in" : "query",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/components/schemas/Pageable"
+          }
+        } ],
+        "responses" : {
+          "400" : {
+            "description" : "Page size > 100",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PageSyncGroupSummary"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller lacks the required role",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PageSyncGroupSummary"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Page of sync groups (possibly empty)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PageSyncGroupSummary"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Create a sync group",
+        "operationId" : "create_1",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/CreateSyncGroupRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "404" : {
+            "description" : "Project not found",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "201" : {
+            "description" : "Created",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Validation failed",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "Duplicate (project_id, name)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sync-groups/{id}/playback/jump" : {
+      "post" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Jump every device in the sync group to a playlist index",
+        "description" : "Re-anchors the group's loop so all members converge on `index` at a coordinated cut-over and stay frame-aligned. Delivered over the existing /sync wire; offline members converge on their next heartbeat. A re-jump overwrites the active jump.",
+        "operationId" : "jump",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/JumpRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "404" : {
+            "description" : "Unknown id, or out of operator scope",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupJumpResult"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupJumpResult"
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "Group empty or not content-coherent",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupJumpResult"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Jump scheduled; members re-anchored",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupJumpResult"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "index out of range [0, deliverableCount)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupJumpResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sync-groups/{id}/devices" : {
+      "post" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Set the members of a sync group",
+        "description" : "Sets device.syncGroup to this group for each id. Devices already in this group are no-ops; devices in a different sync group are moved silently and the previous sync-group id is reported in `movedFrom` for audit.",
+        "operationId" : "addDevices",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/AddDevicesRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "400" : {
+            "description" : "Devices belong to a different project",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
+                }
+              }
+            }
+          },
+          "404" : {
+            "description" : "Group out of scope, or one or more devices missing/soft-deleted",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Membership applied",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
+                },
+                "example" : {
+                  "addedCount" : 1,
+                  "alreadyMember" : [ 102 ],
+                  "movedFrom" : {
+                    "103" : 2
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/schedules" : {
       "get" : {
         "tags" : [ "schedule-controller" ],
-        "operationId" : "list_1",
+        "operationId" : "list_2",
         "parameters" : [ {
           "name" : "assignmentId",
           "in" : "query",
@@ -1788,7 +2217,7 @@
       },
       "post" : {
         "tags" : [ "schedule-controller" ],
-        "operationId" : "create_1",
+        "operationId" : "create_2",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -1817,7 +2246,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "List regions (filtered, paginated)",
-        "operationId" : "list_2",
+        "operationId" : "list_3",
         "parameters" : [ {
           "name" : "projectId",
           "in" : "query",
@@ -1877,7 +2306,7 @@
       "post" : {
         "tags" : [ "Devices" ],
         "summary" : "Create a region",
-        "operationId" : "create_2",
+        "operationId" : "create_3",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -1947,7 +2376,7 @@
         "tags" : [ "Devices" ],
         "summary" : "List all projects",
         "description" : "Unpaginated by design — projects are a small set in practice (single-digit to low-double-digit). Returns a flat ordered list.",
-        "operationId" : "list_3",
+        "operationId" : "list_4",
         "responses" : {
           "200" : {
             "description" : "List of projects (possibly empty)",
@@ -1980,7 +2409,7 @@
       "post" : {
         "tags" : [ "Sensitive", "Devices" ],
         "summary" : "[SENSITIVE] Create a project",
-        "operationId" : "create_3",
+        "operationId" : "create_4",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -2104,7 +2533,7 @@
       "get" : {
         "tags" : [ "Content" ],
         "summary" : "List playlists (filtered, paginated)",
-        "operationId" : "list_4",
+        "operationId" : "list_5",
         "parameters" : [ {
           "name" : "projectId",
           "in" : "query",
@@ -2164,7 +2593,7 @@
       "post" : {
         "tags" : [ "Content" ],
         "summary" : "Create a playlist",
-        "operationId" : "create_4",
+        "operationId" : "create_5",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -2418,7 +2847,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "List facilities (filtered, paginated)",
-        "operationId" : "list_5",
+        "operationId" : "list_6",
         "parameters" : [ {
           "name" : "regionId",
           "in" : "query",
@@ -2478,7 +2907,7 @@
       "post" : {
         "tags" : [ "Devices" ],
         "summary" : "Create a facility",
-        "operationId" : "create_5",
+        "operationId" : "create_6",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -2968,7 +3397,7 @@
       "get" : {
         "tags" : [ "Devices" ],
         "summary" : "List device groups (filtered, paginated)",
-        "operationId" : "list_6",
+        "operationId" : "list_7",
         "parameters" : [ {
           "name" : "projectId",
           "in" : "query",
@@ -3028,7 +3457,7 @@
       "post" : {
         "tags" : [ "Devices" ],
         "summary" : "Create a device group",
-        "operationId" : "create_6",
+        "operationId" : "create_7",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -3098,7 +3527,7 @@
         "tags" : [ "Devices" ],
         "summary" : "Add devices to a group",
         "description" : "Sets device.deviceGroup to this group for each id. Devices already in this group are no-ops; devices in a different group are moved silently and the previous group id is reported in `movedFrom` for audit.",
-        "operationId" : "addDevices",
+        "operationId" : "addDevices_1",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -3246,6 +3675,26 @@
           }
         },
         "responses" : {
+          "400" : {
+            "description" : "Validation failed (file type, size, name)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/UploadResponse"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/UploadResponse"
+                }
+              }
+            }
+          },
           "202" : {
             "description" : "Upload accepted; transcoding queued",
             "content" : {
@@ -3282,26 +3731,6 @@
                       "message" : "Upload accepted as orphan content (no project bound); attach a project via PATCH /api/content/{id}/project. Transcoding in progress"
                     }
                   }
-                }
-              }
-            }
-          },
-          "400" : {
-            "description" : "Validation failed (file type, size, name)",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/UploadResponse"
-                }
-              }
-            }
-          },
-          "403" : {
-            "description" : "Caller lacks ADMIN/OPERATOR",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/UploadResponse"
                 }
               }
             }
@@ -3390,22 +3819,22 @@
           }
         } ],
         "responses" : {
-          "401" : {
-            "description" : "Cookie missing, token unknown, expired, or replay detected",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
           "200" : {
             "description" : "New access token in body, rotated refresh token in cookie",
             "content" : {
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/AccessTokenResponse"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "Cookie missing, token unknown, expired, or replay detected",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3462,16 +3891,6 @@
           "required" : true
         },
         "responses" : {
-          "401" : {
-            "description" : "Invalid credentials, deactivated account, or no role assigned",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
           "200" : {
             "description" : "Authenticated; access token in body, refresh token in `refresh_token` cookie",
             "content" : {
@@ -3486,6 +3905,16 @@
                       "accessToken" : "eyJhbGciOiJIUzI1NiJ9.eyJzdWIi..."
                     }
                   }
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "Invalid credentials, deactivated account, or no role assigned",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3656,7 +4085,7 @@
         "tags" : [ "Admin" ],
         "summary" : "List API keys (metadata only — no hash, no plaintext)",
         "description" : "Returns prefix + lifecycle metadata. Plaintext keys and SHA-256 hashes are never exposed by this endpoint.",
-        "operationId" : "list_7",
+        "operationId" : "list_8",
         "responses" : {
           "200" : {
             "description" : "Key summaries",
@@ -3677,7 +4106,7 @@
         "tags" : [ "Sensitive", "Admin" ],
         "summary" : "[SENSITIVE] Mint a new API key",
         "description" : "Returns the plaintext key ONCE in `rawKey`. The database stores only the SHA-256 hash; a lost key cannot be recovered — issue a new one. The 8-char `prefix` is preserved in cleartext for log/UI identification.\n",
-        "operationId" : "create_7",
+        "operationId" : "create_8",
         "requestBody" : {
           "content" : {
             "application/json" : {
@@ -3692,16 +4121,6 @@
           "required" : true
         },
         "responses" : {
-          "400" : {
-            "description" : "Blank or oversized client name",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/CreatedKey"
-                }
-              }
-            }
-          },
           "201" : {
             "description" : "Key created — plaintext returned once",
             "content" : {
@@ -3712,6 +4131,16 @@
                   "prefix" : "kx9r8s2L",
                   "clientName" : "Acme Inc.",
                   "createdAt" : "2026-05-06T10:30:00Z"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Blank or oversized client name",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/CreatedKey"
                 }
               }
             }
@@ -3821,7 +4250,7 @@
         "tags" : [ "Sensitive", "Admin" ],
         "summary" : "[SENSITIVE] Delete a user (cascades advertiser content access)",
         "description" : "Removes the user. For ADVERTISERs, every linked content access grant is also removed in the same transaction. Irreversible.",
-        "operationId" : "delete_7",
+        "operationId" : "delete_8",
         "parameters" : [ {
           "name" : "userId",
           "in" : "path",
@@ -3894,6 +4323,55 @@
                   "items" : {
                     "$ref" : "#/components/schemas/LinkedContent"
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sync-groups/{id}/playback" : {
+      "get" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Sync-group playback view (pickable items + active jump)",
+        "description" : "The shared deliverable timeline the whole group can jump to. When the members are not content-coherent (different playlists/versions, a member with no active playlist, or an empty group) `coherent` is false with a `reason` and an empty item list.",
+        "operationId" : "playback",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "404" : {
+            "description" : "Unknown id, or out of operator scope",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupPlaybackView"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR/VIEWER",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupPlaybackView"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Playback view (coherent, or coherent:false + reason)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupPlaybackView"
                 }
               }
             }
@@ -4308,7 +4786,7 @@
       },
       "delete" : {
         "tags" : [ "file-controller" ],
-        "operationId" : "delete_8",
+        "operationId" : "delete_9",
         "parameters" : [ {
           "name" : "objectName",
           "in" : "path",
@@ -4545,7 +5023,7 @@
     "/api/events" : {
       "get" : {
         "tags" : [ "event-controller" ],
-        "operationId" : "list_8",
+        "operationId" : "list_9",
         "parameters" : [ {
           "name" : "deviceId",
           "in" : "query",
@@ -4610,7 +5088,7 @@
     "/api/devices" : {
       "get" : {
         "tags" : [ "device-controller" ],
-        "operationId" : "list_9",
+        "operationId" : "list_10",
         "parameters" : [ {
           "name" : "status",
           "in" : "query",
@@ -4681,6 +5159,13 @@
           }
         }, {
           "name" : "hasActivePlaylist",
+          "in" : "query",
+          "required" : false,
+          "schema" : {
+            "type" : "boolean"
+          }
+        }, {
+          "name" : "syncUnassigned",
           "in" : "query",
           "required" : false,
           "schema" : {
@@ -4911,7 +5396,7 @@
     "/api/content" : {
       "get" : {
         "tags" : [ "content-controller" ],
-        "operationId" : "list_10",
+        "operationId" : "list_11",
         "parameters" : [ {
           "name" : "projectId",
           "in" : "query",
@@ -4960,7 +5445,7 @@
     "/api/content/{id}" : {
       "get" : {
         "tags" : [ "content-controller" ],
-        "operationId" : "detail_6",
+        "operationId" : "detail_7",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -4986,7 +5471,7 @@
       "delete" : {
         "tags" : [ "Sensitive" ],
         "summary" : "[SENSITIVE] Soft-delete a content file",
-        "operationId" : "delete_9",
+        "operationId" : "delete_10",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -5113,6 +5598,42 @@
         }
       }
     },
+    "/api/sync-groups/{id}/devices/{deviceId}" : {
+      "delete" : {
+        "tags" : [ "Sync Groups" ],
+        "summary" : "Remove a device from this sync group",
+        "description" : "Sets device.syncGroup = null (the device returns to the project's unassigned pool). Removing the last device is allowed; empty sync groups remain valid.",
+        "operationId" : "removeDevice",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }, {
+          "name" : "deviceId",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "404" : {
+            "description" : "Group/device missing, or device is not in this group"
+          },
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR"
+          },
+          "204" : {
+            "description" : "Removed"
+          }
+        }
+      }
+    },
     "/api/playlists/{id}/items/{itemId}" : {
       "delete" : {
         "tags" : [ "Content" ],
@@ -5153,7 +5674,7 @@
         "tags" : [ "Devices" ],
         "summary" : "Remove a device from this group",
         "description" : "Sets device.deviceGroup = null. Removing the last device is allowed; empty groups remain valid targets for assignment preview/setup.",
-        "operationId" : "removeDevice",
+        "operationId" : "removeDevice_1",
         "parameters" : [ {
           "name" : "id",
           "in" : "path",
@@ -5263,6 +5784,68 @@
   },
   "components" : {
     "schemas" : {
+      "RenameSyncGroupRequest" : {
+        "required" : [ "name" ],
+        "type" : "object",
+        "properties" : {
+          "name" : {
+            "maxLength" : 100,
+            "minLength" : 0,
+            "type" : "string"
+          }
+        }
+      },
+      "SyncGroupDetail" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "projectId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "projectName" : {
+            "type" : "string"
+          },
+          "name" : {
+            "type" : "string"
+          },
+          "deviceCount" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "devices" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/SyncGroupMember"
+            }
+          }
+        }
+      },
+      "SyncGroupMember" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "serialNumber" : {
+            "type" : "string"
+          },
+          "name" : {
+            "type" : "string"
+          },
+          "status" : {
+            "type" : "string"
+          }
+        }
+      },
       "UpdateScheduleRequest" : {
         "required" : [ "endTimeUtc", "repeatType", "startTimeUtc" ],
         "type" : "object",
@@ -5758,6 +6341,13 @@
             "type" : "integer",
             "format" : "int64"
           },
+          "syncGroupId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "syncGroupName" : {
+            "type" : "string"
+          },
           "lastHeartbeatAt" : {
             "type" : "string",
             "format" : "date-time"
@@ -5926,6 +6516,126 @@
             "type" : "string"
           }
         }
+      },
+      "CreateSyncGroupRequest" : {
+        "required" : [ "name", "projectId" ],
+        "type" : "object",
+        "properties" : {
+          "projectId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "name" : {
+            "maxLength" : 100,
+            "minLength" : 0,
+            "type" : "string"
+          }
+        }
+      },
+      "JumpRequest" : {
+        "required" : [ "index" ],
+        "type" : "object",
+        "properties" : {
+          "index" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "Dispatched" : {
+        "type" : "object",
+        "properties" : {
+          "sent" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "skipped" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "failed" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "SyncGroupJumpResult" : {
+        "type" : "object",
+        "properties" : {
+          "syncGroupId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "index" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "anchorEpochMs" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "activateAtEpochMs" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "activateAtIso" : {
+            "type" : "string"
+          },
+          "memberCount" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "dispatched" : {
+            "$ref" : "#/components/schemas/Dispatched"
+          }
+        }
+      },
+      "AddDevicesRequest" : {
+        "required" : [ "deviceIds" ],
+        "type" : "object",
+        "properties" : {
+          "deviceIds" : {
+            "type" : "array",
+            "items" : {
+              "type" : "integer",
+              "format" : "int64"
+            }
+          }
+        }
+      },
+      "SyncGroupAddDevicesResponse" : {
+        "type" : "object",
+        "properties" : {
+          "addedCount" : {
+            "type" : "integer",
+            "description" : "Number of devices newly attached to this sync group (excludes already-member rows)",
+            "format" : "int32",
+            "example" : 1
+          },
+          "alreadyMember" : {
+            "type" : "array",
+            "description" : "Device ids the caller asked for that were already in this sync group",
+            "example" : [ 102 ],
+            "items" : {
+              "type" : "integer",
+              "description" : "Device ids the caller asked for that were already in this sync group",
+              "format" : "int64"
+            }
+          },
+          "movedFrom" : {
+            "type" : "object",
+            "additionalProperties" : {
+              "type" : "integer",
+              "description" : "For devices silently moved out of a different sync group, maps deviceId -> previousSyncGroupId. Empty when no devices were moved.",
+              "format" : "int64"
+            },
+            "description" : "For devices silently moved out of a different sync group, maps deviceId -> previousSyncGroupId. Empty when no devices were moved.",
+            "example" : {
+              "103" : 2
+            }
+          }
+        },
+        "description" : "Result of POST /api/sync-groups/{id}/devices"
       },
       "CreateScheduleRequest" : {
         "required" : [ "assignmentId", "endTimeUtc", "repeatType", "startTimeUtc" ],
@@ -6507,19 +7217,6 @@
           }
         }
       },
-      "AddDevicesRequest" : {
-        "required" : [ "deviceIds" ],
-        "type" : "object",
-        "properties" : {
-          "deviceIds" : {
-            "type" : "array",
-            "items" : {
-              "type" : "integer",
-              "format" : "int64"
-            }
-          }
-        }
-      },
       "AddDevicesResponse" : {
         "type" : "object",
         "properties" : {
@@ -6662,6 +7359,17 @@
           }
         }
       },
+      "AccessTokenResponse" : {
+        "type" : "object",
+        "properties" : {
+          "accessToken" : {
+            "type" : "string",
+            "description" : "Short-lived JWT access token. Send as `Authorization: Bearer <token>`.",
+            "example" : "eyJhbGciOiJIUzI1NiJ9.eyJzdWIi..."
+          }
+        },
+        "description" : "Access-token response body. The refresh token is delivered separately as an HttpOnly cookie."
+      },
       "ErrorResponse" : {
         "type" : "object",
         "properties" : {
@@ -6705,17 +7413,6 @@
             "type" : "object"
           }
         }
-      },
-      "AccessTokenResponse" : {
-        "type" : "object",
-        "properties" : {
-          "accessToken" : {
-            "type" : "string",
-            "description" : "Short-lived JWT access token. Send as `Authorization: Bearer <token>`.",
-            "example" : "eyJhbGciOiJIUzI1NiJ9.eyJzdWIi..."
-          }
-        },
-        "description" : "Access-token response body. The refresh token is delivered separately as an HttpOnly cookie."
       },
       "LoginRequest" : {
         "required" : [ "password", "username" ],
@@ -7015,6 +7712,162 @@
           },
           "status" : {
             "type" : "string"
+          }
+        }
+      },
+      "PageSyncGroupSummary" : {
+        "type" : "object",
+        "properties" : {
+          "totalPages" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "totalElements" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "size" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/SyncGroupSummary"
+            }
+          },
+          "number" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "sort" : {
+            "$ref" : "#/components/schemas/SortObject"
+          },
+          "pageable" : {
+            "$ref" : "#/components/schemas/PageableObject"
+          },
+          "numberOfElements" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "first" : {
+            "type" : "boolean"
+          },
+          "last" : {
+            "type" : "boolean"
+          },
+          "empty" : {
+            "type" : "boolean"
+          }
+        }
+      },
+      "SyncGroupSummary" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "projectId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "projectName" : {
+            "type" : "string"
+          },
+          "name" : {
+            "type" : "string"
+          },
+          "deviceCount" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      },
+      "ActiveJump" : {
+        "type" : "object",
+        "properties" : {
+          "index" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "activateAt" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "activateAtIso" : {
+            "type" : "string"
+          }
+        }
+      },
+      "SyncGroupPlaybackItem" : {
+        "type" : "object",
+        "properties" : {
+          "index" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "fileId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "title" : {
+            "type" : "string"
+          },
+          "durationSeconds" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "slotStartMs" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "slotDurationMs" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "SyncGroupPlaybackView" : {
+        "type" : "object",
+        "properties" : {
+          "syncGroupId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "coherent" : {
+            "type" : "boolean"
+          },
+          "reason" : {
+            "type" : "string"
+          },
+          "playlistId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "playlistName" : {
+            "type" : "string"
+          },
+          "loopDurationMs" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "memberCount" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "items" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/SyncGroupPlaybackItem"
+            }
+          },
+          "activeJump" : {
+            "$ref" : "#/components/schemas/ActiveJump"
           }
         }
       },
@@ -7934,6 +8787,10 @@
             "type" : "string"
           },
           "deviceGroupId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "syncGroupId" : {
             "type" : "integer",
             "format" : "int64"
           },

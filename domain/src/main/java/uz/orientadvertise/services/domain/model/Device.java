@@ -35,6 +35,10 @@ public class Device {
     @JoinColumn(name = "device_group_id")
     private DeviceGroup deviceGroup;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "sync_group_id")
+    private SyncGroup syncGroup;
+
     @Column(nullable = false, length = 100)
     private String serialNumber;
 
@@ -108,16 +112,25 @@ public class Device {
     public DeviceGroup getDeviceGroup() { return deviceGroup; }
     public void setDeviceGroup(DeviceGroup deviceGroup) { this.deviceGroup = deviceGroup; this.updatedAt = Instant.now(); }
 
+    /** The explicit {@link SyncGroup} this device was placed in (its "sales point"), or {@code null}. */
+    public SyncGroup getSyncGroup() { return syncGroup; }
+    public void setSyncGroup(SyncGroup syncGroup) { this.syncGroup = syncGroup; this.updatedAt = Instant.now(); }
+
     /**
-     * The synchronized-playback group this device belongs to (§1.1): facility, else device group,
-     * else region — prefixed so the axes never collide ({@code "fac-42"} / {@code "grp-7"} /
-     * {@code "reg-3"}). Devices sharing this id are one playback group; only those that ALSO resolve
-     * the same content version end up frame-aligned, so this is a coordination label, not the schedule
-     * key. Returns {@code null} only when the device has no region at all — the device then free-runs
-     * solo (today's behavior). Derived, not stored; must be read inside a transaction because the
-     * grouping associations are {@code LAZY}. Operators relocate devices, so callers re-read it live.
+     * The synchronized-playback group this device belongs to (§1.1): explicit sync group, else
+     * facility, else device group, else region — prefixed so the axes never collide
+     * ({@code "sg-9"} / {@code "fac-42"} / {@code "grp-7"} / {@code "reg-3"}). The {@code sg-}
+     * tier sits at the TOP: an operator-assigned {@link SyncGroup} (the "sales point") overrides
+     * the derived fallbacks; removing the device from its sync group reverts the wire label to the
+     * next non-null fallback (never solo unless the device has no region). Devices sharing this id
+     * are one playback group; only those that ALSO resolve the same content version end up
+     * frame-aligned, so this is a coordination label, not the schedule key. The value is opaque to
+     * the device (ANDROID_DEVICE_FLOW_SPEC §4) and re-read every heartbeat. Returns {@code null}
+     * only when the device has no region at all — the device then free-runs solo. Derived, not
+     * stored; must be read inside a transaction because the grouping associations are {@code LAZY}.
      */
     public String getSyncGroupId() {
+        if (syncGroup != null && syncGroup.getId() != null) return "sg-" + syncGroup.getId();
         if (facility != null && facility.getId() != null) return "fac-" + facility.getId();
         if (deviceGroup != null && deviceGroup.getId() != null) return "grp-" + deviceGroup.getId();
         if (region != null && region.getId() != null) return "reg-" + region.getId();

@@ -42,8 +42,8 @@ class FlywayMigrationTest {
         MigrationInfo[] applied = info.applied();
 
         assertNotNull(applied);
-        assertEquals(40, applied.length);
-        for (int i = 0; i < 40; i++) {
+        assertEquals(42, applied.length);
+        for (int i = 0; i < 42; i++) {
             assertEquals(String.valueOf(i + 1), applied[i].getVersion().toString());
         }
     }

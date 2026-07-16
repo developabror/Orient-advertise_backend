@@ -63,7 +63,7 @@ class DeviceManagementServiceTest {
     void list_unassignedTrueWithDeviceGroupId_throws400() {
         var ex = assertThrows(IllegalArgumentException.class,
                 () -> service.list(null, 1L, null, null, 5L, Boolean.TRUE,
-                        null, null, null, null, org.springframework.data.domain.PageRequest.of(0, 20)));
+                        null, null, null, null, null, org.springframework.data.domain.PageRequest.of(0, 20)));
         assertTrue(ex.getMessage().contains("mutually exclusive"),
                 "Expected mutual-exclusivity error message; got: " + ex.getMessage());
     }
@@ -75,10 +75,10 @@ class DeviceManagementServiceTest {
                 regionRepository, facilityRepository, incidentRepository, operatorScopeResolver);
         var pageable = org.springframework.data.domain.PageRequest.of(0, 20);
         when(statusViewRepository.findFiltered(any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(org.springframework.data.domain.Page.empty());
 
-        s.list(null, 1L, null, null, null, Boolean.TRUE, null, null, null, null, pageable);
+        s.list(null, 1L, null, null, null, Boolean.TRUE, null, null, null, null, null, pageable);
 
         org.mockito.Mockito.verify(statusViewRepository).findFiltered(
                 org.mockito.ArgumentMatchers.eq(null),
@@ -90,8 +90,9 @@ class DeviceManagementServiceTest {
                 org.mockito.ArgumentMatchers.eq(null),
                 org.mockito.ArgumentMatchers.eq(null),
                 org.mockito.ArgumentMatchers.eq(null),
-                org.mockito.ArgumentMatchers.eq(null),
-                org.mockito.ArgumentMatchers.eq(null),
+                org.mockito.ArgumentMatchers.eq(null),   // hasActivePlaylist
+                org.mockito.ArgumentMatchers.eq(null),   // syncUnassigned
+                org.mockito.ArgumentMatchers.eq(null),   // projectIds
                 org.mockito.ArgumentMatchers.eq(pageable));
     }
 
@@ -102,16 +103,17 @@ class DeviceManagementServiceTest {
                 regionRepository, facilityRepository, incidentRepository, operatorScopeResolver);
         var pageable = org.springframework.data.domain.PageRequest.of(0, 20);
         when(statusViewRepository.findFiltered(any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(org.springframework.data.domain.Page.empty());
 
-        s.list(null, null, null, null, null, null, null, null, null, Boolean.TRUE, pageable);
+        s.list(null, null, null, null, null, null, null, null, null, Boolean.TRUE, null, pageable);
 
-        // hasActivePlaylist is the 10th positional arg (after the new projectId, before projectIds/pageable).
+        // hasActivePlaylist is the 10th positional arg; syncUnassigned (11th) then projectIds/pageable.
         org.mockito.Mockito.verify(statusViewRepository).findFiltered(
                 any(), any(), any(), any(), any(), any(), any(), any(), any(),
-                org.mockito.ArgumentMatchers.eq(Boolean.TRUE),
-                org.mockito.ArgumentMatchers.eq(null),
+                org.mockito.ArgumentMatchers.eq(Boolean.TRUE),   // hasActivePlaylist
+                org.mockito.ArgumentMatchers.eq(null),           // syncUnassigned
+                org.mockito.ArgumentMatchers.eq(null),           // projectIds
                 org.mockito.ArgumentMatchers.eq(pageable));
     }
 
@@ -122,15 +124,15 @@ class DeviceManagementServiceTest {
                 regionRepository, facilityRepository, incidentRepository, operatorScopeResolver);
         var pageable = org.springframework.data.domain.PageRequest.of(0, 20);
         when(statusViewRepository.findFiltered(any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any()))
+                any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(org.springframework.data.domain.Page.empty());
 
         // hasActivePlaylist + unassigned together (no deviceGroupId) → no exception.
         org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
-                s.list(null, 1L, null, null, null, Boolean.TRUE, null, null, null, Boolean.TRUE, pageable));
+                s.list(null, 1L, null, null, null, Boolean.TRUE, null, null, null, Boolean.TRUE, null, pageable));
         // hasActivePlaylist + deviceGroupId together (unassigned null) → no exception.
         org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
-                s.list(null, 1L, null, null, 5L, null, null, null, null, Boolean.FALSE, pageable));
+                s.list(null, 1L, null, null, 5L, null, null, null, null, Boolean.FALSE, null, pageable));
     }
 
     @Test

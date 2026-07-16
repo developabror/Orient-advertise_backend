@@ -29,6 +29,9 @@ public class DeviceStatusView {
     @Column(name = "device_group_id")
     private Long deviceGroupId;
 
+    @Column(name = "sync_group_id")
+    private Long syncGroupId;
+
     @Column(name = "serial_number")
     private String serialNumber;
 
@@ -64,6 +67,7 @@ public class DeviceStatusView {
     public Long getFacilityId() { return facilityId; }
     public String getFacilityName() { return facilityName; }
     public Long getDeviceGroupId() { return deviceGroupId; }
+    public Long getSyncGroupId() { return syncGroupId; }
     public String getSerialNumber() { return serialNumber; }
     public String getName() { return name; }
     public Instant getLastHeartbeatAt() { return lastHeartbeatAt; }
