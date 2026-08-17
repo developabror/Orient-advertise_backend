@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.129`
+`1.0.130`
 
 ## Architecture
 
@@ -1192,6 +1192,41 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Playback batch: DB-level idempotent insert (v1.0.130)
+
+**Playback telemetry: DB-level idempotent insert (`ON CONFLICT DO NOTHING`); a duplicate no longer
+500s or discards the rest of the batch.** No migration — the fix leans on `uq_playback_dedup`, live
+since `V11`.
+
+`PlaybackLog` uses `GenerationType.IDENTITY`, so `repository.save()` issued its INSERT eagerly inside
+the batch transaction. One duplicate entry therefore raised SQLSTATE 23505, which aborted the
+PostgreSQL transaction (`25P02` on every later statement) **and** marked the Hibernate session
+rollback-only — both *before* the `catch (DataIntegrityViolationException)` could run. The catch
+returned a tidy `Duplicate` tally while the commit threw `UnexpectedRollbackException`, so **every
+row in the batch was discarded**, the device got a 500, and — per `ANDROID_DEVICE_FLOW_SPEC.md`
+("retry only on network/5xx") — a correct client retried the identical payload forever. One wedged
+device lost ~46 h of telemetry before the fix.
+
+- Dedup now happens **in** the INSERT: `PlaybackLogRepository.insertIgnoringDuplicate(...)` is a
+  native `INSERT … ON CONFLICT DO NOTHING` returning `1` (created) or `0` (duplicate). A duplicate
+  never raises, so nothing aborts and the whole batch commits with an exact tally in one plain
+  `@Transactional`.
+- The conflict target is deliberately **omitted** — H2 `MODE=PostgreSQL` (the test profile) rejects
+  an explicit target. Exact here because `playback_log` has only the identity PK and
+  `uq_playback_dedup`. Add an explicit target if a third unique constraint is ever introduced.
+- `isDuplicateViolation` (driver-message string matching) is gone, as is the try/catch in `record()`.
+  `PlaybackLogResult.Created` no longer carries an entity — nothing is materialized on the write path.
+- Same-request duplicates are short-circuited by an in-batch seen-set; only **accepted** keys enter
+  it, so a repeated *rejected* entry is still rejected twice. `ON CONFLICT` remains the correctness
+  mechanism — the set only saves a round trip.
+- Concurrent flushes are handled by PostgreSQL speculative insertion (the loser tallies `duplicate`),
+  with no application-level retry and no TOCTOU window.
+- **Wire contract unchanged.** `POST /api/devices/{id}/playback` still returns 200 with
+  `{total, created, duplicate, rejected, rejections}` — it simply starts being honoured.
+- **Expected after deploy:** wedged devices flush their queued backlog at once; `duplicate` counts
+  spike for a few hours then fall to near zero. A device whose `duplicate` count stays high after the
+  drain indicates a *client-side* timestamp bug (a separate ticket).
 
 ### Sync-group "Jump to video N" — group re-anchor over `/sync` (v1.0.129)
 

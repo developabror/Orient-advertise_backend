@@ -9,7 +9,6 @@ import org.springframework.dao.DataIntegrityViolationException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Device;
-import uz.orientadvertise.services.domain.model.PlaybackLog;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.PlaybackLogRepository;
@@ -19,7 +18,11 @@ import uz.orientadvertise.services.service.PlaybackLogService.PlaybackLogResult;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -49,15 +52,32 @@ class PlaybackLogServiceTest {
         when(contentFile.getId()).thenReturn(10L);
     }
 
+    /**
+     * {@code insertIgnoringDuplicate} returns a primitive {@code int}, so an unstubbed mock
+     * returns 0 — which the service correctly reads as "duplicate". Any test asserting
+     * {@code Created} MUST stub it to 1 explicitly or it passes for the wrong reason.
+     */
+    private void stubInsertReturns(int affected) {
+        when(repository.insertIgnoringDuplicate(anyLong(), anyLong(), nullable(Long.class),
+                any(Instant.class), nullable(Integer.class), any(Instant.class)))
+                .thenReturn(affected);
+    }
+
+    private void verifyNoInsertAttempted() {
+        verify(repository, never()).insertIgnoringDuplicate(anyLong(), anyLong(),
+                nullable(Long.class), any(Instant.class), nullable(Integer.class), any(Instant.class));
+    }
+
     @Test
     void record_validPlayedAt_createsEntry() {
         var playedAt = Instant.now().minus(5, ChronoUnit.MINUTES);
-        when(repository.save(any(PlaybackLog.class))).thenAnswer(inv -> inv.getArgument(0));
+        stubInsertReturns(1);
 
         var result = service.record(device, contentFile, null, playedAt, 30);
 
         assertInstanceOf(PlaybackLogResult.Created.class, result);
-        verify(repository).save(any(PlaybackLog.class));
+        verify(repository).insertIgnoringDuplicate(eq(1L), eq(10L), nullable(Long.class),
+                eq(playedAt), eq(30), any(Instant.class));
     }
 
     @Test
@@ -67,13 +87,13 @@ class PlaybackLogServiceTest {
         var result = service.record(device, contentFile, null, playedAt, 30);
 
         assertInstanceOf(PlaybackLogResult.Rejected.class, result);
-        verify(repository, never()).save(any());
+        verifyNoInsertAttempted();
     }
 
     @Test
     void record_playedAtSlightlyInFutureWithinSkew_accepted() {
         var playedAt = Instant.now().plus(15, ChronoUnit.SECONDS); // 15s < 30s tolerance
-        when(repository.save(any(PlaybackLog.class))).thenAnswer(inv -> inv.getArgument(0));
+        stubInsertReturns(1);
 
         var result = service.record(device, contentFile, null, playedAt, 30);
 
@@ -83,7 +103,7 @@ class PlaybackLogServiceTest {
     @Test
     void record_exactlyAtSkewBoundary_accepted() {
         var playedAt = Instant.now().plus(29, ChronoUnit.SECONDS); // 29s < 30s
-        when(repository.save(any(PlaybackLog.class))).thenAnswer(inv -> inv.getArgument(0));
+        stubInsertReturns(1);
 
         var result = service.record(device, contentFile, null, playedAt, 30);
 
@@ -92,9 +112,10 @@ class PlaybackLogServiceTest {
 
     @Test
     void record_duplicate_returnsDuplicateResult() {
+        // 0 rows affected = the database skipped an existing (device, content, played_at) via
+        // ON CONFLICT DO NOTHING. No exception is raised, so the caller's transaction survives.
         var playedAt = Instant.now().minus(1, ChronoUnit.MINUTES);
-        when(repository.save(any(PlaybackLog.class)))
-                .thenThrow(new DataIntegrityViolationException("uq_playback_dedup"));
+        stubInsertReturns(0);
 
         var result = service.record(device, contentFile, null, playedAt, 30);
 
@@ -103,8 +124,11 @@ class PlaybackLogServiceTest {
 
     @Test
     void record_nonDuplicateIntegrityViolation_rethrows() {
+        // ON CONFLICT DO NOTHING covers unique/exclusion conflicts only. A foreign-key violation
+        // is a genuine defect and must still propagate rather than be swallowed as a duplicate.
         var playedAt = Instant.now().minus(1, ChronoUnit.MINUTES);
-        when(repository.save(any(PlaybackLog.class)))
+        when(repository.insertIgnoringDuplicate(anyLong(), anyLong(), nullable(Long.class),
+                any(Instant.class), nullable(Integer.class), any(Instant.class)))
                 .thenThrow(new DataIntegrityViolationException("fk_playback_device"));
 
         org.junit.jupiter.api.Assertions.assertThrows(DataIntegrityViolationException.class, () ->
@@ -114,7 +138,7 @@ class PlaybackLogServiceTest {
     @Test
     void record_playedAtInPast_accepted() {
         var playedAt = Instant.now().minus(1, ChronoUnit.HOURS);
-        when(repository.save(any(PlaybackLog.class))).thenAnswer(inv -> inv.getArgument(0));
+        stubInsertReturns(1);
 
         var result = service.record(device, contentFile, null, playedAt, 60);
 
@@ -122,16 +146,38 @@ class PlaybackLogServiceTest {
     }
 
     @Test
-    void record_withAssignment_saved() {
+    void record_withAssignment_passesAssignmentIdToTheInsert() {
+        // Created no longer carries an entity — nothing is materialized on the write path — so
+        // the assignment binding is asserted at the call instead.
         var assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(7L);
         var playedAt = Instant.now().minus(10, ChronoUnit.SECONDS);
-        when(repository.save(any(PlaybackLog.class))).thenAnswer(inv -> inv.getArgument(0));
+        stubInsertReturns(1);
 
         var result = service.record(device, contentFile, assignment, playedAt, 45);
 
         assertInstanceOf(PlaybackLogResult.Created.class, result);
-        var created = (PlaybackLogResult.Created) result;
-        assertNotNull(created.log().getAssignment());
+        verify(repository).insertIgnoringDuplicate(eq(1L), eq(10L), eq(7L), eq(playedAt),
+                eq(45), any(Instant.class));
+    }
+
+    /**
+     * The write path must never materialize a {@link uz.orientadvertise.services.domain.model.PlaybackLog}
+     * entity. {@code save()} issues its INSERT eagerly under IDENTITY generation, and a unique
+     * violation there aborts the transaction before any catch block can run — the exact defect
+     * this change removed. Guards against a regression that reintroduces it.
+     */
+    @Test
+    void record_neverUsesTheEntitySavePath() {
+        stubInsertReturns(1);
+
+        service.record(device, contentFile, null, Instant.now().minusSeconds(60), 30);
+
+        boolean savedAnything = mockingDetails(repository).getInvocations().stream()
+                .anyMatch(i -> i.getMethod().getName().equals("save")
+                        || i.getMethod().getName().equals("saveAll"));
+        org.junit.jupiter.api.Assertions.assertFalse(savedAnything,
+                "the playback write path must go through insertIgnoringDuplicate, not save()");
     }
 
     @Test

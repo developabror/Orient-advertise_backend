@@ -27,7 +27,10 @@ import uz.orientadvertise.services.service.PlaybackLogService.PlaybackEntry;
  * <ul>
  *   <li>{@code playedAt} in the future (beyond clock-skew tolerance) → entry rejected with reason</li>
  *   <li>{@code playedAt} older than 90 days → entry rejected (matches retention window)</li>
- *   <li>Duplicate {@code (deviceId, contentFileId, playedAt)} → silently ignored (idempotent)</li>
+ *   <li>Duplicate {@code (deviceId, contentFileId, playedAt)} → silently ignored (idempotent),
+ *       counted in {@code duplicate}. Dedup happens in the INSERT itself
+ *       ({@code ON CONFLICT DO NOTHING}), so a duplicate can never abort the batch transaction
+ *       or discard the entries around it — this endpoint does not 500 on a repeated entry.</li>
  *   <li>Batch size &gt; 500 → 400 (whole request rejected; client must chunk)</li>
  * </ul>
  */

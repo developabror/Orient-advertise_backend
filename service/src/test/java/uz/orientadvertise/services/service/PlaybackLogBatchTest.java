@@ -3,17 +3,16 @@ package uz.orientadvertise.services.service;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.dao.DataIntegrityViolationException;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Device;
-import uz.orientadvertise.services.domain.model.PlaybackLog;
 import uz.orientadvertise.services.domain.model.Playlist;
 import uz.orientadvertise.services.domain.model.PlaylistItem;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
@@ -26,6 +25,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -59,7 +60,15 @@ class PlaybackLogBatchTest {
 
         when(deviceRepository.findByIdAndDeletedAtIsNull(1L)).thenReturn(Optional.of(device));
         when(contentFileRepository.findById(10L)).thenReturn(Optional.of(contentFile));
-        when(repository.save(any(PlaybackLog.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        // DANGER: insertIgnoringDuplicate returns a primitive int, so an UNSTUBBED mock returns
+        // 0 — which the service reads as "duplicate". Every Created assertion would silently
+        // flip green-but-wrong. Stub it key-aware so dedup is simulated by (contentFileId,
+        // playedAt) rather than by call order: 1 the first time a key is seen, 0 afterwards.
+        var seen = new HashSet<List<Object>>();
+        when(repository.insertIgnoringDuplicate(anyLong(), anyLong(), nullable(Long.class),
+                any(Instant.class), nullable(Integer.class), any(Instant.class)))
+                .thenAnswer(inv -> seen.add(List.of(inv.getArgument(1), inv.getArgument(3))) ? 1 : 0);
     }
 
     @Test
@@ -129,7 +138,8 @@ class PlaybackLogBatchTest {
         var result = service.recordBatch(1L, entries);
 
         assertEquals(500, result.created());
-        verify(repository, times(500)).save(any(PlaybackLog.class));
+        verify(repository, times(500)).insertIgnoringDuplicate(anyLong(), anyLong(),
+                nullable(Long.class), any(Instant.class), nullable(Integer.class), any(Instant.class));
     }
 
     @Test
@@ -199,11 +209,9 @@ class PlaybackLogBatchTest {
 
     @Test
     void duplicate_idempotentlyDedupedNotRejected() {
-        // First save succeeds, second hits unique constraint
-        when(repository.save(any(PlaybackLog.class)))
-                .thenAnswer(inv -> inv.getArgument(0))
-                .thenThrow(new DataIntegrityViolationException("uq_playback_dedup violated"));
-
+        // These tallies become true of PRODUCTION for the first time: pre-fix the batch
+        // transaction was already rollback-only by this point, so the counts described a
+        // contract the commit could not honour.
         Instant t1 = Instant.now().minusSeconds(60);
         var entries = List.of(
                 new PlaybackEntry(10L, t1, 30),
@@ -214,15 +222,13 @@ class PlaybackLogBatchTest {
         assertEquals(1, result.created());
         assertEquals(1, result.duplicate());
         assertEquals(0, result.rejected());
+        // The in-request seen-set short-circuits the repeat, so only ONE round trip happens.
+        verify(repository, times(1)).insertIgnoringDuplicate(anyLong(), anyLong(),
+                nullable(Long.class), any(Instant.class), nullable(Integer.class), any(Instant.class));
     }
 
     @Test
     void mixedBatch_validInvalidDuplicate_independentlyTallied() {
-        when(repository.save(any(PlaybackLog.class)))
-                .thenAnswer(inv -> inv.getArgument(0))                                // 1 created
-                .thenAnswer(inv -> inv.getArgument(0))                                // 2 created
-                .thenThrow(new DataIntegrityViolationException("uq_playback_dedup")); // 3 duplicate
-
         Instant good1 = Instant.now().minusSeconds(60);
         Instant good2 = Instant.now().minusSeconds(120);
         Instant dup = good1; // duplicate of good1
@@ -241,6 +247,40 @@ class PlaybackLogBatchTest {
         assertEquals(2, result.created());
         assertEquals(1, result.duplicate());
         assertEquals(2, result.rejected());
+    }
+
+    @Test
+    void preexistingRowInDb_countedDuplicate_notRejected() {
+        // The row already exists from an EARLIER request, so the DB skips it and reports 0
+        // affected. That is a duplicate, never a rejection — the device must not be told the
+        // entry was bad, or it would keep retrying.
+        when(repository.insertIgnoringDuplicate(anyLong(), anyLong(), nullable(Long.class),
+                any(Instant.class), nullable(Integer.class), any(Instant.class))).thenReturn(0);
+
+        var result = service.recordBatch(1L, List.of(
+                new PlaybackEntry(10L, Instant.now().minusSeconds(60), 30)));
+
+        assertEquals(0, result.created());
+        assertEquals(1, result.duplicate());
+        assertEquals(0, result.rejected());
+        assertTrue(result.rejections().isEmpty());
+    }
+
+    @Test
+    void rejectedEntryRepeatedInSameBatch_rejectedTwiceNotDeduped() {
+        // Guards the "only ACCEPTED keys enter seenInRequest" rule: a repeated entry that was
+        // rejected must be rejected again, not silently reclassified as a duplicate.
+        Instant future = Instant.now().plusSeconds(600); // beyond the 30s skew tolerance
+        var entries = List.of(
+                new PlaybackEntry(10L, future, 30),
+                new PlaybackEntry(10L, future, 30));
+
+        var result = service.recordBatch(1L, entries);
+
+        assertEquals(0, result.created());
+        assertEquals(0, result.duplicate());
+        assertEquals(2, result.rejected());
+        assertEquals(2, result.rejections().size());
     }
 
     @Test

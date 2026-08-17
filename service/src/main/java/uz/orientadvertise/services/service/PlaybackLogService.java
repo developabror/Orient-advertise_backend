@@ -10,7 +10,6 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
@@ -58,7 +57,14 @@ public class PlaybackLogService {
      * Edge cases:
      * 1. played_at in the future beyond clock skew tolerance → rejected
      * 2. played_at older than 90 days → rejected (matches retention cleanup window)
-     * 3. Duplicate (device_id, content_file_id, played_at) → silently ignored (idempotent)
+     * 3. Duplicate (device_id, content_file_id, played_at) → skipped by the database
+     *    (ON CONFLICT DO NOTHING) and reported as Duplicate — idempotent, as advertised
+     *
+     * <p>Dedup is performed BY the INSERT, never by catching its failure. PlaybackLog uses
+     * IDENTITY generation, so save() would issue the INSERT eagerly inside the caller's
+     * transaction; a unique violation there aborts the PostgreSQL transaction and marks the
+     * Hibernate session rollback-only before any catch block runs, destroying every other row
+     * in the batch. Do not reintroduce a try/catch here.
      */
     @Transactional
     public PlaybackLogResult record(Device device, ContentFile contentFile,
@@ -86,19 +92,22 @@ public class PlaybackLogService {
                     RETENTION_AGE.toDays()));
         }
 
-        // Dedup: try to save, catch unique constraint violation
-        try {
-            var entry = new PlaybackLog(device, contentFile, assignment, playedAt, durationSeconds);
-            var saved = repository.save(entry);
-            return PlaybackLogResult.created(saved);
-        } catch (DataIntegrityViolationException e) {
-            if (isDuplicateViolation(e)) {
-                log.debug("Duplicate playback log ignored [device={}, content={}, played_at={}]",
-                        device.getId(), contentFile.getId(), playedAt);
-                return PlaybackLogResult.duplicate();
-            }
-            throw e;
+        // Dedup is the database's job: ON CONFLICT DO NOTHING skips an existing
+        // (device, content, played_at) without raising, so one duplicate cannot poison the
+        // rest of the batch transaction. 1 row affected = created, 0 = duplicate.
+        int inserted = repository.insertIgnoringDuplicate(
+                device.getId(),
+                contentFile.getId(),
+                assignment != null ? assignment.getId() : null,
+                playedAt,
+                durationSeconds,
+                now);                    // reuse the `now` above — same value the entity ctor set
+        if (inserted == 0) {
+            log.debug("Duplicate playback log ignored [device={}, content={}, played_at={}]",
+                    device.getId(), contentFile.getId(), playedAt);
+            return PlaybackLogResult.duplicate();
         }
+        return PlaybackLogResult.created();
     }
 
     /**
@@ -108,6 +117,9 @@ public class PlaybackLogService {
      * <p>Edge case: batch over {@value #MAX_BATCH_SIZE} entries → IllegalArgumentException
      * (mapped to 400 by the global handler). Forces the device to chunk submissions so
      * one giant POST can't consume excessive memory or transaction time.
+     *
+     * <p>The whole batch is deliberately ONE transaction — a duplicate no longer aborts it,
+     * so every non-duplicate entry commits.
      */
     @Transactional
     public BatchRecordResult recordBatch(Long deviceId, List<PlaybackEntry> entries) {
@@ -137,6 +149,12 @@ public class PlaybackLogService {
         int rejected = 0;
         var rejections = new java.util.ArrayList<EntryRejection>();
 
+        // Same-request duplicates: a device's local queue can hold the same
+        // (contentFileId, playedAt) twice. ON CONFLICT already returns 0 for the second one,
+        // so this set just saves a round trip. Only ACCEPTED keys enter the set, so a repeated
+        // entry that was *rejected* (future / >90 days) is rejected again, exactly as today.
+        var seenInRequest = new java.util.HashSet<List<Object>>();
+
         for (int i = 0; i < entries.size(); i++) {
             var entry = entries.get(i);
             ContentFile file;
@@ -157,10 +175,24 @@ public class PlaybackLogService {
                 continue;
             }
 
+            // Null-safe: List.of rejects nulls, and a null contentFileId/playedAt already fails
+            // downstream exactly as it does today. Skipping the set for those preserves behavior.
+            List<Object> key = (entry.contentFileId() != null && entry.playedAt() != null)
+                    ? List.of(entry.contentFileId(), entry.playedAt())
+                    : null;
+            if (key != null && seenInRequest.contains(key)) {
+                duplicate++;                       // already accepted earlier in THIS payload
+                continue;
+            }
+
             var result = record(device, file, null, entry.playedAt(), entry.durationSeconds());
-            if (result instanceof PlaybackLogResult.Created) created++;
-            else if (result instanceof PlaybackLogResult.Duplicate) duplicate++;
-            else if (result instanceof PlaybackLogResult.Rejected r) {
+            if (result instanceof PlaybackLogResult.Created) {
+                created++;
+                if (key != null) seenInRequest.add(key);
+            } else if (result instanceof PlaybackLogResult.Duplicate) {
+                duplicate++;
+                if (key != null) seenInRequest.add(key);
+            } else if (result instanceof PlaybackLogResult.Rejected r) {
                 rejected++;
                 rejections.add(new EntryRejection(i, r.reason()));
             }
@@ -205,20 +237,13 @@ public class PlaybackLogService {
         return repository.findByContentFileIdOrderByPlayedAtDesc(contentFileId);
     }
 
-    private boolean isDuplicateViolation(DataIntegrityViolationException e) {
-        var message = e.getMessage();
-        return message != null && (message.contains("uq_playback_dedup")
-                || message.contains("Unique index or primary key violation")
-                || message.contains("duplicate key"));
-    }
-
     public sealed interface PlaybackLogResult {
 
-        record Created(PlaybackLog log) implements PlaybackLogResult {}
+        record Created() implements PlaybackLogResult {}
         record Duplicate() implements PlaybackLogResult {}
         record Rejected(String reason) implements PlaybackLogResult {}
 
-        static PlaybackLogResult created(PlaybackLog log) { return new Created(log); }
+        static PlaybackLogResult created() { return new Created(); }
         static PlaybackLogResult duplicate() { return new Duplicate(); }
         static PlaybackLogResult rejected(String reason) { return new Rejected(reason); }
     }

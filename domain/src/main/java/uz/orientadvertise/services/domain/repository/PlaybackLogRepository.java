@@ -6,6 +6,7 @@ import java.util.List;
 
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import uz.orientadvertise.services.domain.model.PlaybackLog;
@@ -18,6 +19,41 @@ public interface PlaybackLogRepository extends JpaRepository<PlaybackLog, Long> 
     List<PlaybackLog> findByContentFileIdOrderByPlayedAtDesc(Long contentFileId);
 
     boolean existsByDeviceIdAndContentFileIdAndPlayedAt(Long deviceId, Long contentFileId, Instant playedAt);
+
+    /**
+     * Idempotent single-row insert. Returns 1 when the row was written, 0 when
+     * {@code (device_id, content_file_id, played_at)} already exists — the database skips the
+     * duplicate instead of raising SQLSTATE 23505, so the caller's transaction stays usable for
+     * the rest of the batch. Catching the violation after the fact cannot achieve this: by the
+     * time a DataIntegrityViolationException is visible, PostgreSQL has aborted the transaction
+     * (25P02 on every later statement) and Hibernate has already called markForRollbackOnly()
+     * on the session. Neither is undoable from a catch block.
+     *
+     * <p>The conflict target is deliberately OMITTED. H2 2.3.232 (MODE=PostgreSQL — the test
+     * profile) accepts ONLY the bare {@code ON CONFLICT DO NOTHING}; adding an explicit target
+     * is a JdbcSQLSyntaxErrorException there. Targetless is exact for this table because
+     * playback_log has exactly two unique constraints: the identity PK (a generated value can
+     * never collide) and uq_playback_dedup. If a third unique constraint is ever added to
+     * playback_log, this statement would silently swallow that conflict too — add an explicit
+     * target then, and drop H2 for that test.
+     *
+     * <p>The CASTs pin the types of the two nullable parameters; without them a null bind
+     * reaches PostgreSQL as an untyped NULL that must be inferred from context.
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO playback_log
+                (device_id, content_file_id, assignment_id, played_at, duration_seconds, reported_at)
+            VALUES (:deviceId, :contentFileId, CAST(:assignmentId AS BIGINT), :playedAt,
+                    CAST(:durationSeconds AS INTEGER), :reportedAt)
+            ON CONFLICT DO NOTHING
+            """, nativeQuery = true)
+    int insertIgnoringDuplicate(@Param("deviceId") Long deviceId,
+                                @Param("contentFileId") Long contentFileId,
+                                @Param("assignmentId") Long assignmentId,
+                                @Param("playedAt") Instant playedAt,
+                                @Param("durationSeconds") Integer durationSeconds,
+                                @Param("reportedAt") Instant reportedAt);
 
     @Query("SELECT pl.id FROM PlaybackLog pl WHERE pl.playedAt < :threshold ORDER BY pl.id ASC")
     List<Long> findIdsOlderThan(@Param("threshold") Instant threshold, Pageable pageable);

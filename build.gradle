@@ -6,7 +6,7 @@ plugins {
 
 allprojects {
     group = 'uz.orientadvertise.services'
-    version = '1.0.129'
+    version = '1.0.130'
 }
 
 subprojects {
