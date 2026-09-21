@@ -103,6 +103,13 @@ public class FacilityManagementService {
     public FacilityDetailView create(Long regionId, String name, String address) {
         Region region = regionRepository.findById(regionId)
                 .orElseThrow(() -> new ResourceNotFoundException("Region", regionId));
+        // Operator-scope guard (AUTHZ-02): a restricted operator may not create a facility in a
+        // project outside their assigned set. Collapses to the same 404 as a missing Region so
+        // out-of-scope ids leak nothing, and runs BEFORE the duplicate check so a 409 can't
+        // reveal which names exist in another tenant's project. Mirrors SyncGroup create.
+        if (operatorScopeResolver.resolve().excludes(region.getProject().getId())) {
+            throw new ResourceNotFoundException("Region", regionId);
+        }
         if (facilityRepository.existsByRegionIdAndName(regionId, name)) {
             throw new IllegalStateException(
                     "Facility with name '" + name + "' already exists in region " + regionId);

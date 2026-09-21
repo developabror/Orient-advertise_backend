@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import uz.orientadvertise.services.common.exception.AccessForbiddenException;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.repository.PlaylistItemRepository;
@@ -33,13 +34,16 @@ public class ContentManagementService {
     private final ContentFileRepository contentFileRepository;
     private final PlaylistItemRepository playlistItemRepository;
     private final ProjectRepository projectRepository;
+    private final OperatorScopeResolver operatorScopeResolver;
 
     public ContentManagementService(ContentFileRepository contentFileRepository,
                                      PlaylistItemRepository playlistItemRepository,
-                                     ProjectRepository projectRepository) {
+                                     ProjectRepository projectRepository,
+                                     OperatorScopeResolver operatorScopeResolver) {
         this.contentFileRepository = contentFileRepository;
         this.playlistItemRepository = playlistItemRepository;
         this.projectRepository = projectRepository;
+        this.operatorScopeResolver = operatorScopeResolver;
     }
 
     /**
@@ -83,6 +87,11 @@ public class ContentManagementService {
      * <p>Unknown projectId is a 404 (here we know the operator is filling in a real
      * association, so a wrong id is a mistake worth surfacing — in contrast to upload
      * where we accept and defer).
+     *
+     * <p>Operator scope (AUTHZ-01): a restricted operator may only move content between projects
+     * in their own set. A file currently bound to a project outside that set is 403 — the
+     * operator can already see the file, so there is nothing to hide — and an out-of-scope
+     * target is the same 404 as an unknown one. Row ownership is checked by the controller.
      */
     @Transactional
     public void assignProject(Long contentFileId, Long projectId) {
@@ -90,12 +99,21 @@ public class ContentManagementService {
                 .filter(f -> f.getDeletedAt() == null)
                 .orElseThrow(() -> new ResourceNotFoundException("ContentFile", contentFileId));
 
+        var scope = operatorScopeResolver.resolve();
+        if (content.getProject() != null && scope.excludes(content.getProject().getId())) {
+            throw new AccessForbiddenException(
+                    "Content " + contentFileId + " is bound to a project outside your scope");
+        }
+
         if (projectId == null) {
             content.setProject(null);
             log.info("Cleared project binding on content [id={}]", contentFileId);
             return;
         }
 
+        if (scope.excludes(projectId)) {
+            throw new ResourceNotFoundException("Project", projectId);
+        }
         var project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new ResourceNotFoundException("Project", projectId));
         content.setProject(project);

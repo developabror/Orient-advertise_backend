@@ -25,6 +25,7 @@ public class ContentUploadService {
     private final ContentFileRepository contentFileRepository;
     private final ProjectRepository projectRepository;
     private final ApplicationEventPublisher events;
+    private final OperatorScopeResolver operatorScopeResolver;
     private final ContentUploadService self;
     private final String rawBucket;
 
@@ -38,12 +39,14 @@ public class ContentUploadService {
                                  ContentFileRepository contentFileRepository,
                                  ProjectRepository projectRepository,
                                  ApplicationEventPublisher events,
+                                 OperatorScopeResolver operatorScopeResolver,
                                  @Lazy ContentUploadService self,
                                  @Value("${app.minio.raw-bucket:content-raw}") String rawBucket) {
         this.storageClient = storageClient;
         this.contentFileRepository = contentFileRepository;
         this.projectRepository = projectRepository;
         this.events = events;
+        this.operatorScopeResolver = operatorScopeResolver;
         this.self = self;
         this.rawBucket = rawBucket;
     }
@@ -57,7 +60,9 @@ public class ContentUploadService {
      * is persisted with {@code project = null} ("orphan" content). The caller can attach a project
      * later via {@code PATCH /api/content/{id}/project}. This is intentional: the FE may not have
      * the project picker wired up yet, and we'd rather accept the bytes once than ask the operator
-     * to re-upload after they create the project.
+     * to re-upload after they create the project. A project outside a restricted operator's scope
+     * is treated exactly like an unknown one (AUTHZ-01): the bytes land as orphan content, never
+     * in another tenant's project, and the response is identical so it reveals nothing.
      *
      * <p>Edge case: interrupted uploads leave incomplete multipart parts in MinIO. Those are swept
      * by MinIO itself ({@code stale_uploads_expiry}, 24 h) — no application job is involved.
@@ -119,11 +124,17 @@ public class ContentUploadService {
                                          String uploadedBy) {
         Project project = null;
         if (projectId != null) {
-            project = projectRepository.findById(projectId).orElse(null);
-            if (project == null) {
-                // Don't 404 — accept the upload as orphan content. The caller can attach
-                // a real project later. Logging at WARN so the divergence is auditable.
-                log.warn("Upload referenced unknown projectId={} — saving as orphan content", projectId);
+            if (operatorScopeResolver.resolve().excludes(projectId)) {
+                // Out of the operator's scope — same outcome as an unknown project (see javadoc).
+                log.warn("Upload referenced out-of-scope projectId={} by {} — saving as orphan content",
+                        projectId, uploadedBy);
+            } else {
+                project = projectRepository.findById(projectId).orElse(null);
+                if (project == null) {
+                    // Don't 404 — accept the upload as orphan content. The caller can attach
+                    // a real project later. Logging at WARN so the divergence is auditable.
+                    log.warn("Upload referenced unknown projectId={} — saving as orphan content", projectId);
+                }
             }
         }
 

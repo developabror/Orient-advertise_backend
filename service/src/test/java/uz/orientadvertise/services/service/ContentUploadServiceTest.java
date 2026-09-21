@@ -1,6 +1,7 @@
 package uz.orientadvertise.services.service;
 
 import java.io.ByteArrayInputStream;
+import java.util.List;
 import java.util.Optional;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -8,12 +9,14 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.springframework.context.ApplicationEventPublisher;
+import uz.orientadvertise.services.domain.auth.Role;
 import uz.orientadvertise.services.domain.content.ContentUploadedEvent;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Project;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.repository.ProjectRepository;
 import uz.orientadvertise.services.domain.storage.StorageClient;
+import uz.orientadvertise.services.service.OperatorScopeResolver.ScopedProjects;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -48,6 +51,7 @@ class ContentUploadServiceTest {
     private ContentFileRepository contentFileRepository;
     private ProjectRepository projectRepository;
     private ApplicationEventPublisher events;
+    private OperatorScopeResolver operatorScopeResolver;
     private ContentUploadService service;
 
     @BeforeEach
@@ -56,8 +60,11 @@ class ContentUploadServiceTest {
         contentFileRepository = mock(ContentFileRepository.class);
         projectRepository = mock(ProjectRepository.class);
         events = mock(ApplicationEventPublisher.class);
+        operatorScopeResolver = mock(OperatorScopeResolver.class);
+        // Unrestricted (admin) unless a test narrows it.
+        when(operatorScopeResolver.resolve()).thenReturn(new ScopedProjects("admin", Role.ADMIN, null, false));
         service = new ContentUploadService(storageClient, contentFileRepository,
-                projectRepository, events, null, "content-raw");
+                projectRepository, events, operatorScopeResolver, null, "content-raw");
         // Point the self-proxy at the instance itself: without Spring there is no transaction
         // advice to route through, and the delegation is what we want exercised. Same idiom as
         // RetentionCleanupServiceTest.
@@ -146,6 +153,41 @@ class ContentUploadServiceTest {
         // Bytes still landed in MinIO and the transcode announcement still fired.
         verify(storageClient).upload(eq("content-raw"), anyString(), any(), eq(100L), eq("video/mp4"));
         verify(events).publishEvent(any(ContentUploadedEvent.class));
+    }
+
+    @Test
+    void upload_projectOutsideOperatorScope_uploadsAsOrphanWithoutBindingIt() {
+        // AUTHZ-01: a restricted operator must not land content in another tenant's project.
+        // Same outcome as an unknown project — the project row is never even loaded, so the
+        // response cannot differ between "exists but not yours" and "does not exist".
+        when(operatorScopeResolver.resolve())
+                .thenReturn(new ScopedProjects("op", Role.OPERATOR, List.of(5L), true));
+        savedWithId(9L);
+
+        var result = service.upload(42L, "file.mp4", "video/mp4", 100,
+                new ByteArrayInputStream("x".getBytes()), false, "op");
+
+        assertNull(result.projectId(), "Out-of-scope project must not be bound");
+        verify(projectRepository, never()).findById(anyLong());
+        var saved = ArgumentCaptor.forClass(ContentFile.class);
+        verify(contentFileRepository).save(saved.capture());
+        assertNull(saved.getValue().getProject());
+        assertEquals("op", saved.getValue().getUploadedBy());
+    }
+
+    @Test
+    void upload_projectInsideOperatorScope_bindsIt() {
+        when(operatorScopeResolver.resolve())
+                .thenReturn(new ScopedProjects("op", Role.OPERATOR, List.of(5L), true));
+        var project = mock(Project.class);
+        when(project.getId()).thenReturn(5L);
+        when(projectRepository.findById(5L)).thenReturn(Optional.of(project));
+        savedWithId(10L);
+
+        var result = service.upload(5L, "file.mp4", "video/mp4", 100,
+                new ByteArrayInputStream("x".getBytes()), false, "op");
+
+        assertEquals(5L, result.projectId());
     }
 
     @Test

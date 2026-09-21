@@ -274,14 +274,27 @@ public class ContentListService {
     }
 
     /**
-     * Per-row guard for {@code DELETE /api/content/{id}} by an operator-only caller. Existence
-     * (incl. soft-delete) is checked first ⇒ 404. Then: owned ⇒ allowed (caller proceeds to
-     * soft-delete); granted-but-not-owned ⇒ {@link AccessForbiddenException} (403, matches
-     * {@code canManage=false}); neither owned nor granted ⇒ {@link ResourceNotFoundException}
-     * (404, no existence oracle). No-op for non-operator callers (admin is unrestricted).
+     * Per-row guard for an operator-only caller acting on content it can SEE:
+     * {@code POST /api/content/{id}/retranscode}. Same rule as {@link #getDetail} — owned or
+     * admin-granted, otherwise 404 (no existence oracle). No-op for non-operator callers.
      */
     @Transactional(readOnly = true)
-    public void assertOperatorCanDelete(Long contentFileId, String callerUsername, boolean callerIsOperatorOnly) {
+    public void assertOperatorCanAccess(Long contentFileId, String callerUsername, boolean callerIsOperatorOnly) {
+        if (callerIsOperatorOnly) {
+            loadAndCheckAccess(contentFileId, callerUsername, false, true);
+        }
+    }
+
+    /**
+     * Per-row guard for an operator-only caller MUTATING content: {@code DELETE /api/content/{id}}
+     * and {@code PATCH /api/content/{id}/project}. Existence (incl. soft-delete) is checked first
+     * ⇒ 404. Then: owned ⇒ allowed; granted-but-not-owned ⇒ {@link AccessForbiddenException}
+     * (403, matches {@code canManage=false}); neither owned nor granted ⇒
+     * {@link ResourceNotFoundException} (404, no existence oracle). No-op for non-operator callers
+     * (admin is unrestricted).
+     */
+    @Transactional(readOnly = true)
+    public void assertOperatorCanManage(Long contentFileId, String callerUsername, boolean callerIsOperatorOnly) {
         if (!callerIsOperatorOnly) {
             return;
         }
@@ -298,7 +311,7 @@ public class ContentListService {
                 && operatorAccessRepository.existsByUserIdAndContentFileId(user.getId(), contentFileId);
         if (granted) {
             throw new AccessForbiddenException(
-                    "Operator may view but not delete granted content " + contentFileId);
+                    "Operator may view but not manage granted content " + contentFileId);
         }
         throw new ResourceNotFoundException("ContentFile", contentFileId);
     }

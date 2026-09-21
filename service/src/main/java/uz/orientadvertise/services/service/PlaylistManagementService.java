@@ -109,6 +109,13 @@ public class PlaylistManagementService {
     public PlaylistDetailView create(Long projectId, String name) {
         Project project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new ResourceNotFoundException("Project", projectId));
+        // Operator-scope guard (AUTHZ-02): a restricted operator may not create a playlist in a
+        // project outside their assigned set. Collapses to the same 404 as a missing Project so
+        // out-of-scope ids leak nothing, and runs BEFORE the duplicate check so a 409 can't
+        // reveal which names exist in another tenant's project. Mirrors SyncGroup create.
+        if (operatorScopeResolver.resolve().excludes(projectId)) {
+            throw new ResourceNotFoundException("Project", projectId);
+        }
         if (playlistRepository.existsByProjectIdAndNameAndDeletedAtIsNull(projectId, name)) {
             throw new IllegalStateException(
                     "Playlist with name '" + name + "' already exists in project " + projectId);

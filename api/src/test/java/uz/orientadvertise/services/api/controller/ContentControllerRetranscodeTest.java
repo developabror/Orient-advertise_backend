@@ -22,6 +22,7 @@ import uz.orientadvertise.services.service.ContentUploadService;
 
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -126,5 +127,32 @@ class ContentControllerRetranscodeTest {
         mockMvc.perform(post("/api/content/5/retranscode"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.message").exists());
+    }
+
+    // ---- AUTHZ-01: operator may only retry content they can see ---------------------------
+
+    @Test
+    @WithMockUser(username = "op", roles = "OPERATOR")
+    void operator_onContentTheyCannotSee_is404AndNothingIsQueued() throws Exception {
+        doThrow(new ResourceNotFoundException("ContentFile", 42L))
+                .when(listService).assertOperatorCanAccess(42L, "op", true);
+
+        mockMvc.perform(post("/api/content/42/retranscode"))
+                .andExpect(status().isNotFound());
+
+        verify(retranscodeService, never()).retranscode(anyLong(), any());
+    }
+
+    @Test
+    @WithMockUser(username = "op", roles = "OPERATOR")
+    void operator_onVisibleContent_isCheckedThenQueued() throws Exception {
+        when(retranscodeService.retranscode(anyLong(), any()))
+                .thenReturn(new RetranscodeResult(42L, "TRANSCODING", "FAILED"));
+
+        mockMvc.perform(post("/api/content/42/retranscode"))
+                .andExpect(status().isOk());
+
+        verify(listService).assertOperatorCanAccess(42L, "op", true);
+        verify(retranscodeService).retranscode(42L, "op");
     }
 }

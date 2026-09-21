@@ -10,6 +10,8 @@ import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import uz.orientadvertise.services.common.exception.AccessForbiddenException;
+import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.domain.model.AppUser;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.repository.AdvertiserContentAccessRepository;
@@ -19,7 +21,9 @@ import uz.orientadvertise.services.domain.repository.OperatorContentAccessReposi
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -309,5 +313,50 @@ class ContentListServiceTest {
         var captor = ArgumentCaptor.forClass(Pageable.class);
         verify(contentFileRepository).findFilteredScoped(any(), any(), any(), any(), captor.capture());
         assertEquals(ContentFileRepository.DEFAULT_LISTING_SORT, captor.getValue().getSort());
+    }
+
+    // ---- operator row guards (AUTHZ-01) ----------------------------------------------------
+
+    /** Content 5 uploaded by {@code owner}; operator {@code op} (user id 3) holds a grant iff {@code granted}. */
+    private void contentOwnedBy(String owner, boolean granted) {
+        var file = mock(ContentFile.class);
+        when(file.getUploadedBy()).thenReturn(owner);
+        when(contentFileRepository.findById(5L)).thenReturn(Optional.of(file));
+        var user = mock(AppUser.class);
+        when(user.getId()).thenReturn(3L);
+        when(userRepository.findByUsername("op")).thenReturn(Optional.of(user));
+        when(operatorAccessRepository.existsByUserIdAndContentFileId(3L, 5L)).thenReturn(granted);
+    }
+
+    @Test
+    void assertOperatorCanManage_owned_passes_granted_is403_neither_is404() {
+        contentOwnedBy("op", false);
+        assertDoesNotThrow(() -> service.assertOperatorCanManage(5L, "op", true));
+
+        contentOwnedBy("someone-else", true);
+        assertThrows(AccessForbiddenException.class, () -> service.assertOperatorCanManage(5L, "op", true));
+
+        contentOwnedBy("someone-else", false);
+        assertThrows(ResourceNotFoundException.class, () -> service.assertOperatorCanManage(5L, "op", true));
+    }
+
+    @Test
+    void assertOperatorCanAccess_ownedOrGranted_passes_neither_is404() {
+        contentOwnedBy("op", false);
+        assertDoesNotThrow(() -> service.assertOperatorCanAccess(5L, "op", true));
+
+        contentOwnedBy("someone-else", true);
+        assertDoesNotThrow(() -> service.assertOperatorCanAccess(5L, "op", true));
+
+        contentOwnedBy("someone-else", false);
+        assertThrows(ResourceNotFoundException.class, () -> service.assertOperatorCanAccess(5L, "op", true));
+    }
+
+    @Test
+    void operatorGuards_areNoOpsForNonOperatorCallers() {
+        // Admin/hybrid callers are unrestricted — the guards must not even load the row.
+        service.assertOperatorCanManage(5L, "admin", false);
+        service.assertOperatorCanAccess(5L, "admin", false);
+        verify(contentFileRepository, never()).findById(any());
     }
 }

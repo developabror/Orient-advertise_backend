@@ -142,7 +142,7 @@ public class ContentController {
         var auth = SecurityContextHolder.getContext().getAuthentication();
         // Operator-only callers may delete ONLY content they own; granted-not-owned ⇒ 403,
         // neither owned nor granted ⇒ 404 (no existence oracle). Admins are unrestricted.
-        listService.assertOperatorCanDelete(id, CallerRoles.usernameOf(auth), CallerRoles.isOperatorOnly(auth));
+        listService.assertOperatorCanManage(id, CallerRoles.usernameOf(auth), CallerRoles.isOperatorOnly(auth));
         managementService.softDelete(id);
         return ResponseEntity.noContent().build();
     }
@@ -248,18 +248,26 @@ public class ContentController {
      *
      * <p>Body: {@code {"projectId": 5}} — pass {@code null} to clear the binding
      * (returns the file to orphan state).
+     *
+     * <p>Operator-only callers may move ONLY content they own (granted ⇒ 403, neither ⇒ 404 —
+     * the same rule as delete), and only between projects in their scope (see
+     * {@link ContentManagementService#assignProject}).
      */
     @Operation(summary = "Assign or clear the project on a content file")
     @ApiResponses({
             @ApiResponse(responseCode = "204", description = "Project bound (or cleared if null)"),
-            @ApiResponse(responseCode = "403", description = "Caller lacks ADMIN/OPERATOR"),
-            @ApiResponse(responseCode = "404", description = "Unknown content file (or already soft-deleted), or unknown project")
+            @ApiResponse(responseCode = "403", description = "Caller lacks ADMIN/OPERATOR; or an operator "
+                    + "acting on granted-not-owned content, or on content bound to a project outside their scope"),
+            @ApiResponse(responseCode = "404", description = "Unknown content file (or already soft-deleted, "
+                    + "or not visible to the operator), or unknown / out-of-scope project")
     })
     @PatchMapping("/{id}/project")
     @PreAuthorize("hasAnyRole('ADMIN','OPERATOR')")
     public ResponseEntity<Void> assignProject(@PathVariable Long id,
                                                @RequestBody AssignProjectRequest body) {
         Long projectId = body == null ? null : ProjectIds.normalize(body.projectId());
+        var auth = SecurityContextHolder.getContext().getAuthentication();
+        listService.assertOperatorCanManage(id, CallerRoles.usernameOf(auth), CallerRoles.isOperatorOnly(auth));
         managementService.assignProject(id, projectId);
         return ResponseEntity.noContent().build();
     }
@@ -308,12 +316,16 @@ public class ContentController {
      * as an automatic retry, and must not be refused because earlier automatic attempts used up the
      * budget. The claim is the same atomic compare-and-set the sweeper uses, so a double-click (or a
      * click that races the sweeper) starts exactly one encode.
+     *
+     * <p>Operator-only callers may retry only content they can see (owned or granted); anything
+     * else is 404, so the sequential ids can't be walked to keep ffmpeg busy.
      */
     @Operation(summary = "Re-queue transcoding for a stuck or failed content file")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Claimed and queued; returns the new status"),
             @ApiResponse(responseCode = "403", description = "Caller lacks ADMIN/OPERATOR"),
-            @ApiResponse(responseCode = "404", description = "Unknown content file (or soft-deleted)"),
+            @ApiResponse(responseCode = "404", description = "Unknown content file (or soft-deleted, or not "
+                    + "visible to the operator)"),
             @ApiResponse(responseCode = "409", description = "Status is not UPLOADED/FAILED, the raw object "
                     + "is missing, or another worker just claimed it — see `message`")
     })
@@ -321,6 +333,7 @@ public class ContentController {
     @PreAuthorize("hasAnyRole('ADMIN','OPERATOR')")
     public ResponseEntity<RetranscodeResult> retranscode(@PathVariable Long id) {
         var auth = SecurityContextHolder.getContext().getAuthentication();
+        listService.assertOperatorCanAccess(id, CallerRoles.usernameOf(auth), CallerRoles.isOperatorOnly(auth));
         return ResponseEntity.ok(retranscodeService.retranscode(id, CallerRoles.usernameOf(auth)));
     }
 

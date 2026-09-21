@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.144`
+`1.0.145`
 
 ## Architecture
 
@@ -889,7 +889,7 @@ The upload endpoint returns 202 immediately after the bytes land in `content-raw
 
 #### Orphan uploads (project optional)
 
-The upload endpoint **does not fail** when `projectId` is omitted or refers to a project that doesn't exist. The bytes are accepted, a `content_file` row is persisted with `project_id = null`, async transcode kicks off, and the response carries `"projectId": null` plus a message that explicitly mentions "orphan content."
+The upload endpoint **does not fail** when `projectId` is omitted or refers to a project that doesn't exist — or, for a project-restricted OPERATOR, to a project outside their scope (v1.0.145; identical response, so it reveals nothing). The bytes are accepted, a `content_file` row is persisted with `project_id = null`, async transcode kicks off, and the response carries `"projectId": null` plus a message that explicitly mentions "orphan content."
 
 This is a deliberate FE-friendly stance: if the upload form runs before the project picker is wired up, or if the user uploads from a context where the project isn't known yet, we'd rather hold the asset and let them finish the binding later than reject the request and ask for a re-upload.
 
@@ -905,6 +905,7 @@ Content-Type: application/json
 - `204 No Content` on success.
 - `404 Not Found` if the content file doesn't exist (or has been soft-deleted), or if `projectId` is set but unknown — at this point we know the operator is filling in a real binding, so a wrong id is a mistake worth surfacing (in contrast to the upload path, which defers).
 - `{ "projectId": null }` clears the binding (returns the file to orphan state). Useful for reverting a wrong assignment without deleting and re-uploading.
+- **Operator-only callers (v1.0.145):** the same row rule as `DELETE` — own the file, or `403` if it was only granted to them and `404` if they can't see it at all. And both ends of the move must be in their project scope: an out-of-scope target is the same `404` as an unknown one; a file currently bound to a project outside their scope is `403`.
 
 **Caveats:**
 - Orphan content is **not** subject to the `urgent=true` device fan-out — there's no project audience to push to. Re-issue an `urgent` flow after the project is bound (or use a manual sync trigger).
@@ -1295,6 +1296,44 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Operator project scope enforced on content moves, retranscode, upload and every create (v1.0.145)
+
+> **AUTHZ-01/02 — a project-restricted OPERATOR could reach into other tenants' projects.**
+> Reads, renames and deletes were scoped, but five writes only ever called `findById`:
+> `PATCH /api/content/{id}/project` moved **any** content file (even one the operator couldn't see)
+> into any project, or cleared its project; `POST /api/content/{id}/retranscode` re-queued any file
+> and reset its attempt counter, so walking the sequential ids kept ffmpeg busy indefinitely; the
+> upload's `projectId` landed bytes in any project; and `create()` on Region, Facility, Playlist and
+> DeviceGroup saved under whatever `projectId`/`regionId` was sent — only `SyncGroup` create had the
+> guard.
+
+**What changed**
+
+- **Content row rules** (`ContentListService`, called from `ContentController`). Moving a file is a
+  management action, so it takes the delete rule, now named `assertOperatorCanManage`: owned passes,
+  granted-only is 403, anything else is 404. Retranscode uses the new `assertOperatorCanAccess`, the
+  same owned-or-granted rule as `GET /api/content/{id}`, since the operator is only retrying a file
+  they can see. Admins and admin+operator hybrids skip both.
+- **Content project scope** (`ContentManagementService.assignProject`). A file currently bound to an
+  out-of-scope project is 403: the operator already sees the file, so there is nothing to hide. An
+  out-of-scope target is the same `Project not found` 404 as an unknown id.
+- **Upload** (`ContentUploadService.persistUploaded`). An out-of-scope `projectId` is handled exactly
+  like an unknown one: the file is saved as orphan content and the response is the same. A 404 here
+  would reveal which project ids exist, because unknown ones are accepted.
+- **Every `create()`** now calls `operatorScopeResolver.resolve().excludes(..)` before the duplicate
+  check, the same as `SyncGroupManagementService.create`. Running it first matters: otherwise a 409
+  would reveal which names exist in another tenant's project. Facility checks
+  `region.getProject()` and answers `Region not found`.
+
+**Not changed:** the frontend. Its project picker and the content grid only show in-scope projects
+and visible rows, and it doesn't call `PATCH …/project` anywhere. Out-of-scope requests can only
+come from hand-crafted calls.
+
+**Tests:** `ProjectScopedCreateGuardTest` (new, 7: all four creates out of scope → 404 with the
+missing-row message, no duplicate probe, no save; empty scope; in scope; admin),
+`ContentManagementServiceTest` (new, 5), `ContentListServiceTest` (+3), `ContentUploadServiceTest`
+(+2), `ContentControllerAssignProjectTest` (+4), `ContentControllerRetranscodeTest` (+2).
 
 ### MinIO outages self-heal; storage on `/api/health`; `/sync` stops hiding one (v1.0.144)
 
