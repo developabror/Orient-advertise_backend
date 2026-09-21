@@ -26,6 +26,7 @@ import uz.orientadvertise.services.domain.model.Project;
 import uz.orientadvertise.services.service.ContentListService;
 import uz.orientadvertise.services.service.ContentListService.ContentFileView;
 import uz.orientadvertise.services.service.ContentManagementService;
+import uz.orientadvertise.services.service.ContentRetranscodeService;
 import uz.orientadvertise.services.service.ContentUploadService;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -53,6 +54,9 @@ class ContentControllerListTest {
 
     @MockitoBean
     private ContentManagementService managementService;
+
+    @MockitoBean
+    private ContentRetranscodeService retranscodeService;
 
     @MockitoBean
     private DeviceWebSocketHandler webSocketHandler;
@@ -231,6 +235,39 @@ class ContentControllerListTest {
                 .andExpect(jsonPath("$.content[0].status").value("TRANSCODING"))
                 .andExpect(jsonPath("$.content[0].thumbnailUrl").doesNotExist())
                 .andExpect(jsonPath("$.content[0].thumbnailExpiresAt").doesNotExist());
+    }
+
+    @Test
+    @WithMockUser(roles = "OPERATOR")
+    void list_failedRow_carriesTheTranscodeError_soTheCardCanSayWhy() throws Exception {
+        // Before v1.0.134 the ffmpeg error was written to transcode_last_error and exposed on NO
+        // surface — the listing showed a FAILED card with nothing on it, and the live frame carried
+        // an explicit null reason. invalidReason stays null: it is the INVALID column.
+        var failed = stubFile(23L, 7L, "broken.mp4", ContentFile.Status.FAILED);
+        when(failed.getTranscodeLastError()).thenReturn("RuntimeException: minio down");
+        when(listService.list(any(), any(), any(), any(), any(), any()))
+                .thenReturn(new PageImpl<>(List.of(viewOf(failed)), PageRequest.of(0, 20), 1));
+
+        mockMvc.perform(get("/api/content"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content[0].status").value("FAILED"))
+                .andExpect(jsonPath("$.content[0].transcodeLastError")
+                        .value("RuntimeException: minio down"))
+                .andExpect(jsonPath("$.content[0].invalidReason").doesNotExist());
+    }
+
+    @Test
+    @WithMockUser(roles = "OPERATOR")
+    void list_readyRow_carriesNoTranscodeError() throws Exception {
+        // Negative: markTranscodeReady clears the column, so a healthy card must not show a stale
+        // error from an earlier attempt.
+        var ready = stubFile(24L, 7L, "good.mp4", ContentFile.Status.READY);
+        when(listService.list(any(), any(), any(), any(), any(), any()))
+                .thenReturn(new PageImpl<>(List.of(viewOf(ready)), PageRequest.of(0, 20), 1));
+
+        mockMvc.perform(get("/api/content"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content[0].transcodeLastError").doesNotExist());
     }
 
     /** Wrap a stubbed file in a thumbnail-less view — the common case for these tests. */

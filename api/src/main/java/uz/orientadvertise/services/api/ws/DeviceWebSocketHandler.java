@@ -14,6 +14,7 @@ import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
+import uz.orientadvertise.services.domain.content.DevicePushChannel;
 import uz.orientadvertise.services.domain.content.PushMessageType;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.RemoteActionRepository;
@@ -36,7 +37,7 @@ import uz.orientadvertise.services.service.ContentVersionService;
  * </ul>
  */
 @Component
-public class DeviceWebSocketHandler extends TextWebSocketHandler {
+public class DeviceWebSocketHandler extends TextWebSocketHandler implements DevicePushChannel {
 
     private static final Logger log = LoggerFactory.getLogger(DeviceWebSocketHandler.class);
 
@@ -118,9 +119,20 @@ public class DeviceWebSocketHandler extends TextWebSocketHandler {
         return new PushResult(sent.get(), skipped.get(), failed.get());
     }
 
+    @Override
     public boolean isConnected(Long deviceId) {
         var session = sessionsByDevice.get(deviceId);
         return session != null && session.isOpen();
+    }
+
+    /**
+     * Single-device push ({@link DevicePushChannel}). Delegates to {@link #pushToDevices} so
+     * there is exactly one send path; {@code true} means the frame actually reached an open
+     * socket, {@code false} means offline or a failed write — never an exception.
+     */
+    @Override
+    public boolean push(Long deviceId, String message) {
+        return pushToDevices(java.util.List.of(deviceId), message).sent() == 1;
     }
 
     public PushResult broadcast(String message) {

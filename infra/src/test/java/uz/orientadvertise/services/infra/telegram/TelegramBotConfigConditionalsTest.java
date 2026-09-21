@@ -6,6 +6,7 @@ import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.telegram.telegrambots.meta.TelegramBotsApi;
 import uz.orientadvertise.services.domain.notification.TelegramNotifier;
+import uz.orientadvertise.services.infra.storage.MinioHealthStatus;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -24,6 +25,10 @@ class TelegramBotConfigConditionalsTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withConfiguration(AutoConfigurations.of())
+            // healthCommandHandler injects the storage flag directly (it WRITES its MinIO probe
+            // result back into it, v1.0.144), so this slim slice has to supply the bean that
+            // component scanning supplies in the application.
+            .withBean(MinioHealthStatus.class)
             .withUserConfiguration(TelegramBotConfig.class);
 
     @Test

@@ -1,8 +1,10 @@
 package uz.orientadvertise.services.domain.repository;
 
+import java.util.List;
 import java.util.Optional;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import uz.orientadvertise.services.domain.auth.Role;
 import uz.orientadvertise.services.domain.model.AppUser;
 
 public interface AppUserRepository extends JpaRepository<AppUser, Long> {
@@ -22,4 +24,10 @@ public interface AppUserRepository extends JpaRepository<AppUser, Long> {
 
     /** Uniqueness guard for set-email / create-user. Argument must be already normalized. */
     boolean existsByEmail(String email);
+
+    /** Active accounts whose stored hash equals the given one — the default-login guard. */
+    List<AppUser> findByPasswordAndIsActiveTrue(String password);
+
+    /** Whether any active account holds the role — the bootstrap-admin check. */
+    boolean existsByRoleAndIsActiveTrue(Role role);
 }

@@ -3,7 +3,7 @@ package uz.orientadvertise.services.infra.pubsub;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.stereotype.Component;
 import uz.orientadvertise.services.domain.event.DashboardEventBroadcaster;
@@ -17,6 +17,21 @@ import uz.orientadvertise.services.domain.event.DashboardEventBroadcaster;
  * <p>Pub/sub failures are logged at {@code warn} but never thrown — the dashboard live
  * feed is best-effort. Operators get the same data on the next page load via the
  * {@code /service/dashboard/summary} endpoint.
+ *
+ * <h2>Why {@link StringRedisTemplate} and not {@code RedisTemplate<String, Object>}</h2>
+ * The frame built here is <b>already JSON</b>. {@code convertAndSend} serialises its payload with
+ * the template's <i>value</i> serializer, and the generic template's is
+ * {@code GenericJackson2JsonRedisSerializer} — so publishing through it JSON-quoted and escaped the
+ * frame a second time on the wire. {@code DashboardEventSubscriber} forwards the body verbatim, the
+ * browser's {@code JSON.parse} then yielded a <i>string</i> instead of an object, and the frontend
+ * guard dropped it. That killed the entire live feed in production —
+ * {@code CONTENT_STATUS_CHANGE}, {@code DEVICE_STATUS_CHANGE}, {@code INCIDENT_CRITICAL} and
+ * {@code INCIDENT_UPDATED} alike; only {@code SNAPSHOT} survived, because the WebSocket handler
+ * builds that one itself.
+ *
+ * <p>The fix belongs here, at the publisher. Unwrapping a {@code TextNode} in the WebSocket handler
+ * would patch the symptom one hop downstream and leave every other consumer of that template
+ * broken. Any future publisher of pre-rendered JSON must use the string template too.
  */
 @Component
 public class RedisDashboardEventBroadcaster implements DashboardEventBroadcaster {
@@ -28,10 +43,10 @@ public class RedisDashboardEventBroadcaster implements DashboardEventBroadcaster
     public static final String TYPE_DEVICE_STATUS_CHANGE = "DEVICE_STATUS_CHANGE";
     public static final String TYPE_CONTENT_STATUS_CHANGE = "CONTENT_STATUS_CHANGE";
 
-    private final RedisTemplate<String, Object> redisTemplate;
+    private final StringRedisTemplate redisTemplate;
     private final ChannelTopic dashboardEventsTopic;
 
-    public RedisDashboardEventBroadcaster(RedisTemplate<String, Object> redisTemplate,
+    public RedisDashboardEventBroadcaster(StringRedisTemplate redisTemplate,
                                             @Qualifier("dashboardEventsTopic") ChannelTopic dashboardEventsTopic) {
         this.redisTemplate = redisTemplate;
         this.dashboardEventsTopic = dashboardEventsTopic;
@@ -68,7 +83,11 @@ public class RedisDashboardEventBroadcaster implements DashboardEventBroadcaster
                 escape(p.status()),
                 p.invalidReason() == null ? "null" : "\"" + escape(p.invalidReason()) + "\"",
                 p.at());
-        publish(json);
+        // Content frames used to publish unwrapped, i.e. to EVERY operator session regardless of
+        // project or ownership — every content id, status and ffmpeg diagnostic, to everyone.
+        // They carry an owner as well as a project because content visibility is owned ∪ granted,
+        // not project-based; see ContentStatusPayload.
+        publish(envelope(p.projectId(), p.uploadedBy(), json));
     }
 
     private static String incidentJson(String type, IncidentPayload p) {
@@ -90,15 +109,22 @@ public class RedisDashboardEventBroadcaster implements DashboardEventBroadcaster
     }
 
     /**
-     * Wrap a device/incident frame in the server-internal routing envelope
-     * {@code {"_projectId":<num|null>,"payload":<frame>}}. The dashboard handler reads
-     * {@code _projectId} to fan out per operator session and writes ONLY {@code payload} to
-     * the socket — so the on-the-wire frame contract is unchanged. Content frames are NOT
-     * wrapped (they broadcast to every session).
+     * Wrap a frame in the server-internal routing envelope
+     * {@code {"_projectId":<num|null>,"_owner":<string|null>,"payload":<frame>}}. The dashboard
+     * handler routes on {@code _projectId} / {@code _owner} and writes ONLY {@code payload} to the
+     * socket — so the on-the-wire frame contract is unchanged. <b>Every</b> event type is wrapped;
+     * an unwrapped frame is broadcast to every session, which is a leak, not a feature.
      */
     private static String envelope(Long projectId, String frame) {
-        return "{\"_projectId\":%s,\"payload\":%s}".formatted(
-                projectId == null ? "null" : projectId.toString(), frame);
+        return envelope(projectId, null, frame);
+    }
+
+    /** @see #envelope(Long, String) */
+    private static String envelope(Long projectId, String owner, String frame) {
+        return "{\"_projectId\":%s,\"_owner\":%s,\"payload\":%s}".formatted(
+                projectId == null ? "null" : projectId.toString(),
+                owner == null ? "null" : "\"" + escape(owner) + "\"",
+                frame);
     }
 
     private void publish(String json) {

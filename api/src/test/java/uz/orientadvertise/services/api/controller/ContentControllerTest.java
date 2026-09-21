@@ -17,6 +17,7 @@ import uz.orientadvertise.services.domain.auth.TokenValidator;
 import uz.orientadvertise.services.domain.auth.UserActiveChecker;
 import uz.orientadvertise.services.service.ContentListService;
 import uz.orientadvertise.services.service.ContentManagementService;
+import uz.orientadvertise.services.service.ContentRetranscodeService;
 import uz.orientadvertise.services.service.ContentUploadService;
 import uz.orientadvertise.services.service.ContentUploadService.UploadResult;
 
@@ -45,6 +46,9 @@ class ContentControllerTest {
 
     @MockitoBean
     private ContentManagementService managementService;
+
+    @MockitoBean
+    private ContentRetranscodeService retranscodeService;
 
     @MockitoBean
     private DeviceWebSocketHandler webSocketHandler;

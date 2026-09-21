@@ -77,7 +77,7 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
         if (keyOpt.isEmpty()) {
             // Throttle invalid-key attempts per source IP so the 401 path can't be used to
             // brute-force the key space (the per-key limiter below never runs for a bad key).
-            if (!failureRateLimiter.allowFailure(clientIp(request))) {
+            if (!failureRateLimiter.allowFailure(ClientIp.of(request))) {
                 writeError(response, HttpStatus.TOO_MANY_REQUESTS,
                         "Too many failed API key attempts from this source");
                 return;
@@ -119,13 +119,6 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
         }
     }
 
-    private static String clientIp(HttpServletRequest request) {
-        String xff = request.getHeader("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) {
-            return xff.split(",")[0].trim();
-        }
-        return request.getRemoteAddr();
-    }
 
     private static void writeError(HttpServletResponse response, HttpStatus status, String message)
             throws IOException {

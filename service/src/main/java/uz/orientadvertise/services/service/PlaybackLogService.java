@@ -28,7 +28,6 @@ public class PlaybackLogService {
 
     private static final Logger log = LoggerFactory.getLogger(PlaybackLogService.class);
 
-    public static final Duration RETENTION_AGE = Duration.ofDays(90);
     public static final int MAX_BATCH_SIZE = 500;
 
     private final PlaybackLogRepository repository;
@@ -36,6 +35,7 @@ public class PlaybackLogService {
     private final ContentFileRepository contentFileRepository;
     private final ContentAssignmentService assignmentService;
     private final PlaylistItemRepository playlistItemRepository;
+    private final RetentionProperties retentionProperties;
     private final Duration maxClockSkew;
 
     public PlaybackLogService(PlaybackLogRepository repository,
@@ -43,12 +43,14 @@ public class PlaybackLogService {
                               ContentFileRepository contentFileRepository,
                               ContentAssignmentService assignmentService,
                               PlaylistItemRepository playlistItemRepository,
+                              RetentionProperties retentionProperties,
                               @Value("${app.playback.max-clock-skew-seconds:30}") int maxClockSkewSeconds) {
         this.repository = repository;
         this.deviceRepository = deviceRepository;
         this.contentFileRepository = contentFileRepository;
         this.assignmentService = assignmentService;
         this.playlistItemRepository = playlistItemRepository;
+        this.retentionProperties = retentionProperties;
         this.maxClockSkew = Duration.ofSeconds(maxClockSkewSeconds);
     }
 
@@ -56,7 +58,8 @@ public class PlaybackLogService {
      * Record a playback event.
      * Edge cases:
      * 1. played_at in the future beyond clock skew tolerance → rejected
-     * 2. played_at older than 90 days → rejected (matches retention cleanup window)
+     * 2. played_at older than {@code app.retention.playback} (90 days by default) → rejected,
+     *    reading the same property the nightly cleanup deletes by
      * 3. Duplicate (device_id, content_file_id, played_at) → skipped by the database
      *    (ON CONFLICT DO NOTHING) and reported as Duplicate — idempotent, as advertised
      *
@@ -74,22 +77,27 @@ public class PlaybackLogService {
         var now = Instant.now();
         var maxAllowed = now.plus(maxClockSkew);
         if (playedAt.isAfter(maxAllowed)) {
-            log.warn("Rejected playback log — played_at {} is {} seconds in the future (max allowed: {}s), device={}",
+            // INFO, not WARN: a skewed device clock is a CLIENT-driven refusal, and one returning
+            // box flushing a 500-entry queue would otherwise emit 500 WARNs — every one of which is
+            // forwarded to Telegram (the v1.0.137 rule).
+            log.info("Rejected playback log — played_at {} is {} seconds in the future (max allowed: {}s), device={}",
                     playedAt, Duration.between(now, playedAt).getSeconds(),
                     maxClockSkew.getSeconds(), device.getId());
             return PlaybackLogResult.rejected("played_at is in the future beyond clock skew tolerance (%ds)".formatted(
                     maxClockSkew.getSeconds()));
         }
 
-        // Retention check: reject played_at older than 90 days. The nightly retention
-        // job would purge the row anyway, and accepting it would muddy analytics —
-        // there's no signal to be had from a playback report we'd delete this week.
-        var minAllowed = now.minus(RETENTION_AGE);
-        if (playedAt.isBefore(minAllowed)) {
-            log.warn("Rejected playback log — played_at {} is older than {} days, device={}",
-                    playedAt, RETENTION_AGE.toDays(), device.getId());
+        // Retention check: reject played_at older than the CONFIGURED playback window (90 days by
+        // default). The nightly retention job would purge the row anyway, and accepting it would
+        // muddy analytics — there's no signal to be had from a playback report we'd delete this
+        // week. Read from app.retention.playback so the bound and the sweep cannot disagree, and
+        // so the day count in the message is always the one actually enforced.
+        var retention = retentionProperties.getPlayback();
+        if (playedAt.isBefore(now.minus(retention))) {
+            log.info("Rejected playback log — played_at {} is older than {} days, device={}",
+                    playedAt, retention.toDays(), device.getId());
             return PlaybackLogResult.rejected("played_at is older than the %d-day retention window".formatted(
-                    RETENTION_AGE.toDays()));
+                    retention.toDays()));
         }
 
         // Dedup is the database's job: ON CONFLICT DO NOTHING skips an existing
@@ -152,7 +160,7 @@ public class PlaybackLogService {
         // Same-request duplicates: a device's local queue can hold the same
         // (contentFileId, playedAt) twice. ON CONFLICT already returns 0 for the second one,
         // so this set just saves a round trip. Only ACCEPTED keys enter the set, so a repeated
-        // entry that was *rejected* (future / >90 days) is rejected again, exactly as today.
+        // entry that was *rejected* (future / past the retention window) is rejected again.
         var seenInRequest = new java.util.HashSet<List<Object>>();
 
         for (int i = 0; i < entries.size(); i++) {

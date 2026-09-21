@@ -1,380 +1,1170 @@
 # Android Device ↔ Backend Contract — Authoritative Flow Spec
 
 **Audience:** the OrientedTV Android signage client team.
-**Purpose:** the *canonical* register → play flow as the backend **actually** behaves today, what the client **MUST** implement, and what is **NOT** the client's concern. This is the source-of-truth contract; where it disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md` (which described a now-superseded client state), **this document wins**. See §10 for the deltas you must action.
+**Purpose:** everything the device must send, receive, parse, persist and tolerate when it talks to the backend: REST contracts, the WebSocket channel and every frame on it, the MinIO download, timers, limits, failure modes.
+**Backend baseline:** `1.0.138` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4).
+**How this was verified:** every statement was checked against the backend source. The wire examples were captured from a live run of `1.0.135` (dev profile, real MinIO and Redis, real ffmpeg transcode, a real WebSocket client) on 2026-09-14. Rules marked *(verified)* were exercised end to end in that run.
 
-Conventions: **MUST / MUST NOT / SHOULD** are normative. All timestamps are ISO-8601 UTC. All device endpoints are under `/api/devices`.
+Where this document disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md`, or with an earlier revision of this file, **this document wins**. If you built against the previous revision, read the revision notes right below first.
 
----
-
-## 0. Mental model (read this first)
-
-1. **The backend is the single source of truth.** The device never decides *what* to play or *what version* is current — it asks, downloads, verifies, confirms, and plays. Every step is **reactive to state**, not a fixed call chain.
-2. **Two independent signals tell the device to sync**, and they arrive on two channels:
-   - **`syncRequired` / WebSocket `SYNC_REQUIRED`** — "your content is stale."
-   - **A `SYNC_CONTENT` action** in `pendingActions` / WebSocket `ACTION_PENDING` — "an operator forced a re-sync."
-   Either one means: run the sync flow. (As of backend v1.0.111, `syncRequired` is `true` for *both* causes — see §4.)
-3. **Content version is an opaque token.** It is a server-computed SHA-256 string. The device **MUST NOT** parse, compute, or reason about it — only store it and echo it back verbatim.
-4. **The device only ever downloads the *processed* object** from a MinIO presigned URL handed to it in `/sync`. It never touches the raw upload, the bucket, or the transcoder.
-5. **Identity:** after registration the device has a numeric `deviceId` and a `deviceToken`. Every authenticated call uses the **path `{id}` == its own `deviceId`** and the **`X-Device-Token` header**. A token for device A calling device B's path is a hard **403**.
+Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always **your own** `deviceId`. A "beat" is one heartbeat. "Server time" means your clock corrected by the offset from §7.1, never the raw device wall clock.
 
 ---
 
-## 1. Authentication & identity
+## Revision notes: corrections to the previous revision
 
-| Item | Value / behavior |
-|---|---|
-| Auth header | `X-Device-Token: <deviceToken>` on **every** call except `POST /register` |
-| Token format | `dtk_<32-hex>` (opaque — do not parse) |
-| Principal | the backend resolves the token to your numeric `deviceId`; the path `{id}` **MUST** equal it |
-| WebSocket auth | same token via **`X-Device-Token` header** (preferred) **or** `?device_token=<token>` query param on the handshake |
+These are behaviour differences between the previous spec and what the backend actually does. Each one is a client change.
 
-**Status codes you MUST handle on authed calls:**
-- **401 Unauthorized** — token missing, unknown, or **revoked** (e.g. after a re-registration issued a new token). → wipe local token + `deviceId`, re-register (§3), reconnect WS.
-- **403 Forbidden** — valid token but the path `{id}` isn't yours. This is a client bug (wrong id in the URL); do not retry blindly.
-- **404 Not Found** — the device id no longer exists server-side (deleted). → re-register (§3). The client's "3 consecutive device-scoped 404s → force re-register" policy is the right shape; **any non-404 resets the counter**.
-
-> **Not your concern:** how the token is validated/stored server-side, role mapping, or that the token is currently stored in plaintext. You only hold and present it.
-
----
-
-## 2. Endpoint inventory (device-facing)
-
-| # | Method & path | Auth | Role in flow |
+| # | Previous spec said | Actual behaviour | Section |
 |---|---|---|---|
-| 1 | `POST /api/devices/register` | none (permitAll) | obtain `deviceId` + `deviceToken` |
-| 2 | `POST /api/devices/{id}/heartbeat` | device | liveness + sync signal + action pickup |
-| 3 | `GET /api/devices/{id}/sync` | device | get the diff (files to add/delete, playlist order, presigned URLs) |
-| 4 | `POST /api/devices/{id}/sync/confirm` | device | go-live: tell the server you applied a version |
-| 5 | `GET /api/devices/{id}/actions/pending` | device | poll for actions **only when WS is down** |
-| 6 | `POST /api/devices/{id}/actions/{actionId}/confirm` | device | ack an executed action |
-| 7 | `POST /api/devices/{id}/playback` | device | telemetry (off the critical path) |
-| 8 | `GET /api/devices/{id}/time` | device | cheap server clock for offset estimation (**synchronized playback**, §9) |
-| 9 | `WS /ws/devices/{id}` | device | live push: `SYNC_REQUIRED`, `ACTION_PENDING` |
-| — | `GET /api/devices/{id}/playlist` | device | **optional** snapshot of the resolved playlist — **not required** (see §7) |
-| — | MinIO presigned `GET` | URL-signed | download the processed media object |
-
-There are **8 REST endpoints you need + 1 WebSocket + MinIO GETs.** `GET /…/playlist` exists (contrary to older notes) but you don't need it. Endpoint 8 (`/time`) and the schedule fields on `/sync` (§5.1) are the **synchronized-playback time layer** — additive; a device that ignores them free-runs solo exactly as before.
+| R1 | Content changes are pushed as WS `SYNC_REQUIRED` | Live content pushes are **`SYNC_CONTENT`** with a `reason`. `SYNC_REQUIRED` is sent **only as a replay when the socket connects**. | §10.3 |
+| R2 | New actions arrive live as WS `ACTION_PENDING` | `ACTION_PENDING` is **only replayed on connect**. An action issued while you are connected is **not pushed**; you get it from the next heartbeat or from `GET /actions/pending`. | §8.1 |
+| R3 | `currentFileIds` = every file you hold "regardless of download status" | List **only fully downloaded and verified** files. The server never issues a URL for a file you claim to hold, so a partial file listed there can never be resumed. | §6.2 |
+| R4 | `fullSync` is a hint you can ignore | With `fullSync: true` the server **ignored your `currentFileIds`**. `filesToAdd` repeats files you already have, and `filesToDelete` is always empty, so you must garbage-collect yourself. | §6.3, §6.4 |
+| R5 | `URGENT_CONTENT` is never pushed | It **is** pushed to every connected device on the whole fleet. It is not actionable, so ignore it. | §10.3 |
+| R6 | The server pings every ~90 s | The server **never pings**. The client must send WS pings. | §10.6 |
+| R7 | A deleted device gets 404 and should re-register | A deleted (or rotated) token gets **401**. Re-registering a soft-deleted serial currently fails with **500**. | §2 |
+| R8 | Action `payload` looks like a JSON object | `payload` is a **JSON document encoded as a string**, and it may be `null`. Action types also include `PLAYLIST_CONTROL` and `ASSIGN_CONTENT`. | §8.2, §8.3 |
+| R9 | `VOLUME_SET` and `desiredVolume` are both valid | `VOLUME_SET` does **not** change `desiredVolume`, so the next beat pulls the volume back. | §8.3 |
+| R10 | `MISMATCH` means content changed mid-sync | `MISMATCH` means you confirmed something other than what **your latest `/sync`** returned. Content changing mid-sync still yields `CONFIRMED`. | §6.6 |
+| R11 | Devices flip together at `activateAt` | The anchor is created once **per assignment**. After a playlist edit `activateAt` is usually in the past. A group jump changes the anchor **without** a version change, and heartbeats do not signal it. | §7 |
+| R12 | Timestamps are "ISO-8601" | Up to **9** fractional digits. The same instant can render differently on the WS frame and on the heartbeat. | §1.4 |
+| R13 | — | `Content-Type: application/json` is mandatory on every body. Without it the request **500s**. | §1.2 |
+| R14 | — | Sending a stale `X-Device-Token` on `/register` gets **401**, so registration never succeeds. | §4 |
+| R15 | `contentType` describes the download | `contentType` and `name` describe the **original upload** (e.g. `video/quicktime`). The download is always MP4. | §6.3 |
+| R16 | — | The same `fileId` can appear at several `index` positions with different durations. | §6.4 |
+| R17 | Expired URL → 403/410 | MinIO answers **403**, never 410. `ETag` is not the SHA-256. Send `Accept-Encoding: identity`. | §6.5 |
+| R18 | 10 registrations/hour per IP | The window is a fixed **clock hour**. Attempts that fail with 500 also count. Every box behind one NAT shares the budget. | §4 |
+| R19 | — | `agentTicket` is the **same string on every beat**. Acking `ENDED` after an operator stop returns 409, which is expected. Remote control is **disabled in production** today. | §9 |
+| R20 | Playback rejects bad entries per item | One malformed entry fails the **whole batch** with 400. A `null` field fails the whole batch with 500. Entries for content that is no longer assigned are rejected. | §11 |
+| R21 | Re-registering an existing serial returns 200 with a fresh token | **Since 1.0.137:** an already-registered serial gets **409** unless an admin clicked *Allow re-registration* for that device in the last hour (then 200 as before, once). Over-long or badly formed `serialNumber`/`deviceName` now get **400** instead of 500. **Client change:** on 409 from `/register`, keep playing cached content and retry every ~5 min with jitter; show "waiting for operator to allow re-registration" in diagnostics. Attempts on a registered serial use a **separate** budget (60/hour per IP), not the 10/hour new-device budget. A heartbeat closes any open window. | §1.6, §2, §4, §13 |
 
 ---
 
-## 3. Registration
+## 0. Mental model
 
-**Call:** `POST /api/devices/register` (no `X-Device-Token`).
+1. **The backend is the single source of truth.** The device never decides *what* to play or *which version* is current. It reports what it has, asks for the diff, downloads, verifies, confirms, then plays.
+2. **The heartbeat is the contract; the WebSocket is an accelerator.** Almost every WS frame carries information you can also get from the heartbeat, `/sync` or `/actions/pending`. The exceptions are §7.5 (group jump, which needs `/sync`) and `URGENT_CONTENT` (nothing to act on). Build every feature so it works with the socket down.
+3. **Content version is an opaque 64-char lowercase hex token.** Store it, echo it, compare it for equality. Never parse or compute it.
+4. **You only download the processed MP4** from a MinIO presigned URL that `/sync` hands you. You never touch buckets, raw uploads or the transcoder.
+5. **Identity is `deviceId` + `deviceToken`.** Every authenticated call puts your own `deviceId` in the path and the token in `X-Device-Token`.
+6. **Nothing is exactly-once.** Actions repeat until confirmed, WS frames can be dropped, confirms can be retried. Every handler must be idempotent and keyed by id.
+
+---
+
+## 1. Transport & wire conventions
+
+### 1.1 Hosts
+
+| What | Where | Notes |
+|---|---|---|
+| REST API | `https://<api-host>/api/devices/...` | Production sits behind a TLS reverse proxy. The base URL **MUST** be configurable. **MUST NOT** hardcode an IP or port `8080`: since v1.0.133 the app port listens on loopback only and is reachable solely through the proxy. |
+| WebSocket | `wss://<api-host>/ws/devices/{id}` | Same host as REST. Use `wss://` whenever REST is `https://`. |
+| Media | whatever host the `presignedUrl` names | A **different host** from the API (the MinIO public vhost). Network security config, allow-lists and certificate pinning must cover both hosts. |
+
+### 1.2 Request rules
+
+- **`Content-Type: application/json` on every request that has a body** (register, heartbeat, both confirms, ack, playback). Adding `; charset=utf-8` is fine. A body without this header makes the server throw and answer **500** *(verified)*. OkHttp sets it for you when you build the body with a JSON `MediaType`.
+- Bodies are UTF-8 JSON. Unknown fields in your requests are ignored, so extra fields are harmless.
+- **Enum strings inside JSON bodies are case-sensitive.** `SUCCESS`, `FAILED`, `READY`, `ENDED` must be uppercase. `"success"` gets **400** *(verified)*.
+- **JSON type errors fail the whole request with 400** *(verified)*. `"volume": "loud"` and `"supported": "yes"` are rejected. Numeric strings like `"45"` are coerced and floats are truncated, but send real integers and booleans.
+- **String length limits.** Exceeding them fails the request with **500** (the database rejects the value) *(verified)*:
+
+  | Field | Max |
+  |---|---|
+  | `serialNumber` | 100 |
+  | `deviceName` | 200 |
+  | heartbeat `contentVersion`, confirm `reportedVersion` | 64. Only ever echo a server-issued version. |
+  | remote ack `reason` | 64. Longer values are truncated, not rejected. |
+
+- **Headers you MUST NOT send:**
+  - `X-Device-Token` on `POST /register`. A stale token there gets 401 before registration runs (§4).
+  - `X-Device-Token` to the MinIO host. It is ignored there, but it leaks your credential into proxy logs.
+  - `Origin` on the WebSocket handshake. An `Origin` that is not on the server's browser allow-list gets 403 (§10.1), and a device never belongs on that list.
+- There is no request-id header. The server generates a fresh `correlationId` for each error response.
+- A wrong HTTP method gets **405**.
+
+### 1.3 Response rules
+
+- Everything is `application/json` except MinIO (media bytes, or S3 XML errors) and WS handshake rejections (empty body, see §10.1).
+- **Nullable fields are always present as `null`**, never omitted. The one exception is `details` in the error envelope.
+- **Ignore unknown response fields.** The backend adds fields additively.
+- **Arrays are never `null`.** `pendingActions`, `filesToAdd`, `filesToDelete`, `playlistOrder`, `items` and `rejections` are always arrays, possibly empty.
+- All ids (`deviceId`, `fileId`, `actionId`) and every `*Ms` / `*EpochMs` / `activateAt` value are **int64**. Use `Long`.
+
+### 1.4 Time
+
+- **Server → device timestamps** are ISO-8601 UTC with `Z` and **0 to 9 fractional digits** *(verified)*, e.g. `"2100-01-01T00:00:00Z"`, `"2026-09-14T17:42:21.468521Z"`, `"2026-09-14T17:40:28.406465577Z"`. Parse with `java.time.Instant.parse` (API 26+, or core-library desugaring). **Never** use a fixed-pattern `SimpleDateFormat`.
+- **The same instant can be rendered with different precision on different channels.** One remote session's `expiresAt` came through as `…13:12.041682612Z` on the WS frame and `…13:12.041683Z` on the heartbeat *(verified)*. Compare parsed instants, never strings, and key objects by their id.
+- **Epoch-millisecond fields** are `/time` `serverUnixMs`, `/sync` `anchorEpochMs`, `activateAt`, `loopDurationMs`, `slotStartMs` and `slotDurationMs`.
+- **Device → server timestamps** (playback `playedAt`) **MUST** be ISO-8601 strings with `Z` or an explicit offset (`+05:00` is accepted). An offset-less `"2026-09-14T17:00:00"` fails the whole batch with 400 *(verified)*. A JSON number is read as epoch **seconds**, so an epoch-millisecond value lands far in the future and is rejected.
+- **Do not trust the device wall clock.** TV boxes often boot with a wrong clock. Keep a server-time offset (§7.1) measured against `SystemClock.elapsedRealtime()` and use it for `playedAt`, action expiry, remote-session `expiresAt`, presigned-URL deadlines and `activateAt`.
+
+### 1.5 Error envelope
+
+Every non-2xx JSON response uses the same shape *(verified)*:
+
+```json
+{
+  "status": 400,
+  "error": "Validation Failed",
+  "message": "Request validation failed — see fieldErrors for details",
+  "correlationId": "e0b6b535-e63b-4e1b-90d7-24c91eda2e34",
+  "timestamp": "2026-09-14T17:40:27.987848609Z",
+  "fieldErrors": [ { "field": "serialNumber", "message": "Serial number is required", "rejectedValue": " " } ]
+}
+```
+
+- `fieldErrors` is `null` except on bean-validation failures. `details` is omitted; it never appears on device endpoints.
+- **Branch on `status` only.** `message` is human text. Log `message` together with `correlationId`, which is how backend engineers find your request.
+- A production 500 carries `"message": "An unexpected error occurred. Reference: <correlationId>"`.
+
+### 1.6 Generic retry classification
+
+| Outcome | Meaning | Client behaviour |
+|---|---|---|
+| network error / timeout | — | Retry with exponential backoff and jitter. |
+| 5xx | Server fault. **Some 500s are deterministic** from bad input (§16). | Retry with backoff, but cap retries per payload. If the same payload 500s repeatedly, treat it as poison and drop or split it. |
+| 400 | Your request is malformed. | **Do not** retry the same payload. Log it as a client bug. |
+| 401 | Token missing, unknown or revoked. | §2: close the WS, wipe credentials, re-register. |
+| 403 | Path `{id}` ≠ your token's device. | Client bug. Re-read the stored `deviceId` and do not loop. |
+| 404 | Endpoint-specific (§14). | See §14. |
+| 405 | Wrong method. | Client bug. |
+| 409 | Endpoint-specific. **`POST /register`:** serial already registered and no admin window open (§4). **Remote ack:** session terminal. | `/register`: keep retrying every ~5 min with jitter (§4). Remote ack: terminal, stop retrying. |
+| 429 | Registration rate limit. | Back off until the next UTC clock hour (§4). |
+| 503 | Temporarily unavailable. | Retry later with backoff. |
+
+Suggested timeouts: connect 10 s, read 30 s. Use a 60 s read timeout for `/sync`, which checks storage once per file it offers.
+
+---
+
+## 2. Identity, token lifecycle & auth failures
+
+| Item | Behaviour |
+|---|---|
+| `deviceId` | int64 assigned at first registration. Stable across re-registrations of the same serial. |
+| `deviceToken` | `dtk_` + 32 lowercase hex (36 chars). Opaque. No expiry, no refresh endpoint. |
+| Header | `X-Device-Token: <deviceToken>` on every call except `POST /register` and MinIO GETs. |
+| Validation | Checked against the database on **every** REST request with no cache, so revocation is immediate for REST. |
+| Token becomes invalid when | (a) the same `serialNumber` re-registers **inside an admin-opened window** (§4), which rotates it, or (b) an admin soft-deletes the device. Since 1.0.137 nobody can rotate your token by just calling `/register`. |
+| Path binding | The path `{id}` **MUST** equal the token's device, otherwise 403. |
+
+**Auth failures on REST** *(verified)*:
+
+| Response | Cause | Action |
+|---|---|---|
+| `401` `"Authentication required"` | You sent **no** `X-Device-Token`, or a proxy stripped it. | Fix the client. Re-registering will not help if the header never leaves the device. |
+| `401` `"Invalid or revoked device token"` | Unknown token, rotated by an admin-allowed re-registration, or device soft-deleted. | Close the WebSocket, wipe `deviceId` and token, re-register (§4), reconnect. **Keep your local media store**: re-registration does not require re-downloading. If `/register` answers 409, keep playing cached content and retry (§4). |
+| `403` `"Insufficient permissions"` | Path `{id}` is not your device. | Client bug. |
+| `404` on a device endpoint | Only reachable in a race (a deleted device gets 401 first). | Keep the "3 consecutive device-scoped 404s → re-register" guard as defence. Any non-404 resets the counter. |
+
+**An open WebSocket is not closed when your token is revoked or your device is deleted** *(verified both)*. It keeps receiving pushes. A REST 401 is the authoritative signal, so close the socket yourself.
+
+**Decommissioned devices:** after an admin soft-deletes a device, re-registering **the same serial fails with 500** (the serial stays unique even on deleted rows) *(verified)*. Every attempt also consumes registration rate-limit budget. On repeated 5xx from `/register`, back off exponentially up to 1 hour and surface "device decommissioned — contact operator" in diagnostics. See §16 G-6.
+
+**Serial uniqueness is your responsibility.** Two boxes with the same `serialNumber` cannot both work: since 1.0.137 the second one gets 409 on `/register` for as long as the first holds the serial (before, they evicted each other's token in an endless 401 → re-register ping-pong). Derive the serial from hardware identity where the app has the privilege. Otherwise use `Settings.Secure.ANDROID_ID` (unique per signing key + user + device, resets on factory reset). Only as a last resort use a generated UUID persisted in app storage. **Never ship a device image with pre-populated app data.** The serial is case-sensitive and must match `^[A-Za-z0-9][A-Za-z0-9._:-]*$` (≤ 100 chars): whitespace or any other character gets 400.
+
+---
+
+## 3. Endpoint inventory (device-facing)
+
+| # | Method & path | Auth | Request | Success | Purpose |
+|---|---|---|---|---|---|
+| 1 | `POST /api/devices/register` | **none** | JSON | `201` / `200` | Obtain `deviceId` + `deviceToken`. §4 |
+| 2 | `POST /api/devices/{id}/heartbeat` | token | JSON, optional | `200` | Liveness, desired state, action pickup. §5 |
+| 3 | `GET /api/devices/{id}/sync` | token | query | `200` | Content diff, play order, URLs, schedule. §6 |
+| 4 | `POST /api/devices/{id}/sync/confirm` | token | JSON | `200` | Go-live acknowledgement. §6.6 |
+| 5 | `GET /api/devices/{id}/time` | token | — | `200` | Server clock for offset estimation. §7.1 |
+| 6 | `GET /api/devices/{id}/actions/pending` | token | — | `200` (array) | Pending actions with payloads. §8 |
+| 7 | `POST /api/devices/{id}/actions/{actionId}/confirm` | token | JSON | `200` | Report an action's outcome. §8.5 |
+| 8 | `POST /api/devices/{id}/remote/{sessionId}/ack` | token | JSON | `200` | Remote-session outcome. §9 |
+| 9 | `POST /api/devices/{id}/playback` | token | JSON object or array | `200` | Proof-of-play telemetry. §11 |
+| 10 | `GET /api/devices/{id}/playlist` | token | — | `200` | **Optional** read-only snapshot. §6.8 |
+| 11 | `WS /ws/devices/{id}` | token | — | `101` | Push channel. §10 |
+| 12 | `GET <presignedUrl>` | signature in URL | — | `200` / `206` | Media download. §6.5 |
+
+Nothing else is meant for devices. Operator endpoints return **403** for a device token. The few public endpoints (`/api/auth/**`, `/api/health`, password reset) are for humans and monitoring, not part of this contract.
+
+---
+
+## 4. Registration
+
+**`POST /api/devices/register`**, with no `X-Device-Token` header.
 
 ```jsonc
 // request
-{ "serialNumber": "<stable per-device id>", "deviceName": "<optional friendly name>" }
-// response  (201 = newly created, 200 = re-registered)
-{ "deviceId": 12, "deviceToken": "dtk_…", "serialNumber": "…", "status": "registered",
-  "syncGroupId": "reg--1" }   // synchronized-playback group; usually the region-level fallback here
-```
-
-**MUST:**
-- Derive `serialNumber` from a **stable** identity (hardware serial, else a persisted UUID). The server keys the device on this — a changing serial creates duplicate devices.
-- Treat `syncGroupId` here as provisional **and opaque** (never parse the prefix) — a freshly-registered device usually sits on the region-level fallback until an operator places it into a sync group (a `"sg-…"` sales point). The **authoritative** group is delivered on every **heartbeat** (§4); re-read it there. `null` ⇒ free-run solo.
-- Persist the response **token first, then the `deviceId`** (so a crash can never leave a device row without a usable token).
-- Treat **201 and 200 identically** — both yield a valid `deviceId`+`deviceToken`. (200 = the serial already existed; **the returned token is fresh and the previous token is now invalid** — overwrite it.)
-- Skip the network call when you already hold **both** a `deviceId` and a token.
-
-**Rate limit:** registration is limited to **10/hour per source IP** → **429** with a JSON error body. Re-register is not a hot path; if you hit 429 you are registering in a loop — back off (capped exponential is fine) and fix the loop cause.
-
-> **Not your concern:** region/facility/group placement (the server assigns a default), and the `status` string (informational only).
-
----
-
-## 4. Heartbeat — the liveness beat and sync signal
-
-**Call:** `POST /api/devices/{id}/heartbeat` on a fixed cadence (the current 2-minute self-rescheduling beat is appropriate). Skip the POST if you have no `deviceId` yet.
-
-```jsonc
-// request body (optional; send your last CONFIRMED version + your current output volume)
-{ "contentVersion": "<last confirmed version, or omit/null if none>", "volume": 45 }
-// response
 {
-  "deviceId": 12,
-  "status": "ONLINE",                       // ONLINE | OFFLINE | NO_CONTENT | UNREGISTERED
-  "serverTime": "2026-06-04T09:20:26Z",
-  "pendingActions": [ /* PendingAction… see §6 */ ],
-  "expectedContentVersion": "c6fe…",        // the version the server wants you on (may be null if no content)
-  "syncRequired": true,
-  "desiredVolume": 70,                      // the target output volume (0–100) — set yours to this
-  "syncGroupId": "fac-42"                   // synchronized-playback group; null ⇒ free-run solo
+  "serialNumber": "SPEC-VERIFY-1",   // REQUIRED. ≤100 chars, ^[A-Za-z0-9][A-Za-z0-9._:-]*$, stable per physical box (§2)
+  "deviceName":   "Verify box"       // OPTIONAL. ≤200 chars. Used only when the device row is created
 }
 ```
 
-**What you MUST read and act on:**
-- **`syncRequired == true`** → stage a sync: remember `expectedContentVersion` as the target and trigger the sync flow (§5). As of backend v1.0.111 this flag is `true` when **either** your reported version ≠ `expectedContentVersion` **or** a `SYNC_CONTENT` action is pending — so it is now a complete "you should sync" signal.
-- **`desiredVolume`** (int, 0–100, always present) → the operator-set target output volume. **Set your audio output to this value** and keep reporting your current `volume` on each beat. This is the convergence loop: *report current → obey `desiredVolume`*. Persistent desired state — an offline/reset device self-heals to the right volume on its next beat. (The one-off `VOLUME_SET` pending action still exists for ad-hoc immediate pokes; both paths are valid.)
-- **`pendingActions[]`** (independent of `syncRequired`) → ingest and execute (§6). Always present-or-empty.
-- **`syncGroupId`** (string, nullable) → the **authoritative** synchronized-playback group (`sync group ?? facility ?? device group ?? region`, prefixed — e.g. `"sg-9"` / `"fac-42"` / `"grp-7"` / `"reg-3"`; the `sg-` tier is an operator-assigned "sales point" and sits on top). **Treat it as opaque** — never parse the prefix. Devices sharing it are one playback group; re-read it every beat (operators relocate and re-group devices). `null` ⇒ free-run solo. Only devices sharing `syncGroupId` **and** the same resolved content version end up frame-aligned. Used only by the sync-time layer (§9); ignore it if you are not implementing synchronized playback.
+```jsonc
+// 201 Created (first registration) — verified
+{ "deviceId": 1, "deviceToken": "dtk_2730e287694d40d7bd39aa71b7f2e442",
+  "serialNumber": "SPEC-VERIFY-1", "status": "registered", "syncGroupId": "reg--1" }
 
-**Request `volume`** (optional, 0–100) is your device's *current* output volume; the server stores it for the operator console and never fails the beat on a bad/missing value. Omit it only if you genuinely can't read it.
+// 200 OK (re-registration of an existing serial — only inside an admin-opened window, since 1.0.137)
+{ "deviceId": 1, "deviceToken": "dtk_2425d2344a3444299c794e185a66a937",
+  "serialNumber": "SPEC-VERIFY-1", "status": "re-registered", "syncGroupId": "reg--1" }
+```
 
-**What you SHOULD ignore:** `status` and `deviceId` are echoes for debugging; the device does not need to branch on `status` (the server derives it from your heartbeat freshness + content state). `serverTime` is only useful as the clock for your own "sync pending since" timer. **Do NOT** ignore `desiredVolume` — it is authoritative.
+| Field | Type | Meaning |
+|---|---|---|
+| `deviceId` | int64 | Your id for every path. Unchanged on re-registration. |
+| `deviceToken` | string | **Always a fresh token.** On 200 the previous token died at that instant. |
+| `serialNumber` | string | Echo. |
+| `status` | `"registered"` \| `"re-registered"` | Informational only. |
+| `syncGroupId` | string \| null | Provisional sync-group label. A new device sits in the "Unassigned" region, so this is `"reg--1"` (note the double hyphen: the id is `-1`). Opaque. The authoritative value arrives on every heartbeat. |
 
-> **Not your concern:** how `status` is derived, the 15-min offline window, incident/alert escalation. Those are server-side.
+**Server-side effects you must know about:**
+- A **new** device is placed in the default "Unassigned" region, named `deviceName` or `"Device-<serial>"`.
+- **Re-registration of an already-registered serial is refused with `409`** unless an ADMIN opened a re-registration window for that device (device page → *Allow re-registration*, 1 hour by default). The first registration inside the window uses it up; a second one gets 409 again. This closes device takeover by anyone who knows a serial.
+- **Re-registration** (inside a window) rotates the token and **clears the server's record of your confirmed content version** and any in-flight sync marker. Placement, groups, volume and name are all kept; `deviceName` is **ignored** on re-registration. Because the stored version is cleared, your next WS connect replays `SYNC_REQUIRED` (§10.2). Sending your confirmed version on the next heartbeat restores the server's view without a re-download.
+- **Registration does not count as a heartbeat.** The operator console shows the device OFFLINE until the first beat, so **send a heartbeat immediately after registering**.
+
+**MUST:**
+- Persist the **token first, then `deviceId`**, so a crash can never leave an id without a usable token.
+- Treat 201 and 200 identically. Both return a valid pair; overwrite what you had.
+- On **409** (already registered, no window): do **not** wipe your media store and do **not** treat it as terminal. Keep playing cached content, retry every ~5 min with ±60 s jitter, and show "waiting for operator to allow re-registration" in diagnostics. The operator fixes it with one click; your next retry then gets 200. (A window is closed early by any heartbeat from the device, since a beat proves the box still holds its token.)
+- Skip the call when you already hold both a `deviceId` and a token.
+- Never send `X-Device-Token` on this call. A stale header gets `401 "Invalid or revoked device token"` before registration runs *(verified)*, and would lock a revoked device out forever.
+
+**Rate limit** *(verified)*: **10 attempts per source IP per UTC clock hour.**
+- The window is fixed (bucket = `epochSeconds / 3600`), not rolling. It resets at the top of each hour.
+- The "source IP" is your public address as seen by the reverse proxy (since 1.0.138 the backend ignores any `X-Forwarded-For` the client itself sends), so **every box behind one venue NAT shares the 10**.
+- Every attempt that passes body validation counts, **including ones that then fail with 500**. 400s and stale-token 401s do not count.
+- **Since 1.0.137, attempts on an already-registered serial (409, or 200 inside an admin window) count against a separate budget of 60 per source IP per hour**, so a box waiting for re-registration does not starve new boxes behind the same NAT. Over that budget you get 429 as above.
+- The 11th attempt gets `429` with `"message": "Device registration rate limit exceeded (10/hour) for this source"` and **no `Retry-After` header**.
+- **Client behaviour:** on 429, wait until the next UTC hour plus random jitter of 0–5 min. For a fleet install of more than 10 boxes at one site, stagger registrations or ask the backend to raise `app.device.register-rate-limit-per-hour`.
+
+| Status | Cause |
+|---|---|
+| 201 | Created, or first registration of a pre-provisioned serial. |
+| 200 | Re-registration inside an admin window; token rotated. |
+| 400 | Missing, blank, over-long (> 100) or badly formed `serialNumber`; `deviceName` > 200; malformed JSON. |
+| 401 | You sent an invalid `X-Device-Token` header. |
+| 409 | Serial already registered and no admin re-registration window open. Retry every ~5 min. |
+| 429 | Rate limit. |
+| 500 | The serial belongs to a soft-deleted device (§2), or a missing `Content-Type`. |
 
 ---
 
-## 5. The sync flow (the heart of register→play)
+## 5. Heartbeat
 
-This is a strict, gated pipeline. Run it whenever a sync is staged (heartbeat `syncRequired`, WS `SYNC_REQUIRED`, a `SYNC_CONTENT` action, a presigned-URL expiry, or an offline→online edge while a sync is still pending).
+**`POST /api/devices/{id}/heartbeat`**. It is idempotent and safe to retry.
 
-### 5.1 Fetch the diff
-**Call:** `GET /api/devices/{id}/sync?currentVersion={v}&currentFileIds={id}&currentFileIds={id}…`
-- `currentVersion` = your **last CONFIRMED** version (omit/blank when you have none → the server returns a full set).
-- `currentFileIds` = the ids of **every** content file you currently hold locally (repeat the param per id), regardless of download status. The server diffs against this.
+### 5.1 Request
+
+The body is optional: no body, an empty body and `{}` are all accepted *(verified)*.
 
 ```jsonc
-// response
 {
-  "deviceId": 12,
-  "expectedContentVersion": "c6fe…",
-  "fullSync": true,                          // informational — see below
+  "contentVersion": "875250576ce90c2a2d9edad015654e974d6e0972460aadf6149c1ff4b55364af",
+  "volume": 45,
+  "remote": {                     // OPTIONAL — remote view/control capability (§9.1)
+    "supported": true,
+    "input": "ROOT",              // ROOT | ACCESSIBILITY | NONE
+    "transport": "SCRCPY_WS",     // SCRCPY_WS | NONE
+    "maxWidth": 1280,
+    "maxHeight": 720
+  }
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `contentVersion` | string \| null | Your **last CONFIRMED** version (§6.6). `null`, absent and `""` all mean "I hold no content". **Send it on every beat once you have one.** If you omit it while content is assigned, `syncRequired` stays `true` *(verified)* and after 30 minutes the server opens a `CONTENT_VERSION_MISMATCH` incident. Whatever non-blank value you send is stored as your current version, which drives the WS replay (§10.2). Max 64 chars, otherwise the beat fails with 500. |
+| `volume` | int 0–100 \| null | Your **actual** output volume on a 0–100 scale. Out-of-range values are clamped. `null` or absent keeps the last known value. |
+| `remote` | object \| null | §9.1. Semantically bad values are dropped with a server WARN, but **JSON type errors fail the whole beat with 400** *(verified)*. |
+
+### 5.2 Response
+
+*(verified)*
+
+```json
+{
+  "deviceId": 1,
+  "status": "ONLINE",
+  "serverTime": "2026-09-14T17:42:23.705927232Z",
+  "pendingActions": [
+    { "actionId": 2, "actionType": "VOLUME_SET", "payload": "{\"volume\":35}",
+      "issuedAt": "2026-09-14T17:42:21.521544Z", "expiresAt": "2026-09-14T17:47:21.521544Z" }
+  ],
+  "expectedContentVersion": "a7bb9017ee84741ef1f668e57e4b3ce3c246d3ba95f8c982e1dd88f69730e668",
+  "syncRequired": true,
+  "desiredVolume": 100,
+  "syncGroupId": "reg--1",
+  "desiredRemoteSession": null
+}
+```
+
+| Field | Type | What you do with it |
+|---|---|---|
+| `deviceId` | int64 | Echo; ignore. |
+| `status` | string | `ONLINE` or `NO_CONTENT` in practice; the enum also has `OFFLINE` and `UNREGISTERED`. Server-derived. **Do not branch on it**; log it. |
+| `serverTime` | ISO instant | The server clock when the response was built. Good enough for a coarse clock offset; use `/time` for precision (§7.1). |
+| `pendingActions` | array of PendingAction | Ordered by `issuedAt` ascending. **May include actions whose `expiresAt` has already passed** but that the janitor has not swept yet (it runs every minute) *(verified)*. Handle per §8. |
+| `expectedContentVersion` | string \| null | The version the server wants you on. `null` means no content is assigned (§6.7). |
+| `syncRequired` | bool | `true` when **either** content is assigned and it differs from the `contentVersion` you sent, **or** a `SYNC_CONTENT` action is pending. Run the sync flow (§6). It does **not** become true for a sync-group jump (§7.5). |
+| `desiredVolume` | int 0–100 | **Always present.** The per-device override, else the device-group volume, else 100. Set your output to it on every beat. It is desired state: an offline or reset device self-heals on its next beat. |
+| `syncGroupId` | string \| null | Opaque playback-group label (`"sg-9"`, `"fac-42"`, `"grp-7"`, `"reg-3"`, `"reg--1"`). Re-read it every beat, since operators re-group devices and reassignment can clear an `sg-` membership. **Never parse the prefix.** Informational for the time layer (§7.2). In practice never `null`, because every device has a region. |
+| `desiredRemoteSession` | object \| null | Desired remote-session state (§9). **Always `null` while remote control is disabled on the server, which is the case in production today.** |
+
+### 5.3 Cadence
+
+- Every **120 s ± 10 s jitter**, self-rescheduling. Never run two beats concurrently.
+- Also beat **immediately** after registration, on app start, and when the network comes back.
+- The server marks a device OFFLINE after **15 minutes + 60 s grace** without a beat and raises a `DEVICE_OFFLINE` incident, so one missed beat is harmless.
+- Skip the beat when you have no `deviceId`.
+- Status handling: 401 → §2. 400 → fix the payload; a beat that 400s does not count as liveness. 5xx or network → try again on the next tick.
+
+---
+
+## 6. Content sync
+
+### 6.1 Triggers
+
+Run the sync flow (§6.2–§6.6) when any of these happens. Use a **single-flight** coordinator: if a trigger arrives mid-sync, mark the coordinator dirty and run exactly one more pass after the current one. Never abort in-flight downloads.
+
+| Trigger | Channel |
+|---|---|
+| `syncRequired: true` on a heartbeat | REST |
+| WS `SYNC_CONTENT`, **any** `reason`, even if you believe you are current, because the anchor may have moved (§7.5) | WS |
+| WS `SYNC_REQUIRED` | WS connect replay |
+| A pending `SYNC_CONTENT` action | heartbeat, poll or replay (§8) |
+| App start, and every WebSocket (re)connect | local; this is how you recover a group jump you missed (§7.5) |
+| Every 10 min while in schedule mode (§7) | local |
+| Downloads still pending with `presignedUrlsExpireAt` less than 10 min away, or a 403 from MinIO | local |
+| A local media file is missing or fails re-verification | local; re-sync **without** that id in `currentFileIds` |
+
+Coalesce bursts, e.g. debounce 500 ms, but keep the delay well under the 5 s jump lead (§7.5). Space non-push-triggered `/sync` calls at least 30 s apart.
+
+### 6.2 `GET /api/devices/{id}/sync`: request
+
+```
+GET /api/devices/12/sync?currentVersion=a7bb90…e668&currentFileIds=1&currentFileIds=7
+GET /api/devices/12/sync?currentVersion=a7bb90…e668&currentFileIds=1,7          (equivalent)
+GET /api/devices/12/sync                                                           (nothing confirmed yet)
+```
+
+| Param | Rules |
+|---|---|
+| `currentVersion` | Your last CONFIRMED version. **Omit the parameter entirely** when you have none. An empty `currentVersion=` is **not** treated as absent: it is a non-matching version with `fullSync: false` *(verified)*. |
+| `currentFileIds` | int64 ids of the media files you hold **fully downloaded and SHA-256/size-verified on disk right now**. Use either repeated params or a comma list, **never both**: `currentFileIds=5,6&currentFileIds=7` gets 400 *(verified)*. Non-numeric values get 400. Omit it when you hold none. **Never** include partial downloads (the server gives no URL for a file you claim to hold) or files you have already deleted. It is ignored when `currentVersion` is omitted. |
+
+- **Side effect:** when the response carries work (non-empty add/delete, or `expectedContentVersion ≠ currentVersion`), the server arms a sync-pending marker for that `expectedContentVersion`. A matching confirm clears it. If 30 minutes pass without a matching confirm, a `SYNC_TIMEOUT` incident opens and the marker clears; the next `/sync` re-arms it. The 30 minutes count from the **first** `/sync` of the cycle, so refreshing URLs does not reset them.
+- **Every call re-signs URLs**, and probes storage once for each file it offers you. It is not free.
+- Keep the URL under ~8 KB (the server's header limit). The comma form is shorter; ~1000 ids fit comfortably.
+
+### 6.3 Response
+
+*(verified; the same `fileId` appears twice because the playlist holds the same clip at two slots)*
+
+```json
+{
+  "deviceId": 1,
+  "expectedContentVersion": "a7bb9017ee84741ef1f668e57e4b3ce3c246d3ba95f8c982e1dd88f69730e668",
+  "fullSync": true,
   "filesToAdd": [
     {
       "fileId": 1,
-      "name": "promo.mp4",
-      "contentType": "video/mp4",
-      "sizeBytes": 1890347,                  // EXACT size of the object the URL serves (see §8)
-      "durationSeconds": 39,
-      "checksum": "9be63ff9…64hex",          // SHA-256 hex of that object (see §8)
-      "presignedUrl": "https://minio/content-processed/processed/…?X-Amz-…"
+      "name": "clip.mov",
+      "contentType": "video/quicktime",
+      "sizeBytes": 86135,
+      "durationSeconds": 4,
+      "checksum": "05bc5a6a3e274f4f5eca4054f57702e3532ae85b52ee0106442d7f6c3cb928df",
+      "presignedUrl": "https://minio.<domain>/content-processed/processed/d0733eb4-5b92-470f-9e4f-6d696cebe519.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=…%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260914T174158Z&X-Amz-Expires=7200&X-Amz-SignedHeaders=host&X-Amz-Signature=…"
     }
   ],
-  "filesToDelete": [ 7, 8 ],                 // fileIds you hold but should drop
+  "filesToDelete": [],
   "playlistOrder": [
-    { "index": 0, "position": 0, "fileId": 1, "durationSeconds": 39,
-      "slotStartMs": 0,     "slotDurationMs": 39000 },   // ── sync-time layer (§9) ──
-    { "index": 1, "position": 1, "fileId": 2, "durationSeconds": 15,
-      "slotStartMs": 39000, "slotDurationMs": 15000 }
+    { "index": 0, "position": 0, "fileId": 1, "durationSeconds": 4, "slotStartMs": 0,    "slotDurationMs": 4000 },
+    { "index": 1, "position": 1, "fileId": 1, "durationSeconds": 2, "slotStartMs": 4000, "slotDurationMs": 2000 }
   ],
   "presignedUrlExpiryMinutes": 120,
-  "presignedUrlsExpireAt": "2026-06-04T11:20:26Z",
-
-  // ─── synchronized-playback time layer (§9). Epoch-MILLISECOND longs, NOT ISO-8601.
-  //     Absent/null for a solo/ungrouped device or before the loop is anchored. ───
-  "syncGroupId": "fac-42",                   // == the heartbeat's syncGroupId (§4)
-  "anchorEpochMs": 1719830400000,            // loop T0 (== activateAt)
-  "loopDurationMs": 95000,                   // Σ slotDurationMs; 0 when nothing is deliverable
-  "activateAt": 1719830400000               // coordinated cut-over instant (epoch ms)
+  "presignedUrlsExpireAt": "2026-09-14T19:41:58.893460829Z",
+  "syncGroupId": "reg--1",
+  "anchorEpochMs": 1789407838945,
+  "loopDurationMs": 6000,
+  "activateAt": 1789407838945
 }
 ```
 
-**MUST:**
-- Apply as a **delta upsert**: `filesToAdd` → mark for download (preserve already-DOWNLOADED/DOWNLOADING rows for the same id); `filesToDelete` → mark for deletion; stage `playlistOrder` as the *pending* order (do not promote it to the live playlist yet — promotion happens at confirm, §5.3).
-- **Order by `index`** (a contiguous, 0-based ordinal over the delivered list) — **not** `position`. `position` is the raw playlist slot (kept for reference) and **may be sparse** (e.g. `0, 2`) when an undeliverable item was filtered out; never use it as a dense array index or for `next = (i+1) % n`. Use `index`.
-- **`playlistOrder[].durationSeconds` is the EFFECTIVE per-item duration** (the per-item override, else the file's natural duration) and is the **source of truth for item timing** — non-null for any deliverable item. Do **not** read timing from `filesToAdd[].durationSeconds`: `filesToAdd` excludes files you already hold, so a held item has no entry there.
-- Treat `presignedUrlsExpireAt` as the **hard deadline** for the URLs in this response. Re-run `/sync` to refresh URLs before they expire if downloads are still in flight (refreshing ~10 min early is sensible).
-- Only files the server considers ready appear in `filesToAdd`. The URL always points at the **processed** object in `content-processed`. (`/playlist` is a parallel, stateless freshness snapshot of the same deliverable set, also carrying `index`; `/sync` is the authoritative play contract.)
+**Top level:**
 
-**SHOULD ignore:** `fullSync` — the device behavior is identical either way (always a delta upsert against your held ids). It's a server hint, not an instruction. `expectedContentVersion` here equals the version you're syncing toward; if it equals your `currentVersion` the diff is empty (no-op).
-
-> **A version change can have NO file delta.** `expectedContentVersion` differs from your `currentVersion` whenever the order changes too — a **pure reorder** returns empty `filesToAdd`/`filesToDelete` but a new `expectedContentVersion` and a new `playlistOrder`. Apply the new order and **still confirm** it (see §5.3). Don't treat "no files to add/delete" as "nothing to do". *(As of backend v1.0.127 a pure **dwell-time edit** also yields a new `expectedContentVersion` — item durations are now folded into the version hash — so offline/reconnecting devices pick up new slot timings.)*
-
-> **Sync-time layer (§9), synchronized playback — optional, additive.** When `syncGroupId` is non-null and `anchorEpochMs`/`activateAt` are present, the response is a deterministic **schedule**: `slotStartMs`/`slotDurationMs` per item (a prefix-sum timeline; `loopDurationMs = Σ slotDurationMs`), a shared loop anchor `anchorEpochMs`, and a coordinated cut-over `activateAt`. All are **epoch-millisecond `long`s** (not ISO-8601). Every device that resolves the same content version gets the **identical** schedule, so you compute "what's on screen right now" as a pure function of a synced clock, with **no device-to-device traffic**:
-> - Estimate your clock offset from `GET /{id}/time` (§2 endpoint 8): sample it a few times against a **monotonic** device clock (`elapsedRealtime`), keep the min-RTT sample. Never trust the device wall clock.
-> - `positionInLoop()`: if `syncedNow < activateAt` hold the previous version; else `elapsed = floorMod(syncedNow − anchorEpochMs, loopDurationMs)`, then the item is the last slot with `slotStartMs ≤ elapsed`, offset `elapsed − slotStartMs`.
-> - A device that reboots/reconnects re-derives the **live** position and seeks straight there — it **never restarts the loop at item 0**. Devices flip to a new version together at `activateAt`; a straggler that misses it joins at the live position when ready.
-> - `slotDurationMs` is authoritative and always positive (a null-duration image falls back to a default dwell). Audio stays out-of-band via heartbeat `desiredVolume` + `VOLUME_SET` — **not** a sync concern. A device that ignores these fields free-runs solo exactly as before.
-> - **`anchorEpochMs` is no longer guaranteed to equal the version's original T0** (backend v1.0.129): an operator **group jump** re-anchors it so the whole sync group converges on a chosen item at `activateAt`. The device rule is unchanged — **always trust the latest `/sync` `anchorEpochMs`/`activateAt`** and re-derive `positionInLoop()`; on a jump you seek to the new live position at `activateAt`, exactly like a version cut-over. **No new field, no new action.** The jump self-clears when the content version changes (the next `/sync` returns the base anchor again).
-
-### 5.2 Download + verify each file (MinIO)
-**Call:** `GET <presignedUrl>` (support `Range: bytes=<resumeFrom>-` to resume partials).
-
-**MUST:**
-- **Pre-flight space check** before starting (e.g. `sizeBytes` + headroom). `sizeBytes` is now the true size of the object you will receive (§8), so this check is reliable.
-- **Verify integrity on completion (this is now mandatory and reliable):**
-  1. **Byte size:** bytes written **MUST** equal `sizeBytes`. (Backend v1.0.112 fixed `sizeBytes` to be the processed object's size — the historical mismatch that forced you to disable this check is gone. **Re-enable the strict size check.**)
-  2. **Checksum:** when `checksum != null`, compute SHA-256 of the downloaded bytes and it **MUST** equal `checksum` (lowercase hex). Backend v1.0.114 populates this for newly-processed files and backfills legacy ones; treat it as **"verify if present,"** and it will be present for essentially all files post-rollout. Mismatch → discard the partial, re-download.
-- On **403/410** from MinIO (URL expired) → the URL is stale, not the file. Keep any partial bytes, re-run `/sync` to get a fresh URL, resume via `Range`.
-- A file only becomes **playable** once fully downloaded **and** verified.
-
-### 5.3 Confirm (go-live)
-**Gate:** all files required by the pending version are downloaded+verified (nothing still PENDING/DOWNLOADING/ERROR). Deletions need not block.
-
-**Call:** `POST /api/devices/{id}/sync/confirm` body `{ "reportedVersion": "<the version you just fully applied>" }`.
-
-```jsonc
-// response
-{ "deviceId": 12, "status": "CONFIRMED", "expectedVersion": "c6fe…", "reportedVersion": "c6fe…", "syncRequired": false }
-```
-
-**MUST confirm a reorder too:** a pure reorder is a **no-file sync** — `expectedContentVersion` changes but `filesToAdd`/`filesToDelete` are both empty. You **MUST still POST `/sync/confirm`** with the new `expectedContentVersion` after applying the new order. The server arms a sync-pending marker on a reorder, and only your confirm clears it; skipping confirm-on-no-files leaves the marker to time out into an incident.
-
-**Handle `status`:**
-- **`CONFIRMED`** → atomically promote the pending playlist to live, set your `currentVersion = reportedVersion`, clear the "sync pending" state. You are live on the new content.
-- **`MISMATCH`** (`syncRequired: true`) → the server expected a different version (content changed again mid-sync). **Do NOT retry confirm.** Keep the pending state and **re-run `/sync`** — you'll get the corrected file set + fresh URLs. Loop until `CONFIRMED`.
-
-> **Not your concern:** the server's 30-minute sync-timeout incident timer (it keeps running across a MISMATCH on purpose). You just keep re-syncing until CONFIRMED.
-
----
-
-## 6. Remote actions
-
-Actions arrive two ways and the device handles them identically:
-- **WebSocket** `ACTION_PENDING` frame (live), and replayed on connect.
-- **Heartbeat** `pendingActions[]` (poll fallback), and **`GET /api/devices/{id}/actions/pending`** while the WS is disconnected (poll ~30s; stop when WS connects, since the server replays on connect).
-
-```jsonc
-// PendingAction (from heartbeat / actions-pending)
-{ "actionId": 7, "actionType": "SYNC_CONTENT", "payload": "{}", "issuedAt": "…", "expiresAt": "…" }
-```
-
-**Action types and what the device MUST do:**
-
-| `actionType` | Payload | Device action |
+| Field | Type | Meaning |
 |---|---|---|
-| `SYNC_CONTENT` | `{}` | Trigger the sync flow (§5) immediately — same as `syncRequired` |
-| `REBOOT` | `{}` | Soft-reboot |
-| `VOLUME_SET` | `{"volume": 0–100}` | Set output volume |
-| `PLAYBACK_PAUSE` | `{}` | Pause playback |
-| `PLAYBACK_RESUME` | `{}` | Resume playback |
-| `GET_DIAGNOSTICS` | `{}` | Gather diagnostics, return them in the confirm `result` |
-| `PLAYLIST_CONTROL` | `{"action":"PREV"|"NEXT"|"JUMP","position":N}` | **Solo/manual** transport control. For `JUMP`, **`position` is the 0-based `index` into your delivered playlist** (the same contiguous `index` from `/sync` `playlistOrder` — **not** the raw `position` field). The server validates it against the deliverable count; treat an out-of-range value defensively (clamp/ignore). **For a device in a sync group the coordinated mechanism is the server-side *group jump* (a `/sync` re-anchor, §5.1), not this per-device command** — a solo `JUMP` on a synced device is expected to be overridden by the next `positionInLoop()` tick. |
+| `deviceId` | int64 | Echo. |
+| `expectedContentVersion` | string(64) \| null | The target version. `null` means no content (§6.7). **This is the value you confirm.** |
+| `fullSync` | bool | `true` **iff you omitted `currentVersion`**. When true the server ignored `currentFileIds`: `filesToAdd` lists **every** deliverable file, including ones you already hold, and `filesToDelete` is **always `[]`**. |
+| `filesToAdd` | array | Files to download. Each `fileId` appears once, in first-play order. Only files that are transcoded **and** present in storage. |
+| `filesToDelete` | int64[] | Ascending. The subset of your `currentFileIds` that is no longer deliverable. With no content assigned it is **all** your `currentFileIds`. |
+| `playlistOrder` | array | The play order, sorted by `index`. |
+| `presignedUrlExpiryMinutes` | int | URL lifetime (default 120). |
+| `presignedUrlsExpireAt` | ISO instant | Hard deadline for **these** URLs. It is computed a few ms before signing, so it is safely conservative. |
+| `syncGroupId` | string \| null | Same label as the heartbeat. |
+| `anchorEpochMs` | int64 \| null | Loop T0 for schedule mode (§7). `null` when there is no content or the anchor was unavailable this round. |
+| `loopDurationMs` | int64 | Σ `slotDurationMs`. **Always present**; `0` when `playlistOrder` is empty. |
+| `activateAt` | int64 \| null | Coordinated cut-over instant (§7). |
 
-`expiresAt` is ~5 min after issue (`PLAYLIST_CONTROL` ~10 min). Actions are best-effort; an expired action you confirm late is still recorded (see below).
+**`filesToAdd[]`:**
 
-**Confirm every action:** `POST /api/devices/{id}/actions/{actionId}/confirm`
+| Field | Type | Meaning |
+|---|---|---|
+| `fileId` | int64 | Stable id. **The bytes behind a delivered `fileId` never change**, so cache by `fileId`. |
+| `name` | string | The **original upload filename** (e.g. `clip.mov`). Display and logging only; never derive an extension from it. |
+| `contentType` | string | MIME type of the **original upload** (e.g. `video/quicktime`). **Not** the type you download, which is always `video/mp4` *(verified)*. Do not pick a decoder from it. |
+| `sizeBytes` | int64 | Exact byte size of the object the URL serves (== `Content-Length`) *(verified)*. |
+| `durationSeconds` | int \| null | The file's **natural** duration, rounded to the nearest second. **Not** the slot duration; use `playlistOrder[]` for timing. |
+| `checksum` | string \| null | SHA-256 of the served bytes as 64 lowercase hex chars *(verified)*. Verify when non-null. |
+| `presignedUrl` | string | HTTPS GET URL (§6.5). |
 
-```jsonc
-{ "status": "SUCCESS", "result": "<optional free-text / diagnostics JSON>" }   // status ∈ { SUCCESS, FAILED }
-```
+**`playlistOrder[]`:**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `index` | int | **Contiguous 0-based play position.** Order by it, address by it (`PLAYLIST_CONTROL` JUMP), log by it. |
+| `position` | int | The raw playlist slot. **May be sparse** (e.g. `0, 2`) when an item was filtered out. Ignore it. |
+| `fileId` | int64 | The media for this slot. **May repeat across entries.** |
+| `durationSeconds` | int \| null | Effective dwell: the operator's per-item override if set, otherwise the file's natural duration. |
+| `slotStartMs` | int64 | Loop-relative start (prefix sum). |
+| `slotDurationMs` | int64 | **Always > 0.** `durationSeconds × 1000`, or `10000` when `durationSeconds` is null or 0. **This is the authoritative slot length.** |
+
+**The deliverable-set rule:** `playlistOrder` contains exactly the files offered in `filesToAdd` this round plus the files you reported holding that are still in the playlist. If the server cannot presign a file you do not hold (a storage glitch), that item is **absent** from `playlistOrder` this round and the `index` values are renumbered around it. Its pending order is shorter; it is not broken.
+
+### 6.4 Applying the diff
+
+1. **Stage, don't switch.** Store the response as the *pending* state: version, `playlistOrder`, `anchorEpochMs`, `activateAt`, `loopDurationMs`, `syncGroupId`. The live playlist keeps playing.
+2. **`filesToAdd`**: if you already hold that `fileId` with a matching size and checksum (routine when `fullSync` is true), do nothing. Otherwise queue a download and keep any partial bytes from earlier attempts.
+3. **`filesToDelete`**: mark those ids for deletion. **Physically delete only after** the new version is live (and in schedule mode after `activateAt`), and only if neither the live nor the pending playlist references the id.
+4. **Model the playlist by `index`, not by `fileId`.** A `fileId` can sit at several indexes with different `slotDurationMs` values *(verified: the same clip at index 0 for 4 s and index 1 for 2 s)*.
+5. **A version change can come with no file delta.** Reorders, dwell edits, and adding a file you already hold all produce a new `expectedContentVersion` with empty add and delete lists. Apply the new order and **still confirm** (§6.6).
+6. **Nothing changed** (same version, empty diff, same anchor and `activateAt`): nothing to do. Confirming anyway is harmless.
+7. **Garbage-collect after every CONFIRMED promotion:** delete every local media file whose id is not referenced by the live or pending `playlistOrder`. This is **required**, because a full sync never lists deletions.
+
+**What changes `expectedContentVersion`:** a different resolved assignment, or any change to the assigned playlist's items. That covers add, remove, move, reorder, dwell edit, and a file's processed object changing. **What does not:** a volume change, sync-group membership, operator exclusions of *other* devices, and a group jump.
+
+### 6.5 Download & verify (MinIO)
+
+**Request:**
+- `GET <presignedUrl>` **verbatim**. Only the `Host` header is signed. Do not re-encode, reorder or rebuild the query string: turning `%2F` in `X-Amz-Credential` back into `/` breaks the signature and gets 403.
+- Send `Accept-Encoding: identity`. OkHttp silently adds `Accept-Encoding: gzip` when there is no `Range` header, and a compressing proxy in front of MinIO would then strip `Content-Length` and `Accept-Ranges`.
+- Send `Range: bytes=<alreadyHave>-` to resume a partial download.
+- Do not send `X-Device-Token`.
+
+**Responses** *(verified)*:
+
+| Status | Meaning | Action |
+|---|---|---|
+| `200` | Full body. `Content-Length == sizeBytes`, `Content-Type: video/mp4`, `Accept-Ranges: bytes`. | Stream to a temp file. If you had asked for a `Range` and still got 200, truncate the temp file and restart from 0. |
+| `206` | Partial body, with `Content-Range: bytes 100-86134/86135`. | Append. |
+| `403` | Signature expired or invalid; the body is S3 XML. MinIO never answers 410. | Keep the partial bytes, run `/sync` for a fresh URL, then resume. This works only because you did **not** list the file in `currentFileIds` (§6.2). |
+| `404` | Object gone. | Discard the partial and re-sync; the server will stop offering it. |
+| `5xx` / network | — | Retry with backoff. |
+
+**`ETag` is not the checksum** (it is an MD5-style S3 ETag). Never compare it to `checksum`.
 
 **MUST:**
-- Send `status` as exactly **`SUCCESS`** or **`FAILED`** (these are the only accepted values).
-- Confirm is **idempotent and never 404s** for an unknown/expired action — the response `outcome` is one of `CONFIRMED | CONFIRMED_LATE | FAILED | UNKNOWN | ALREADY_FINALIZED`; you may treat all as terminal-success and stop retrying. Retry only on network/5xx; never drop a confirm (queue it if offline).
+- **Check free space before downloading.** Require `sizeBytes` of every queued download plus a safety margin, e.g. 10 % or 50 MB.
+- **Verify on completion:**
+  1. Bytes written **==** `sizeBytes`.
+  2. When `checksum != null`, the lowercase-hex SHA-256 of the file **==** `checksum`.
+  3. On a mismatch, delete the file and re-download from byte 0. After 2 consecutive failures mark the file ERROR and retry on a later sync.
+- `fsync` the temp file, then atomically rename it into the store. A file becomes **playable** and **reportable in `currentFileIds`** only after verification.
+- **Refresh URLs proactively:** when server time is within 10 min of `presignedUrlsExpireAt` and downloads are still pending, run `/sync`.
+- Download at most **2** files in parallel. The storage host is small.
 
-> **Not your concern:** the server-side action lifecycle (`PENDING → CONFIRMED/CONFIRMED_LATE/EXPIRED/FAILED`), late-confirm bookkeeping, or de-duplication. Just confirm once with SUCCESS/FAILED.
+**What you receive** (the transcoder's output):
+- **Container:** MP4 with fast-start.
+- **Video:** H.264 (High profile for normal 8-bit sources, verified), scaled down to fit **1920×1080** by default with aspect ratio preserved. That cap is server-configurable. The frame rate is kept from the source.
+- **Audio:** AAC-LC, 128 kbit/s, **present only if the source had audio**.
+- **Pixel format and H.264 profile are not forced.** A 10-bit or 4:2:2 source can produce a High 10 or High 4:2:2 stream that many hardware decoders reject. Handle a decoder failure per item: keep the slot timing, show black or hold the previous frame for that slot, and record the `fileId` plus error for diagnostics (§8.3 `GET_DIAGNOSTICS`). **Never crash the loop.**
+
+### 6.6 Confirm (go-live)
+
+**Gate:** every `fileId` referenced by the pending `playlistOrder` is held and verified. Deletions do not gate the confirm.
+
+**`POST /api/devices/{id}/sync/confirm`**
+
+```jsonc
+// request
+{ "reportedVersion": "<expectedContentVersion of your MOST RECENT /sync response>" }
+
+// response — verified
+{ "deviceId": 1, "status": "CONFIRMED",
+  "expectedVersion": "a7bb9017ee84741ef1f668e57e4b3ce3c246d3ba95f8c982e1dd88f69730e668",
+  "reportedVersion": "a7bb9017ee84741ef1f668e57e4b3ce3c246d3ba95f8c982e1dd88f69730e668",
+  "syncRequired": false }
+
+// response on a wrong version — verified
+{ "deviceId": 1, "status": "MISMATCH", "expectedVersion": "a7bb…e668", "reportedVersion": "old", "syncRequired": true }
+```
+
+**How the server judges it:**
+- It compares `reportedVersion` with the version your **most recent `/sync` that had work** armed (§6.2).
+- If no marker is armed (the last `/sync` had nothing to do, or the marker timed out), it compares with the live expected version.
+- If no content is assigned at all, any non-blank value is `CONFIRMED` with `"expectedVersion": null` *(verified)*. **Do not confirm** in that state anyway (§6.7).
+- **Whatever you report is stored as your current version, even on `MISMATCH`.**
+- **Content changing between your `/sync` and your confirm does not produce `MISMATCH`.** You get `CONFIRMED` for the version you downloaded, and the newer version reaches you through a `SYNC_CONTENT` push or the next heartbeat's `syncRequired`. Keep listening after every CONFIRMED.
+
+**Handle the response:**
+- **`CONFIRMED`**: atomically promote pending → live (in schedule mode the promotion takes effect on screen at `activateAt`, §7.3), set `confirmedVersion = reportedVersion`, persist, run the §6.4 GC, and send `confirmedVersion` on subsequent heartbeats.
+- **`MISMATCH`** (`syncRequired: true`): you confirmed something other than what your latest `/sync` gave you. **Do not retry the confirm with the same value.** Run `/sync` again and confirm its `expectedContentVersion`.
+
+**Rules:**
+- **The confirm is idempotent.** Repeating a CONFIRMED confirm returns `CONFIRMED` again *(verified)*, so retrying on network or 5xx errors is safe.
+- **Confirm no-file syncs too** (reorders and dwell edits). The server armed a marker, and only your confirm clears it.
+- **Confirm promptly.** The 30-minute `SYNC_TIMEOUT` incident clock started at the first `/sync` of the cycle.
+- In schedule mode, confirm **as soon as the files are ready, even before `activateAt`**. `activateAt` governs what is on screen, not when you confirm, and your heartbeat reports the confirmed version while the old content is still playing out.
+- A blank or missing `reportedVersion` gets 400. More than 64 chars gets 500. A missing `Content-Type` gets 500.
+
+### 6.7 The "no content" state
+
+When `expectedContentVersion` is `null` (no active assignment, the window ended, or the device was excluded) *(verified)*:
+- `/sync` returns `filesToAdd: []`, `playlistOrder: []`, `loopDurationMs: 0`, and `anchorEpochMs` / `activateAt` both `null`.
+- `filesToDelete` holds your `currentFileIds`, but only when you sent `currentVersion`.
+- `syncGroupId` is still set.
+- The heartbeat returns `status: "NO_CONTENT"` and `syncRequired: false`.
+
+**Device behaviour:**
+1. Stop playback and show the idle/branding screen.
+2. Delete held media. That is the product decision: a lapse and a cancellation look the same to the server.
+3. Set `confirmedVersion = null`, so heartbeats send `contentVersion: null`.
+4. **Do not confirm** anything.
+
+### 6.8 `GET /api/devices/{id}/playlist` (optional)
+
+A stateless snapshot. **Not required**; `/sync` plus confirm is the play contract. It re-signs a URL for every item on each call, has no slot or anchor fields, and neither arms nor clears the sync marker. Use it for diagnostics only.
+
+```json
+{ "deviceId": 1, "playlistId": 1, "playlistName": "verify",
+  "contentVersion": "875250576ce90c2a2d9edad015654e974d6e0972460aadf6149c1ff4b55364af",
+  "totalDurationSeconds": 5,
+  "items": [
+    { "index": 0, "position": 0, "fileId": 1, "name": "clip.mov", "contentType": "video/quicktime",
+      "presignedUrl": "https://…", "durationSeconds": 3,
+      "checksum": "05bc5a6a…28df", "sizeBytes": 86135 }
+  ] }
+```
+
+With no content it returns `200` with `playlistId: null`, `playlistName: null`, `contentVersion: null`, `totalDurationSeconds: 0` and `items: []` *(verified)*. It never returns 404 for "no playlist".
 
 ---
 
-## 7. WebSocket (`/ws/devices/{id}`)
+## 7. Synchronized playback: the time layer
 
-Open after registration; reconnect with backoff on any non-`superseded` close.
+This layer is optional and additive. A device that ignores it free-runs the loop (§7.8).
 
-- **Auth:** `X-Device-Token` header (or `?device_token=`). Missing → 401, wrong id → 403, unknown/revoked → 401.
-- **Inbound frames (JSON, discriminated by `type`) — exactly two are emitted today:**
-  - `{"type":"SYNC_REQUIRED","expectedVersion":"…"}` → stage a sync toward `expectedVersion` (§5).
-  - `{"type":"ACTION_PENDING","actionId":…,"actionType":"…","issuedAt":"…"}` → pick up/execute the action (§6).
-  - *(`URGENT_CONTENT` exists in the protocol enum but the backend does **not** currently push it. You may keep a dormant handler, but do not depend on receiving it.)*
-- **On connect the server replays** all currently-pending actions and a `SYNC_REQUIRED` if your version is stale — so a fresh connection self-heals missed messages.
-- **Duplicate connection:** if the same device opens a second socket, the **older** socket is closed with code **1008 "superseded"**. On `1008 superseded` → do **not** reconnect (another instance owns the socket).
-- The device sends **no outbound frames**; the server pings ~every 90s.
-- **While the WS is connected, do not poll** `/actions/pending`. Use the poll only as the disconnected fallback.
+### 7.1 Server clock: `GET /api/devices/{id}/time`
 
-> **Not your concern:** which server event produced a push (assignment confirmed, content changed, operator action). The frame tells you what to do; the cause is server-side.
+```json
+{ "serverUnixMs": 1789407628919 }
+```
+
+The endpoint is cheap: no database work and no liveness side effects.
+
+**Offset estimation:**
+1. Take 5 samples back to back.
+2. For each, record `t0 = elapsedRealtime()` before the call and `t1` after it; `rtt = t1 − t0`.
+3. Keep the sample with the smallest `rtt`.
+4. `serverNowAt(e) = serverUnixMs + (e − (t0 + t1) / 2)`.
+
+Re-estimate every ~10 min, after network changes, and after any wall-clock change broadcast. Never trust the device wall clock.
+
+### 7.2 When schedule mode applies
+
+- Schedule mode is on when `anchorEpochMs != null && activateAt != null && loopDurationMs > 0`.
+- **The anchor belongs to the assignment, not to `syncGroupId`.** Every device that resolves the same assignment gets the same anchor and the same slot timeline, whatever its `syncGroupId` label. `syncGroupId` is informational.
+
+### 7.3 What is on screen right now
+
+```text
+syncedNow = serverNow()
+
+schedule = (pending exists AND syncedNow >= pending.activateAt) ? pending : live
+           // before activateAt keep the live version; after it, the confirmed pending version takes over
+           // no live version at all (fresh device)? use pending immediately — the formula below is
+           // well-defined for negative elapsed, and every device computes the same answer
+
+elapsed  = floorMod(syncedNow − schedule.anchorEpochMs, schedule.loopDurationMs)
+slot     = last entry with slotStartMs <= elapsed
+offsetMs = elapsed − slot.slotStartMs          // seek the media here on join
+```
+
+- After a reboot or reconnect, re-derive the position and seek straight there. **Never restart the loop at index 0.**
+- Only switch to a pending schedule whose files are all verified. A straggler joins at the live position when it is ready.
+- `slotDurationMs` is authoritative.
+
+### 7.4 `activateAt` in practice
+
+- The anchor is created the first time anyone (a device's `/sync` or the server's readiness monitor) sees an assignment: `activateAt = anchorEpochMs = now + 2 min` (server default).
+- It is **immutable for the life of the assignment.** A later playlist edit produces a new `expectedContentVersion` but **reuses the same anchor and `activateAt`**, which is usually long in the past by then *(verified: after a dwell edit the version changed, the anchor stayed identical, and `loopDurationMs` went 6000 → 5000)*.
+- So "hold the old version until `activateAt`" matters only for a brand-new assignment. For edits, cut over as soon as you are confirmed, and expect the on-screen position to jump because `loopDurationMs` changed. That jump is correct.
+- Keep the old version's files until the cut-over has happened.
+
+### 7.5 Operator group jump
+
+An operator can make an explicit sync group (`sg-…`) jump to a chosen index. The server writes a group override with `activateAt = now + 5 s` and `anchorEpochMs = activateAt − slotStartMs[index]`, then pushes WS `SYNC_CONTENT` with `"reason": "sync-group-jump"`.
+
+- **`expectedContentVersion` does not change and there is no file delta.** Only `anchorEpochMs` and `activateAt` change. **Re-read both from every `/sync` response** and apply them at `activateAt` exactly like a cut-over. There is no new field and no new action.
+- **Heartbeats do not signal a jump** (`syncRequired` stays false), and **the WS connect replay does not resend it.** A device that was disconnected at jump time learns about it only on its next `/sync`. That is why §6.1 requires a `/sync` on every WS (re)connect and every 10 min in schedule mode.
+- The override self-clears when the content version changes; the next `/sync` returns the base anchor again.
+- A device placed in or removed from a sync group sees it only as a different `syncGroupId` label.
+
+### 7.6 Media length vs slot length
+
+- `durationSeconds` is rounded to whole seconds, so media is up to ±0.5 s off its natural slot, and operators can set any dwell from 1 s to 86400 s. The media will often be shorter or longer than its slot.
+- The backend does not prescribe what happens. **Recommended:**
+  - The slot is authoritative. Cut the media at the slot end.
+  - If the media ends early, **hold the last frame** until the slot ends.
+  - When joining with `offsetMs` beyond the media length, show the last frame.
+- Pick one behaviour and apply it on every device, or frame alignment breaks.
+
+### 7.7 Audio
+
+Volume stays out of band (heartbeat `desiredVolume`, §5.2). It is not a schedule concern.
+
+### 7.8 Free-run (no schedule)
+
+When the schedule fields are null, loop `playlistOrder` by `index`, holding each item for `slotDurationMs`. Start at index 0 only on a cold start with no remembered position.
 
 ---
 
-## 8. Content integrity: `sizeBytes` & `checksum` (important — changed)
+## 8. Remote actions
 
-The device downloads the **processed** object via the presigned URL. The backend now guarantees the `/sync` metadata describes **that** object:
+### 8.1 How actions reach you
 
-- **`sizeBytes`** = the exact byte size of the processed object the URL serves (== MinIO `Content-Length`). **MUST** match bytes received. *(Fixed in v1.0.112; legacy rows backfilled in v1.0.114.)*
-- **`checksum`** = **SHA-256 hex (lowercase, 64 chars)** of that same processed object. **MUST** match when non-null. *(Added in v1.0.114; backfilled for legacy files on the server's first boot after deploy.)*
+*(verified)*
 
-**Required client posture:**
-1. Re-enable the strict `bytesOnDisk == sizeBytes` check — the prior size drift is resolved.
-2. Verify SHA-256 whenever `checksum != null`; you may treat `Content-Length` as a corroborating source of truth, but `sizeBytes` is now correct and required for the pre-download free-space check.
-3. During the rollout window a not-yet-reconciled legacy file *could* briefly still have `checksum == null`; "verify if present" keeps you safe. Post-rollout, expect it always present.
+| Channel | Carries payload? | When |
+|---|---|---|
+| Heartbeat `pendingActions[]` | yes | Every beat, until the action is confirmed, expired **and** swept. |
+| `GET /api/devices/{id}/actions/pending` | yes | Any time. Returns a plain JSON array of PendingAction, same shape and order as the heartbeat. |
+| WS `ACTION_PENDING` frame | **no** (id, type and `issuedAt` only) | **Only as a replay on socket connect.** No frame is pushed when an operator issues an action. |
 
-> **Not your concern:** how/when the backend computes size+checksum (at transcode time, plus a one-time startup reconciler for old files). You just verify what's handed to you.
+Consequences:
+- While the socket is connected, a new action reaches you on the **next heartbeat**, i.e. within one beat (≤120 s).
+- While the socket is **disconnected**, poll `/actions/pending` every **30 s**, and stop when the socket connects (the connect replay covers you).
+- If one-beat latency is unacceptable for your UX (transport controls, pause), you **MAY** also poll every 30–60 s while connected. The proper fix, a live push when an action is issued, is backend gap G-1 (§16).
+- An `ACTION_PENDING` frame has no payload. On receiving one, call `GET /actions/pending` once and execute from that response.
+
+### 8.2 PendingAction shape
+
+```json
+{ "actionId": 2, "actionType": "VOLUME_SET", "payload": "{\"volume\":35}",
+  "issuedAt": "2026-09-14T17:42:21.521544Z", "expiresAt": "2026-09-14T17:47:21.521544Z" }
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `actionId` | int64 | Idempotency key. |
+| `actionType` | string | See §8.3. Treat it as an open set. |
+| `payload` | **string** \| null | A JSON document **encoded as a string**: parse the string, then parse the JSON. Actions issued through the device-group bulk path may carry `null` or any operator-supplied string. If it is missing or does not parse, treat it as `{}`. |
+| `issuedAt` / `expiresAt` | ISO instant | `expiresAt` is `issuedAt` + 5 min (+10 min for `PLAYLIST_CONTROL`). |
+
+### 8.3 Action types
+
+Every string you can receive:
+
+| `actionType` | Payload | Device behaviour | Confirm |
+|---|---|---|---|
+| `SYNC_CONTENT` | `{}` | Trigger the sync flow (§6.1). While it is pending, heartbeats also say `syncRequired: true`. | `SUCCESS` as soon as `/sync` returned 200 and the diff is staged. Do **not** wait for downloads, which can outlive the 5-min expiry. `FAILED` if `/sync` fails non-retryably. |
+| `REBOOT` | `{}` | Soft reboot, using the confirm-before-reboot protocol in §8.4. | `SUCCESS` **before** rebooting. |
+| `VOLUME_SET` | `{"volume": 0–100}` | Apply immediately. **Caveat:** it does **not** change `desiredVolume`, so the next heartbeat pulls the volume back to `desiredVolume` *(verified: after `VOLUME_SET 35`, `desiredVolume` stayed 100)*. `desiredVolume` is authoritative. | `SUCCESS`, or `FAILED` with a reason. |
+| `PLAYBACK_PAUSE` | `{}` | Pause output. The backend keeps **no** paused state: it is not on the heartbeat and not re-sent after a restart. **Do not persist** a pause across process restarts. | `SUCCESS` / `FAILED` |
+| `PLAYBACK_RESUME` | `{}` | Resume. In schedule mode re-derive `positionInLoop()`; never continue from the paused frame. | `SUCCESS` / `FAILED` |
+| `GET_DIAGNOSTICS` | `{}` | Collect diagnostics and return them in `result` as a JSON string. The backend does not parse it, and operators see it verbatim. Recommended keys: `appVersion`, `androidVersion`, `model`, `serialNumber`, `uptimeSec`, `confirmedVersion`, `pendingVersion`, `syncState`, `liveIndex`, `scheduleMode`, `clockOffsetMs`, `wsConnected`, `freeStorageBytes`, `files: [{fileId, state, sizeBytes}]`, `decoderErrors`, `lastErrors`. Keep it ≤ 64 KB. | `SUCCESS` with `result`. |
+| `PLAYLIST_CONTROL` | `{"action":"PREV"}`, `{"action":"NEXT"}`, `{"action":"JUMP","position":N}` | Solo transport control. `position` is the **`index`** from `/sync`, not the raw `position` field. The server range-checked it against its own deliverable count **at issue time**, so it can be stale: clamp or ignore out-of-range values. **In schedule mode** the next `positionInLoop()` tick overrides any manual move; there, don't execute it. The coordinated mechanism is the group jump (§7.5). | Solo: `SUCCESS`. Schedule mode: `FAILED` with `result: "SCHEDULE_MODE"`, so the operator sees why nothing happened. |
+| `ASSIGN_CONTENT` | `{"playlistId": N}` | Issued only by the legacy device-group bulk endpoint. **It has no device-side meaning**: assignments are made server-side and content arrives through `/sync`. Do nothing. | `FAILED` with `result: "UNSUPPORTED: content is assigned server-side"`. |
+| anything else | — | Ignore. | `FAILED` with `result: "UNSUPPORTED_ACTION_TYPE"`. |
+
+Server guarantees: at most one PENDING action per `(device, actionType)`, and at most 10 pending actions per device.
+
+### 8.4 Execution rules
+
+- **Deduplicate by `actionId`.** The same action shows up on every beat, poll and replay until it is confirmed and swept. Persist the ids you have executed or confirmed for at least 24 h.
+- **Execute in `issuedAt` order.**
+- **Expired before execution:** if server time is already past `expiresAt` when you first see an action, **do not** perform a side effect (`REBOOT`, `PLAYBACK_*`, `VOLUME_SET`, `PLAYLIST_CONTROL`). Confirm it `FAILED` with `result: "EXPIRED_BEFORE_EXECUTION"`. Stale actions can still appear because the janitor sweeps only once a minute *(verified)*.
+- **REBOOT protocol:**
+  1. Persist `actionId` in the executed set.
+  2. `POST` the confirm with `SUCCESS`, waiting up to 5 s.
+  3. If the confirm did not succeed, put it in the durable confirm queue.
+  4. Reboot.
+  5. After boot, **flush the confirm queue before processing any pending actions**, and skip ids already in the executed set. Without this, a REBOOT that reappears after the reboot causes a reboot loop until it expires.
+- **Durable confirm queue:** confirms go into a persisted queue. Retry on network errors and 5xx with backoff. Drop on 4xx after logging.
+
+### 8.5 Confirm contract
+
+**`POST /api/devices/{id}/actions/{actionId}/confirm`**
+
+```jsonc
+// request
+{ "status": "SUCCESS", "result": "optional free text or a JSON string" }   // status ∈ {SUCCESS, FAILED}, uppercase, required
+
+// response — verified
+{ "actionId": 1, "outcome": "CONFIRMED", "finalStatus": "CONFIRMED" }
+```
+
+| `outcome` | When | `finalStatus` |
+|---|---|---|
+| `CONFIRMED` | `SUCCESS` before `expiresAt` | `CONFIRMED` |
+| `CONFIRMED_LATE` | `SUCCESS` after `expiresAt`, including an action already swept to EXPIRED *(verified)* | `CONFIRMED_LATE` |
+| `FAILED` | `FAILED` reported, at any time | `FAILED` |
+| `UNKNOWN` | No such action, or it belongs to another device *(verified)* | `null` |
+| `ALREADY_FINALIZED` | The action was already `CONFIRMED`, `CONFIRMED_LATE` or `FAILED` *(verified)* | the existing status |
+
+- Every outcome is `200` and **terminal**. Never retry after a 200.
+- A missing `status` gets 400 with `fieldErrors`, and a lowercase status gets 400 *(verified)*. A missing `Content-Type` gets 500.
+- `result` is stored as-is with no server limit. Keep it ≤ 64 KB.
 
 ---
 
-## 9. What is NOT the device's responsibility (server-side concerns)
+## 9. Remote view/control sessions
 
-Do **not** implement, compute, or branch on any of these:
+**Current status: the feature ships dark.** Production runs with `app.remote.enabled=false` and the relay server is not deployed, so `desiredRemoteSession` is always `null` and no session frames are sent. The ack endpoint answers regardless of the flag. Everything below is the contract for when the feature is enabled. Reporting the capability block (§9.1) is safe to ship today.
 
-- **Content version computation.** It's an opaque SHA-256 over the assignment/playlist. Echo `currentVersion`, store `expectedContentVersion`. Never derive it.
-- **Assignment resolution** — which region/facility/device-group/playlist applies, priorities, time windows, exclusions. The server resolves it and hands you the final playlist via `/sync`.
-- **The diff itself.** You send your held `currentFileIds` + `currentVersion`; the server computes `filesToAdd`/`filesToDelete`. Don't try to pre-compute it.
-- **`fullSync`** — ignore it; always do a delta upsert.
-- **Transcoding / buckets / object keys / URL signing.** You only follow the presigned URL.
-- **`GET /api/devices/{id}/playlist`** — this returns the resolved playlist (with URLs/size/checksum) as a *snapshot*, intended mainly for the operator UI. It is **redundant** with `/sync` for the device. You do **not** need to call it; `/sync` + confirm is the authoritative path.
-- **Health/status derivation, incidents, dashboards, telemetry analytics, the sync-timeout timer.** Server-side.
-- **Playback logging correctness beyond batching.** `POST /…/playback` accepts a batch of `{contentFileId, playedAt, durationSeconds}` (≤500), is idempotent on `(deviceId, contentFileId, playedAt)`, rejects future/>90-day entries per-item, and is **off the critical path** — fire-and-forget on a slow cadence; a failure never blocks playback.
+A session is a short-lived rendezvous between one operator browser and your device through a separate **relay**. **The backend never carries media.** It tells both sides where to meet and gives each a signed ticket. Sessions are not remote actions: they have their own channel and their own ack endpoint.
+
+### 9.1 Capability block (heartbeat `remote`)
+
+| Field | Type | Server handling *(verified)* |
+|---|---|---|
+| `supported` | bool | `false` blocks operators from starting a session: they get **422**. Never reporting the block means "unknown", and operators may still try. |
+| `input` | `ROOT` \| `ACCESSIBILITY` \| `NONE` | Trimmed and upper-cased (`"root"` → `ROOT`). Unknown values are dropped with a WARN. `NONE` makes the operator UI show a **View only** badge. |
+| `transport` | `SCRCPY_WS` \| `NONE` | Same normalisation. |
+| `maxWidth`, `maxHeight` | int | Kept if in (0, 7680], otherwise dropped. `maxWidth` caps the `maxWidth` the server sends you. |
+
+- A `null` or omitted field keeps the previously stored value, so a partial block is fine.
+- Semantic problems never fail the beat. **JSON type errors do** (400).
+
+### 9.2 How a session reaches you
+
+- **Heartbeat `desiredRemoteSession`** is the reliable path, with up to one beat of latency.
+- **WS `REMOTE_SESSION_START`** carries the same fields, sooner.
+
+```jsonc
+// desiredRemoteSession on the heartbeat — verified (WS frame has the same fields plus "type")
+{
+  "sessionId":   "rs_ab8c2b96ce3bca418b543a29d6af23f5",   // "rs_" + 32 hex; opaque key
+  "relayUrl":    "wss://relay.example.uz/agent",
+  "agentTicket": "eyJzaWQiOiJyc19hYjhj….pkkcauwUB-XlnocW_oy44WFzCmr6eDmehqqJpEcp9U8",  // opaque
+  "expiresAt":   "2026-09-14T18:13:12.041683Z",           // issue time + 30 min (server default)
+  "viewOnly":    true,
+  "maxWidth":    1280,      // min(server cap 1280, your reported maxWidth)
+  "maxFps":      15,
+  "bitRate":     2000000
+}
+```
+
+- **`agentTicket` is deterministic.** It is the identical string on every beat for a session *(verified)*. Never treat a ticket change as a signal; key everything on `sessionId`. The ticket is opaque, so do not decode it.
+- There is no `maxHeight`. Preserve aspect ratio from `maxWidth`.
+- `desiredRemoteSession` becomes `null` when:
+  - an operator stops the session;
+  - you ack `FAILED` or `ENDED`;
+  - server time passes `expiresAt`, even before the janitor marks it EXPIRED;
+  - the feature is disabled.
+
+### 9.3 MUST
+
+1. **Converge; don't queue.** A non-null `desiredRemoteSession` for a `sessionId` you are not running → start it (stop any other session first). `null` → stop whatever you are running. A beat naming the session you already run is a no-op. `ACTIVE` sessions keep appearing on every beat *(verified)*.
+2. **Dial `relayUrl` with `agentTicket`.** The relay-side protocol (the expected `?ticket=<agentTicket>` query, stream framing, input events) is defined by the relay contract, **not by this backend**, and is not published yet, so treat it as provisional. The ticket is **single use** per `(sessionId, role)` at the relay. After a process restart during an ACTIVE session the heartbeat still names the session, but the relay will refuse the reused ticket: ack `FAILED` with `error: "relay refused reconnect after restart"` so the operator can start a new session.
+3. **Kill the stream at `expiresAt` using server time (§1.4).** This is a hard ceiling that you enforce yourself. An unreachable backend must never leave a box streaming.
+4. **Honour `viewOnly`**: send video and accept no input.
+5. **Ack every outcome** (§9.4).
+
+### 9.4 Ack: `POST /api/devices/{id}/remote/{sessionId}/ack`
+
+```jsonc
+// request
+{ "status": "READY",          // READY | FAILED | ENDED — uppercase, required (lowercase → 400, verified)
+  "width": 1280, "height": 720, // real capture size; non-positive → stored as null
+  "error": null,               // SHOULD be set on FAILED (human-readable; shown to the operator)
+  "reason": null }             // on ENDED: "EXPIRED" | "RELAY_LOST" | "USER_STOP" | …; ≤64 chars (truncated); blank → "DEVICE_ENDED"
+
+// 200 — verified
+{ "sessionId": "rs_ab8c2b96ce3bca418b543a29d6af23f5", "status": "ACTIVE" }
+```
+
+| Ack `status` | Effect | Response `status` |
+|---|---|---|
+| `READY` | PENDING → ACTIVE. **A repeated READY while ACTIVE is idempotent (200)** *(verified)* and just refreshes the dimensions. | `ACTIVE` |
+| `FAILED` | → FAILED. Do not retry silently; the operator needs to see `error`. | `FAILED` |
+| `ENDED` | → ENDED. Use `reason: "EXPIRED"` when you hit `expiresAt`. | `ENDED` |
+
+| Code | Meaning | Action |
+|---|---|---|
+| 200 | Recorded. | — |
+| 400 | Bad or missing `status`, or malformed JSON. | Fix the client. |
+| 401 / 403 | §2. | — |
+| 404 | Unknown session, or it belongs to another device. | Terminal: stop retrying. |
+| 409 | The session is already terminal (ENDED, FAILED or EXPIRED). **Expected** when you ack `ENDED` after an operator stop *(verified)*. | Terminal: stop retrying. |
+
+### 9.5 Stop
+
+- An operator stop sends WS `REMOTE_SESSION_STOP` (§10.3), and the next heartbeat returns `desiredRemoteSession: null`.
+- Tear the session down.
+- You may ack `ENDED`; a 409 is normal there.
 
 ---
 
-## 10. Deltas from the previous client behavior (action items)
+## 10. WebSocket: `/ws/devices/{id}`
 
-The older `REGISTER_TO_PLAYBACK_FLOW.md` documented a client built against an earlier backend. Update these:
+### 10.1 Connecting
 
-1. **Re-enable the download size check.** The "TEMP-HACK (2026-06-04)" that commented out `bytesOnDisk != sizeBytes` was a workaround for a backend bug where `sizeBytes` reported the *original upload* size instead of the processed object. **That bug is fixed** (v1.0.112 + v1.0.114 backfill). `sizeBytes` now equals the served object; the strict check should be restored.
-2. **Start enforcing `checksum`.** It is no longer "frequently null" — the backend now stores the processed object's **SHA-256 hex** and backfills legacy files. Verify it whenever present.
-3. **`syncRequired` is now a superset.** It is `true` for a version mismatch **or** a pending `SYNC_CONTENT` action (was: version-mismatch only). Your existing "treat `SYNC_CONTENT` as a sync trigger" logic is correct and now reinforced; no regression, but the flag alone is sufficient to detect both cases.
-4. **`/playlist` endpoint exists.** The older doc's "there is no `/playlist` endpoint" is inaccurate — `GET /api/devices/{id}/playlist` is live and device-gated. It remains **optional** for the device (see §7/§9); `/sync` is authoritative.
-5. **Registration `429` is real.** The backend rate-limits registration to 10/hour per source IP. Infinite uniform backoff is acceptable, but a 429 means you're registering in a loop — surface/fix the root cause rather than hammering.
-6. **`URGENT_CONTENT` is not currently pushed.** Keep any handler dormant; don't rely on it. The live triggers are `SYNC_REQUIRED` and `ACTION_PENDING` (+ heartbeat fields).
+- **URL:** `wss://<api-host>/ws/devices/{id}`. The last path segment must be your numeric `deviceId`: no trailing slash, no extra segments.
+- **Auth:** the `X-Device-Token` header (**preferred**), or `?device_token=<token>` as a fallback. The query form ends up in proxy access logs.
+- **Do not send `Origin`.** No subprotocol is required.
+- Open the socket after registration. Hold **one** socket per device.
+
+**Handshake results** *(verified)*:
+
+| Response | Cause | Body |
+|---|---|---|
+| `101 Switching Protocols` | OK. | — |
+| `400` | Path segment is not numeric. | empty |
+| `401` | No token, or an unknown or revoked token. | JSON envelope if the bad token came in the header, otherwise empty |
+| `403` | The token belongs to a different device id. | empty |
+| `403` | An `Origin` header not on the server's browser allow-list was sent. Just don't send `Origin`. | empty |
+
+A 401 on the handshake is handled like a REST 401 (§2), unless you simply forgot to send the token.
+
+### 10.2 What happens on open
+
+On **every** successful connection the server immediately replays, in this order *(verified)*:
+
+1. One **`ACTION_PENDING`** frame per PENDING action, by `issuedAt` ascending. Expired-but-unswept actions are included.
+2. **`SYNC_REQUIRED`**, only if content is assigned and it differs from the version the server has stored for you. The stored version is updated by your heartbeat `contentVersion` and by every confirm (even a MISMATCH), and **cleared by re-registration**.
+
+Nothing else is replayed: no `SYNC_CONTENT`, no group jump, no `URGENT_CONTENT`, and no remote-session frame (the heartbeat covers sessions). So after every (re)connect you **MUST** also run `/sync` once (§6.1).
+
+### 10.3 Inbound frames
+
+Frames are JSON text, discriminated by `type`. **Ignore unknown `type` values** and log them.
+
+**`SYNC_CONTENT`**: live "content or schedule changed" push *(verified)*.
+```json
+{"type":"SYNC_CONTENT","reason":"playlist-reordered"}
+```
+- `reason` is informational and open-ended. Current values:
+  - `assignment-confirmed`: a new assignment covers you.
+  - `assignment-cancelled`: an assignment that drove you was cancelled or narrowed.
+  - `playlist-reordered`: your playlist changed (item add, remove, move, reorder or dwell edit).
+  - `sync-group-jump`: §7.5.
+- Action: run the sync flow (§6.1), **always**, even if your version looks current.
+- Server-side batching: pushes go out in batches of 50 devices, 100 ms apart, capped at 5000 devices per confirmed assignment (devices beyond the cap rely on the heartbeat).
+
+**`SYNC_REQUIRED`**: sent **only as a connect replay** (§10.2) *(verified)*.
+```json
+{"type":"SYNC_REQUIRED","expectedVersion":"875250576ce90c2a2d9edad015654e974d6e0972460aadf6149c1ff4b55364af"}
+```
+- Action: run the sync flow. `expectedVersion` is advisory: confirm whatever `/sync` returns.
+
+**`ACTION_PENDING`**: sent **only as a connect replay** (§8.1) *(verified)*.
+```json
+{"type":"ACTION_PENDING","actionId":3,"actionType":"SYNC_CONTENT","issuedAt":"2026-09-14T17:42:21.579375Z"}
+```
+- It has no `payload` and no `expiresAt`. Action: call `GET /actions/pending` once, then execute per §8.
+
+**`URGENT_CONTENT`**: broadcast *(verified)*.
+```json
+{"type":"URGENT_CONTENT","contentFileId":2,"projectId":1}
+```
+- Sent to **every connected device on the whole fleet**, whatever its project, when an operator uploads a file with `urgent=true`. At that moment the file is not transcoded and is not in any playlist.
+- Action: **ignore it** (debug log only). It **MUST NOT** trigger a download or a sync, because a fleet-wide sync on every urgent upload would stampede the server. Once the file is added to your playlist you receive `SYNC_CONTENT`.
+
+**`REMOTE_SESSION_START`** *(verified)*.
+```json
+{"type":"REMOTE_SESSION_START","sessionId":"rs_ab8c2b96ce3bca418b543a29d6af23f5","relayUrl":"wss://relay.example.uz/agent","agentTicket":"eyJ…U8","expiresAt":"2026-09-14T18:13:12.041682612Z","viewOnly":true,"maxWidth":1280,"maxFps":15,"bitRate":2000000}
+```
+- Action: same as a heartbeat `desiredRemoteSession` naming this session (§9.3).
+
+**`REMOTE_SESSION_STOP`** *(verified)*.
+```json
+{"type":"REMOTE_SESSION_STOP","sessionId":"rs_ab8c2b96ce3bca418b543a29d6af23f5"}
+```
+- Action: tear down that session now (§9.5).
+
+### 10.4 Delivery guarantees: there are none
+
+- Frames are **at most once and best effort**: no acknowledgement, no sequence numbers, no redelivery.
+- A frame can be lost to a reconnect window, a network blip, or two server threads writing to your socket at the same moment.
+- The socket map lives inside one backend instance. Behind several replicas, only the replica holding your socket can push to you.
+- Design rule: a frame only makes you *act sooner*. Correctness must come from the heartbeat, `/sync` and `/actions/pending`.
+
+### 10.5 Outbound: send nothing
+
+- The device sends **no application frames**. All acknowledgements go over REST.
+- A text frame you send is silently ignored and the socket stays open *(verified)*.
+- A **binary** frame closes the socket with **1003 "Binary messages not supported"** *(verified)*.
+
+### 10.6 Keepalive
+
+- **The server never sends pings.** Configure client pings; with OkHttp use `pingInterval(30, SECONDS)`.
+- The server answers every ping with a pong automatically.
+- Without pings, NAT and proxy idle timeouts kill the socket silently and you wait forever. With pings, OkHttp fails the socket on a missed pong and you reconnect.
+
+### 10.7 Close codes
+
+| Code / reason | Cause | Action |
+|---|---|---|
+| **1008 `superseded`** *(verified)* | Another connection with your token opened after yours. | See §10.8. |
+| **1003 `Binary messages not supported`** *(verified)* | You sent a binary frame. | Client bug; reconnect. |
+| 1001 | Server shutting down or redeploying. | Reconnect with backoff. |
+| 1006 (no close frame) | Network drop, proxy reload, missed pong. | Reconnect with backoff. |
+| anything else | — | Reconnect with backoff. |
+
+### 10.8 Reconnect policy
+
+- **Backoff:** 1 s, 2 s, 4 s … capped at 60 s, with ±20 % jitter. Reset the backoff after the socket has stayed up for 60 s.
+- **After every successful (re)connect:** process the replay, then run `/sync` once.
+- **On `1008 superseded`:**
+  - If this process opened a newer socket itself (your own reconnect race), do nothing; the new socket is live.
+  - Otherwise **another client holds your token**, e.g. a cloned box (§2). Do **not** reconnect immediately: two clients evicting each other loop forever. Wait **≥ 5 min**, log `"ws superseded by another client"` into diagnostics, and keep heartbeating meanwhile.
+- **Revocation is not delivered over the socket** (§2). When a REST call returns 401, close the socket, re-register, and reconnect with the new token.
+- **While disconnected:** poll `/actions/pending` every 30 s. Heartbeats and every other behaviour are unaffected.
 
 ---
 
-## 11. End-to-end sequence (canonical)
+## 11. Playback telemetry: `POST /api/devices/{id}/playback`
+
+This path is off the critical path: a failure here must never block playback.
+
+```jsonc
+// request: a single object OR an array of ≤500 objects
+[
+  { "contentFileId": 1, "playedAt": "2026-09-14T17:44:02.123Z", "durationSeconds": 4 }
+]
+
+// 200 — verified
+{
+  "total": 5, "created": 1, "duplicate": 1, "rejected": 3,
+  "rejections": [
+    { "index": 2, "reason": "played_at is in the future beyond clock skew tolerance (30s)" },
+    { "index": 3, "reason": "contentFileId not assigned to device: 2" },
+    { "index": 4, "reason": "played_at is older than the 90-day retention window" }
+  ]
+}
+```
+
+**Entry fields:**
+
+| Field | Type | Rules |
+|---|---|---|
+| `contentFileId` | int64 | **REQUIRED, never null.** A `null` fails the **whole batch with 500**, and nothing in it is stored *(verified)*. |
+| `playedAt` | ISO-8601 string | **REQUIRED, never null.** A `null` also gives 500 for the whole batch. Use `Z` or an explicit offset: an offset-less value gives 400 for the whole batch. Take it from server time (§1.4). Use **millisecond precision**, generate it once, and reuse the exact same value on retries so duplicates are detected. |
+| `durationSeconds` | int \| null | Seconds actually shown. |
+
+Unknown fields are ignored.
+
+**Per-entry outcomes** (the request itself still returns 200):
+- **created**
+- **duplicate**: the same `(device, contentFileId, playedAt)` already exists, or appears earlier in the same batch. Idempotent, so retries are safe.
+- **rejected**, final, so never retry these:
+  - `playedAt` more than 30 s ahead of server time;
+  - `playedAt` older than the server's playback retention window (`app.retention.playback`, **90 days** by default; the reason string quotes the configured value);
+  - unknown `contentFileId`;
+  - `contentFileId` **not in your currently assigned playlist**, when you have one. Report plays promptly, and flush the queue before or right after a content switch, or the old content's plays get rejected.
+
+**Whole-request failures:**
+- more than 500 entries → 400 `"Batch size 501 exceeds maximum 500"` *(verified)*;
+- malformed JSON or a malformed entry → 400;
+- null fields → 500;
+- missing `Content-Type` → 500.
+
+An empty array returns 200 with all zeros *(verified)*.
+
+**Recommended client behaviour:**
+- Write **one entry per play of a slot**, completed or interrupted: `playedAt` = slot start in server time, `durationSeconds` = seconds shown.
+- Keep a durable local queue. Flush every 60–300 s or when it reaches 200 entries, in chunks of ≤ 500.
+- **On 200:** drop every entry in the chunk, rejected ones included.
+- **On 400:** split the chunk in halves to isolate the bad entry, then drop it.
+- **On 5xx or network error:** retry with backoff. After 3 identical 5xx responses, split the chunk as for 400.
+- Cap the queue (e.g. 10 000 entries, dropping the oldest first).
+- The endpoint has no rate limit.
+
+---
+
+## 12. Server timers & limits (reference)
+
+| What | Value | Where it matters |
+|---|---|---|
+| Device OFFLINE threshold | 15 min + 60 s grace | Heartbeat cadence (§5.3). |
+| `DEVICE_OFFLINE` / `CONTENT_VERSION_MISMATCH` incident | 15 min offline / 30 min mismatched | Send `contentVersion` every beat. |
+| `SYNC_TIMEOUT` incident | 30 min after the first `/sync` with work, if no matching confirm | Confirm promptly (§6.6). |
+| Presigned sync URL lifetime | 120 min | §6.5 |
+| Coordinated cut-over lead (new assignment) | 2 min | §7.4 |
+| Group-jump lead | 5 s | §7.5 |
+| Action expiry | 5 min (`PLAYLIST_CONTROL` 10 min) | §8.2 |
+| Action / session janitor sweep | every 1 min | Stale items can still appear (§8.4). |
+| Max pending actions | 1 per type, 10 per device | — |
+| Remote session TTL | 30 min | §9.3 |
+| Remote encoder hints | maxWidth 1280, maxFps 15, bitRate 2 000 000 | §9.2 |
+| Registration rate limit | 10 per source IP per UTC clock hour | §4 |
+| Playback batch max | 500 entries | §11 |
+| Playback clock-skew tolerance | +30 s | §11 |
+| Playback retention | 90 days (server default; `app.retention.playback`) | §11 |
+| Slot fallback dwell | 10 s | §6.3 |
+| Operator dwell range | 1 – 86 400 s | §7.6 |
+| Transcode cap | 1920×1080 (configurable), H.264 + AAC 128k | §6.5 |
+| WS sync push batching | 50 devices per 100 ms, cap 5000 per assignment confirm | §10.3 |
+| Server WS pings | **none** | §10.6 |
+
+The server can override every value through its configuration. Do not hardcode server-side values into client logic except as display text.
+
+---
+
+## 13. Recommended client algorithm
+
+**Persistent state:**
+- `deviceToken`, `deviceId`
+- `confirmedVersion`
+- live and pending playlists (`playlistOrder`, `anchorEpochMs`, `activateAt`, `loopDurationMs`, `syncGroupId`)
+- the file store (`fileId → path, sizeBytes, sha256, state`)
+- the executed-action-id set
+- the action-confirm queue
+- the playback queue
+- the last clock offset
+
+**Boot:**
+1. Load credentials. If either is missing, **register** (§4).
+2. **Estimate the clock offset** (§7.1).
+3. **Flush the action-confirm queue.**
+4. **Heartbeat immediately.** Apply `desiredVolume`, ingest `pendingActions`, handle `desiredRemoteSession`.
+5. **Open the WebSocket** (§10). Process the replay.
+6. **Run `/sync` once** (§6).
+7. Start playback from the live playlist, seeking to the live position in schedule mode.
+
+**Steady-state schedulers:**
+- heartbeat every 120 s ± 10 s;
+- clock re-estimate every 10 min;
+- playback flush every 60–300 s;
+- `/actions/pending` poll every 30 s while the WS is down;
+- `/sync` every 10 min in schedule mode;
+- URL-expiry watchdog.
+
+**Sync coordinator (single-flight):**
+1. `/sync`, then stage the response (§6.4).
+2. Download and verify.
+3. Once every pending file is verified, confirm.
+4. CONFIRMED → promote at cut-over, GC. MISMATCH → loop back to step 1.
+
+**On any REST 401:** stop the schedulers, close the WS, wipe credentials, re-register, then run Boot from step 2. While `/register` answers **409**, keep playing cached content and retry every ~5 min with jitter (§4).
+
+---
+
+## 14. Status-code matrix
+
+| Endpoint | 200/201 | 400 | 401 | 403 | 404 | 409 | 429 | 500 (deterministic causes) |
+|---|---|---|---|---|---|---|---|---|
+| `POST /register` | 201 new, 200 re-reg (admin window only) | blank/over-long/badly formed serial, name > 200, bad JSON | stale `X-Device-Token` sent | — | — | already registered, no window (retry) | rate limit | soft-deleted serial, no Content-Type |
+| `POST /heartbeat` | ok | JSON type errors | §2 | wrong id | race only | — | — | `contentVersion` > 64, no Content-Type |
+| `GET /sync` | ok | bad or mixed `currentFileIds` | §2 | wrong id | race only | — | — | — |
+| `POST /sync/confirm` | CONFIRMED or MISMATCH | blank `reportedVersion` | §2 | wrong id | race only | — | — | > 64 chars, no Content-Type |
+| `GET /time` | ok | — | §2 | wrong id | — | — | — | — |
+| `GET /actions/pending` | ok (array) | — | §2 | wrong id | — | — | — | — |
+| `POST /actions/{aid}/confirm` | every outcome | missing or lowercase `status` | §2 | wrong id | **never** (UNKNOWN instead) | — | — | no Content-Type |
+| `POST /remote/{sid}/ack` | ok | bad `status` | §2 | wrong id | unknown or foreign session | session terminal | — | no Content-Type |
+| `POST /playback` | ok (per-entry tally) | > 500, malformed entry | §2 | wrong id | race only | — | — | null `contentFileId` / `playedAt`, no Content-Type |
+| `GET /playlist` | ok | — | §2 | wrong id | race only | — | — | — |
+| `WS /ws/devices/{id}` | 101 | non-numeric id | no / bad token | wrong id, `Origin` sent | — | — | — | — |
+| MinIO GET | 200 / 206 | — | — | expired or bad signature | object gone | — | — | — |
+
+---
+
+## 15. Not the device's concern
+
+Do **not** implement, compute or branch on any of these:
+
+- **Content version computation.** It is a server hash over assignment, playlist items and durations. Echo it; never derive it.
+- **Assignment resolution:** targets, priorities, time windows, exclusions and supersede rules. You receive the final order through `/sync`.
+- **The diff itself.** Report held ids and the version; the server computes add and delete.
+- **Transcoding, buckets, object keys and URL signing.** Follow the URL.
+- **Status derivation, incidents, dashboards, telemetry analytics, the sync-timeout timer and cut-over readiness monitoring.**
+- **Remote-session bookkeeping:** who is watching, ticket signing, the one-session-per-device rule, the expiry sweep.
+- **Operator APIs:** issuing actions, volume overrides, sync-group management, jumps.
+
+---
+
+## 16. Known backend gaps the client must defend against
+
+These are current backend behaviours that are arguably bugs. The client rules above already work around each one. They are listed here so both teams can track them; when one is fixed, this list and the affected section get updated.
+
+| ID | Gap | Client defence |
+|---|---|---|
+| G-1 | Issuing an action does not push `ACTION_PENDING`; it is only replayed on connect. | Heartbeat pickup; optional 30–60 s poll (§8.1). |
+| G-2 | A group jump is not signalled by the heartbeat or the connect replay. | `/sync` on every (re)connect and every 10 min in schedule mode (§7.5). |
+| G-3 | `VOLUME_SET` does not update `desiredVolume`, so it reverts on the next beat. | Treat `desiredVolume` as authoritative (§8.3). |
+| G-4 | A missing `Content-Type` gives 500 instead of 415. | Always send it (§1.2). |
+| G-5 | Over-length strings give 500 instead of 400 for versions > 64. **Fixed for `/register` in 1.0.137** (serial and name now give 400). | Enforce the limits client-side (§1.2). |
+| G-6 | A soft-deleted device cannot re-register its serial (500), and every attempt consumes rate-limit budget. | Back off up to 1 h and surface "decommissioned" (§2). |
+| G-7 | A null `contentFileId` or `playedAt` gives 500 and rolls back the whole playback batch. | Validate before enqueueing (§11). |
+| G-8 | Token rotation or device deletion does not close an open WebSocket. | Close it yourself on REST 401 (§10.8). |
+| G-9 | `URGENT_CONTENT` is broadcast fleet-wide, unscoped, and carries nothing actionable. | Ignore it (§10.3). |
+| G-10 | Concurrent server pushes to one socket are not serialised, so a frame can be dropped. | Frames only accelerate; correctness comes from REST (§10.4). |
+| G-11 | The transcoder does not force `yuv420p` or an H.264 profile. | Tolerate decoder failures per item (§6.5). |
+| G-12 | `filesToAdd[].contentType` and `name` describe the original upload, not the served MP4. | Ignore both for decoding (§6.3). |
+| G-13 | The legacy bulk path can issue `ASSIGN_CONTENT`, or REBOOT/SYNC_CONTENT with an arbitrary or null payload. | Tolerant payload parsing; FAILED for unsupported types (§8.2, §8.3). |
+| G-14 | The coordinated cut-over (`activateAt` in the future) happens only for a new assignment; edits reuse the old anchor. | Cut over when confirmed (§7.4). |
+| G-15 | `SYNC_CONTENT` is emitted as a literal string and is not a member of the backend's push-type enum. The wire string is stable and documented here. | None needed. |
+
+---
+
+## 17. End-to-end sequence
 
 ```mermaid
 sequenceDiagram
     participant Dev as Device
     participant API as Backend REST
     participant WS as WS /ws/devices/{id}
-    participant CDN as MinIO (presigned)
+    participant S3 as MinIO (presigned)
 
     Note over Dev: cold start — no token or no deviceId
-    Dev->>API: POST /api/devices/register {serialNumber}
-    API-->>Dev: 201/200 {deviceId, deviceToken}
+    Dev->>API: POST /api/devices/register {serialNumber}  (no X-Device-Token)
+    API-->>Dev: 201/200 {deviceId, deviceToken, syncGroupId}
     Dev->>Dev: persist token THEN deviceId
-    Dev->>WS: connect (X-Device-Token)
-    WS-->>Dev: onOpen; server replays pending actions + SYNC_REQUIRED if stale
+    Dev->>API: GET /{id}/time ×5 (min-RTT offset)
+    Dev->>API: POST /{id}/heartbeat {contentVersion?, volume, remote?}
+    API-->>Dev: {syncRequired, expectedContentVersion, desiredVolume, pendingActions[], desiredRemoteSession}
+    Dev->>WS: connect (X-Device-Token, no Origin, client pings 30s)
+    WS-->>Dev: replay: ACTION_PENDING×N, then SYNC_REQUIRED if stale
+    Dev->>API: GET /{id}/sync (always once after connect)
 
-    loop every ~2 min
-        Dev->>API: POST /{id}/heartbeat {contentVersion=lastConfirmed}
-        API-->>Dev: {syncRequired, expectedContentVersion, pendingActions[]}
+    loop every 120s ±10s
+        Dev->>API: POST /{id}/heartbeat {contentVersion=confirmed, volume}
+        API-->>Dev: desired state + pendingActions (the ONLY live path for new actions while connected)
     end
 
-    alt syncRequired==true  OR  WS SYNC_REQUIRED  OR  SYNC_CONTENT action
-        Dev->>API: GET /{id}/sync?currentVersion&currentFileIds
-        API-->>Dev: {filesToAdd[sizeBytes,checksum,presignedUrl], filesToDelete, playlistOrder, presignedUrlsExpireAt}
-        loop per file to add
-            Dev->>CDN: GET presignedUrl (Range resume)
-            CDN-->>Dev: bytes (200/206)
-            Dev->>Dev: verify bytes==sizeBytes AND sha256==checksum
+    alt syncRequired OR WS SYNC_CONTENT/SYNC_REQUIRED OR SYNC_CONTENT action OR (re)connect
+        Dev->>API: GET /{id}/sync?currentVersion&currentFileIds(verified only)
+        API-->>Dev: {expectedContentVersion, fullSync, filesToAdd[], filesToDelete[], playlistOrder[index…], anchorEpochMs, activateAt}
+        loop each file to add (≤2 parallel)
+            Dev->>S3: GET presignedUrl (verbatim, Accept-Encoding: identity, Range to resume)
+            S3-->>Dev: 200/206 video/mp4
+            Dev->>Dev: verify bytes==sizeBytes AND sha256==checksum; atomic rename
         end
-        Note over Dev: all required files downloaded+verified
-        Dev->>API: POST /{id}/sync/confirm {reportedVersion}
+        opt 403 from MinIO / URLs near expiry
+            Dev->>API: GET /{id}/sync (fresh URLs; partial file NOT listed as held)
+        end
+        Dev->>API: POST /{id}/sync/confirm {reportedVersion = latest expectedContentVersion}
         alt CONFIRMED
-            API-->>Dev: CONFIRMED
-            Dev->>Dev: promote pending playlist → live, currentVersion=reportedVersion
+            Dev->>Dev: promote pending→live (on screen at activateAt in schedule mode); GC unreferenced files
         else MISMATCH
-            API-->>Dev: MISMATCH (syncRequired)
-            Dev->>API: GET /{id}/sync (re-fetch; never retry confirm)
+            Dev->>API: GET /{id}/sync again (never re-confirm the same value)
         end
     end
 
-    Note over Dev: play DOWNLOADED+verified files in playlistOrder; loop
-    opt URL expired mid-download (403/410)
-        Dev->>API: GET /{id}/sync (fresh URLs); resume via Range
+    opt pending action (heartbeat / poll / replay)
+        Dev->>Dev: dedupe by actionId; skip side effects if already past expiresAt
+        Dev->>API: POST /{id}/actions/{actionId}/confirm {status: SUCCESS|FAILED, result}
+        Note over Dev: REBOOT: persist id → confirm → reboot → flush confirm queue on boot
     end
-    opt action arrives (WS ACTION_PENDING or heartbeat pendingActions)
-        Dev->>Dev: execute action
-        Dev->>API: POST /{id}/actions/{actionId}/confirm {status: SUCCESS|FAILED}
+
+    opt any REST 401
+        Dev->>WS: close
+        Dev->>API: POST /api/devices/register (fresh token) → heartbeat → reconnect → /sync
     end
+
+    Note over Dev: play by index; schedule mode: floorMod(serverNow − anchorEpochMs, loopDurationMs)
+    Dev->>API: POST /{id}/playback [≤500 entries] (every 60–300s, off the critical path)
 ```
-
----
-
-## 12. Quick reference — status codes
-
-| Code | Where | Meaning → device action |
-|---|---|---|
-| 200 / 201 | register | ok (200 re-register, 201 new) — both give a fresh token |
-| 200 | heartbeat/sync/confirm/actions/playback | ok |
-| 202 | (operator-issued actions) | n/a to device |
-| 401 | any authed call / WS | bad/revoked token → re-register, reconnect |
-| 403 | any authed call / WS | wrong device id in path → client bug |
-| 404 | device-scoped call | device deleted → re-register (3-strikes policy) |
-| 409 | (operator paths only) | not produced on the device's own calls |
-| 429 | register | registering too often per IP → back off, fix loop |
-
-All non-2xx carry a JSON envelope: `{status, error, message, correlationId, timestamp, fieldErrors?, details?}`. Log `correlationId` — it's how backend engineers trace your request.

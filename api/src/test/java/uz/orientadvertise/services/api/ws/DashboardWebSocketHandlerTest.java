@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
@@ -150,6 +151,94 @@ class DashboardWebSocketHandlerTest {
         // called with anything that isn't the exact-snapshot payload would be brittle,
         // so simply count: only one send to this session, which is the snapshot.
         verify(session, times(1)).sendMessage(any());
+    }
+
+    // ---------- routing envelope (v1.0.134) ----------
+
+    private static final String CONTENT_FRAME = "{\"type\":\"CONTENT_STATUS_CHANGE\",\"contentId\":42,"
+            + "\"status\":\"READY\"}";
+
+    private static String enveloped(String projectId, String owner) {
+        return "{\"_projectId\":%s,\"_owner\":%s,\"payload\":%s}".formatted(
+                projectId, owner, CONTENT_FRAME);
+    }
+
+    @Test
+    void push_envelopedFrame_stripsTheRoutingKeysBeforeItReachesTheWire() throws IOException {
+        // _projectId / _owner are server-internal. Leaking _owner would put the uploader's username
+        // in front of every recipient.
+        var admin = sessionWithUser("root", "s1");
+        handler.afterConnectionEstablished(admin);
+
+        handler.push(enveloped("3", "\"alice\""));
+
+        verify(admin).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+    }
+
+    @Test
+    void push_contentFrame_reachesItsUploaderEvenWithNoMatchingProject() throws IOException {
+        // The case project-only routing would break: an operator's content is owned ∪ granted, never
+        // project-gated, and an orphan upload has no project at all. Dropping this frame is exactly
+        // the "it never flips to ready" bug the live feed exists to prevent.
+        var alice = operatorSession("alice", "s1", Set.of(7L));
+        handler.afterConnectionEstablished(alice);
+
+        handler.push(enveloped("null", "\"alice\""));
+
+        verify(alice).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+    }
+
+    @Test
+    void push_contentFrame_isWithheldFromAnUnrelatedOperator() throws IOException {
+        // The disclosure this fixes: content frames used to publish unwrapped, so every operator
+        // received every content id, status and ffmpeg diagnostic.
+        var bob = operatorSession("bob", "s1", Set.of(7L));
+        handler.afterConnectionEstablished(bob);
+
+        handler.push(enveloped("3", "\"alice\""));
+
+        verify(bob, never()).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+    }
+
+    @Test
+    void push_contentFrame_reachesAnOperatorAssignedToItsProject() throws IOException {
+        var carol = operatorSession("carol", "s1", Set.of(3L, 7L));
+        handler.afterConnectionEstablished(carol);
+
+        handler.push(enveloped("3", "\"alice\""));
+
+        verify(carol).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+    }
+
+    @Test
+    void push_contentFrame_reachesEveryAdmin() throws IOException {
+        // ADMIN captures no project set at handshake, so it stays unrestricted.
+        var admin = sessionWithUser("root", "s1");
+        handler.afterConnectionEstablished(admin);
+
+        handler.push(enveloped("3", "\"alice\""));
+
+        verify(admin).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+    }
+
+    @Test
+    void push_frameWithNoOwner_stillRoutesOnProject() throws IOException {
+        // Device/incident frames carry no owner. Their routing must be untouched by the owner term.
+        var carol = operatorSession("carol", "s1", Set.of(3L));
+        var bob = operatorSession("bob", "s2", Set.of(7L));
+        handler.afterConnectionEstablished(carol);
+        handler.afterConnectionEstablished(bob);
+
+        handler.push(enveloped("3", "null"));
+
+        verify(carol).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+        verify(bob, never()).sendMessage(eq(new TextMessage(CONTENT_FRAME)));
+    }
+
+    private static WebSocketSession operatorSession(String username, String id, Set<Long> projectIds) {
+        var session = sessionWithUser(username, id);
+        session.getAttributes().put(DashboardHandshakeInterceptor.ATTR_PROJECT_IDS, projectIds);
+        return session;
     }
 
     private static WebSocketSession sessionWithUser(String username, String id) {

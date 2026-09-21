@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,7 @@ import uz.orientadvertise.services.domain.repository.RemoteActionRepository;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -26,10 +28,13 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class DeviceHeartbeatServiceTest {
@@ -41,6 +46,7 @@ class DeviceHeartbeatServiceTest {
     private ContentVersionService contentVersionService;
     private IncidentService incidentService;
     private uz.orientadvertise.services.domain.event.DashboardEventBroadcaster dashboardBroadcaster;
+    private RemoteSessionService remoteSessionService;
     private DeviceHeartbeatService service;
 
     @BeforeEach
@@ -52,9 +58,60 @@ class DeviceHeartbeatServiceTest {
         deviceEventService = mock(DeviceEventService.class);
         incidentService = mock(IncidentService.class);
         dashboardBroadcaster = mock(uz.orientadvertise.services.domain.event.DashboardEventBroadcaster.class);
+        remoteSessionService = mock(RemoteSessionService.class);
+        // Default: no session wanted. Individual tests override.
+        when(remoteSessionService.desiredFor(any())).thenReturn(Optional.empty());
         service = new DeviceHeartbeatService(deviceRepository, remoteActionRepository,
                 contentAssignmentService, contentVersionService, deviceEventService,
-                incidentService, dashboardBroadcaster);
+                incidentService, dashboardBroadcaster, remoteSessionService);
+    }
+
+    @Test
+    void heartbeat_recovery_neverTouchesIncidentsInsideTheBeat() {
+        // Resolving inside the beat's transaction holds a second pooled connection per recovery
+        // beat (after a regional outage every device recovers at once → pool deadlock) or, if it
+        // joins, lets a failed resolve roll the beat back. processHeartbeat only REPORTS the types;
+        // the controller resolves them after commit via resolveRecoveredIncidents. A real entity:
+        // registered, never beaten.
+        var device = new Device(mock(uz.orientadvertise.services.domain.model.Region.class), null, "SN-R", "R");
+        device.register("dtk");
+        when(deviceRepository.findByIdAndDeletedAtIsNull(99L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(99L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(99L);
+
+        assertEquals(List.of("DEVICE_OFFLINE"), result.resolveIncidentTypes());
+        verifyNoInteractions(incidentService);
+    }
+
+    @Test
+    void resolveRecoveredIncidents_resolvesEachReportedType() {
+        var result = resultResolving(60L, "DEVICE_OFFLINE", "CONTENT_VERSION_MISMATCH");
+
+        service.resolveRecoveredIncidents(60L, result);
+
+        verify(incidentService).autoResolveOnRecovery(60L, "DEVICE_OFFLINE");
+        verify(incidentService).autoResolveOnRecovery(60L, "CONTENT_VERSION_MISMATCH");
+    }
+
+    @Test
+    void resolveRecoveredIncidents_nothingReported_touchesNothing() {
+        service.resolveRecoveredIncidents(61L, new DeviceHeartbeatService.HeartbeatResult(61L, Device.Status.ONLINE, List.of()));
+
+        verifyNoInteractions(incidentService);
+    }
+
+    @Test
+    void resolveRecoveredIncidents_aFailingResolve_isSwallowed_andTheNextTypeStillRuns() {
+        // Best-effort: the beat has already committed; a DB hiccup here is logged and left to the
+        // health monitor's recovery sweep.
+        when(incidentService.autoResolveOnRecovery(62L, "DEVICE_OFFLINE"))
+                .thenThrow(new RuntimeException("DB hiccup"));
+
+        service.resolveRecoveredIncidents(62L, resultResolving(62L, "DEVICE_OFFLINE", "CONTENT_VERSION_MISMATCH"));
+
+        verify(incidentService).autoResolveOnRecovery(62L, "CONTENT_VERSION_MISMATCH");
     }
 
     @Test
@@ -66,7 +123,8 @@ class DeviceHeartbeatServiceTest {
 
     @Test
     void heartbeat_recentWithContent_resultsInOnline() {
-        var device = mockDevice(1L, Device.Status.OFFLINE, Instant.now().minus(1, ChronoUnit.MINUTES));
+        // Stored NO_CONTENT, content now assigned. (Production never stores OFFLINE — see mockDevice.)
+        var device = mockDevice(1L, Device.Status.NO_CONTENT, Instant.now().minus(1, ChronoUnit.MINUTES));
         when(deviceRepository.findByIdAndDeletedAtIsNull(1L)).thenReturn(Optional.of(device));
         when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
         when(remoteActionRepository.findPendingByDevice(1L)).thenReturn(List.of());
@@ -75,6 +133,19 @@ class DeviceHeartbeatServiceTest {
 
         assertEquals(Device.Status.ONLINE, result.status());
         verify(device).setStatus(Device.Status.ONLINE);
+    }
+
+    @Test
+    void heartbeat_closesAnOpenReregistrationWindow() {
+        // AUTH-02: a beat proves the box holds its token; an open window would only let someone
+        // else take the device.
+        var device = mockDevice(3L, Device.Status.ONLINE, Instant.now().minus(1, ChronoUnit.MINUTES));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(3L)).thenReturn(Optional.of(device));
+        when(remoteActionRepository.findPendingByDevice(3L)).thenReturn(List.of());
+
+        service.processHeartbeat(3L);
+
+        verify(device).closeReregistrationWindow();
     }
 
     @Test
@@ -92,7 +163,9 @@ class DeviceHeartbeatServiceTest {
 
     @Test
     void heartbeat_statusChange_emitsEvent() {
-        var device = mockDevice(3L, Device.Status.OFFLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        // Stored ONLINE, but silent for 20 minutes: the device WAS offline, so the beat is an
+        // OFFLINE→ONLINE transition even though the status column never said OFFLINE.
+        var device = mockDevice(3L, Device.Status.ONLINE, Instant.now().minus(20, ChronoUnit.MINUTES));
         when(deviceRepository.findByIdAndDeletedAtIsNull(3L)).thenReturn(Optional.of(device));
         when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
         when(remoteActionRepository.findPendingByDevice(3L)).thenReturn(List.of());
@@ -107,14 +180,98 @@ class DeviceHeartbeatServiceTest {
 
     @Test
     void heartbeat_offlineToOnline_autoResolvesDeviceOfflineIncident() {
-        var device = mockDevice(20L, Device.Status.OFFLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        var device = mockDevice(20L, Device.Status.ONLINE, Instant.now().minus(20, ChronoUnit.MINUTES));
         when(deviceRepository.findByIdAndDeletedAtIsNull(20L)).thenReturn(Optional.of(device));
         when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
         when(remoteActionRepository.findPendingByDevice(20L)).thenReturn(List.of());
 
-        service.processHeartbeat(20L);
+        var result = service.processHeartbeat(20L);
 
-        verify(incidentService).autoResolveOnRecovery(eq(20L), eq("DEVICE_OFFLINE"));
+        assertEquals(List.of("DEVICE_OFFLINE"), result.resolveIncidentTypes());
+        verifyNoInteractions(incidentService);
+    }
+
+    @Test
+    void heartbeat_staleBeatWithUnchangedStoredStatus_stillResolvesDeviceOfflineIncident() {
+        // LOGIC-01 exactly: the stored status (NO_CONTENT) equals the status this beat derives, so
+        // a stored-status comparison sees "no change" — yet the device was silent for 30 minutes
+        // and the health monitor has opened a DEVICE_OFFLINE incident for it.
+        var device = mockDevice(24L, Device.Status.NO_CONTENT, Instant.now().minus(30, ChronoUnit.MINUTES));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(24L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(null);
+        when(remoteActionRepository.findPendingByDevice(24L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(24L);
+
+        assertEquals(Device.Status.NO_CONTENT, result.status());
+        assertEquals(List.of("DEVICE_OFFLINE"), result.resolveIncidentTypes());
+        verify(deviceEventService).emitAsync(eq(24L), eq("DEVICE_STATUS_CHANGED"),
+                any(Event.Priority.class), eq("{\"from\":\"OFFLINE\",\"to\":\"NO_CONTENT\"}"));
+    }
+
+    @Test
+    void heartbeat_withinThreshold_doesNotResolveOrEmit() {
+        // Negative: 14 minutes of silence is inside DeviceHealthMonitor.HEARTBEAT_THRESHOLD, so no
+        // incident can have been opened and the device never counted as offline.
+        var device = mockDevice(25L, Device.Status.ONLINE, Instant.now().minus(14, ChronoUnit.MINUTES));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(25L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(25L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(25L);
+
+        assertTrue(result.resolveIncidentTypes().isEmpty());
+        verify(deviceEventService, never()).emitAsync(any(), any(), any(), any());
+        verify(dashboardBroadcaster, never()).deviceStatusChanged(any());
+    }
+
+    @Test
+    void heartbeat_betweenMonitorAndDisplayThresholds_resolvesButAnnouncesNoTransition() {
+        // 15.5 min: past DeviceHealthMonitor's 15-min escalation threshold (an incident may be
+        // open → resolve it), but inside DeviceStatusEvaluator's 15 min + 60 s grace — no surface
+        // ever showed this device OFFLINE, so no OFFLINE→ONLINE event or broadcast.
+        var device = mockDevice(27L, Device.Status.ONLINE, Instant.now().minusSeconds(15 * 60 + 30));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(27L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(27L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(27L);
+
+        assertEquals(List.of("DEVICE_OFFLINE"), result.resolveIncidentTypes());
+        verify(deviceEventService, never()).emitAsync(any(), any(), any(), any());
+        verify(dashboardBroadcaster, never()).deviceStatusChanged(any());
+    }
+
+    @Test
+    void heartbeat_pastTheDisplayThreshold_announcesOfflineToOnline() {
+        // 16.5 min: past 15 min + 60 s grace, so the device WAS showing OFFLINE everywhere.
+        var device = mockDevice(28L, Device.Status.ONLINE, Instant.now().minusSeconds(16 * 60 + 30));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(28L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(28L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(28L);
+
+        assertEquals(List.of("DEVICE_OFFLINE"), result.resolveIncidentTypes());
+        verify(deviceEventService).emitAsync(eq(28L), eq("DEVICE_STATUS_CHANGED"),
+                eq(Event.Priority.MEDIUM), eq("{\"from\":\"OFFLINE\",\"to\":\"ONLINE\"}"));
+        verify(dashboardBroadcaster).deviceStatusChanged(any());
+    }
+
+    @Test
+    void heartbeat_firstBeatEver_isAnOfflineToOnlineTransition() {
+        // A registered device that has never beaten (lastHeartbeatAt null) counts as coming online.
+        var device = mockDevice(26L, Device.Status.UNREGISTERED, null);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(26L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(26L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(26L);
+
+        assertEquals(Device.Status.ONLINE, result.status());
+        verify(deviceEventService).emitAsync(eq(26L), eq("DEVICE_STATUS_CHANGED"),
+                eq(Event.Priority.MEDIUM), eq("{\"from\":\"OFFLINE\",\"to\":\"ONLINE\"}"));
+        assertEquals(List.of("DEVICE_OFFLINE"), result.resolveIncidentTypes());
     }
 
     @Test
@@ -124,9 +281,10 @@ class DeviceHeartbeatServiceTest {
         when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
         when(remoteActionRepository.findPendingByDevice(21L)).thenReturn(List.of());
 
-        service.processHeartbeat(21L);
+        var result = service.processHeartbeat(21L);
 
-        verify(incidentService, never()).autoResolveOnRecovery(any(), any());
+        assertTrue(result.resolveIncidentTypes().isEmpty());
+        verifyNoInteractions(incidentService);
     }
 
     @Test
@@ -140,23 +298,10 @@ class DeviceHeartbeatServiceTest {
         when(remoteActionRepository.findPendingByDevice(22L)).thenReturn(List.of());
 
         // Heartbeat reports the matching version → mismatch flips false.
-        service.processHeartbeat(22L, "v-current");
+        var result = service.processHeartbeat(22L, "v-current");
 
-        verify(incidentService).autoResolveOnRecovery(eq(22L), eq("CONTENT_VERSION_MISMATCH"));
-    }
-
-    @Test
-    void heartbeat_autoResolveFailure_doesNotFailHeartbeat() {
-        var device = mockDevice(23L, Device.Status.OFFLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
-        when(deviceRepository.findByIdAndDeletedAtIsNull(23L)).thenReturn(Optional.of(device));
-        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
-        when(remoteActionRepository.findPendingByDevice(23L)).thenReturn(List.of());
-        when(incidentService.autoResolveOnRecovery(any(), any()))
-                .thenThrow(new RuntimeException("DB hiccup"));
-
-        // Recovery is best-effort — heartbeat must still succeed.
-        var result = service.processHeartbeat(23L);
-        assertEquals(Device.Status.ONLINE, result.status());
+        assertEquals(List.of("CONTENT_VERSION_MISMATCH"), result.resolveIncidentTypes());
+        verifyNoInteractions(incidentService);
     }
 
     @Test
@@ -205,7 +350,7 @@ class DeviceHeartbeatServiceTest {
         // Stubbing it to throw on the synchronous call path the unit test sees.
         doThrow(new RuntimeException("redis down"))
                 .when(deviceEventService).emitAsync(any(), any(), any(), any());
-        var device = mockDevice(7L, Device.Status.OFFLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        var device = mockDevice(7L, Device.Status.ONLINE, Instant.now().minus(20, ChronoUnit.MINUTES));
         when(deviceRepository.findByIdAndDeletedAtIsNull(7L)).thenReturn(Optional.of(device));
         when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
         when(remoteActionRepository.findPendingByDevice(7L)).thenReturn(List.of());
@@ -331,7 +476,7 @@ class DeviceHeartbeatServiceTest {
 
         assertTrue(result.syncRequired());
         verify(device).recordContentMismatch(false);
-        verify(incidentService, never()).autoResolveOnRecovery(eq(12L), eq("CONTENT_VERSION_MISMATCH"));
+        assertTrue(result.resolveIncidentTypes().isEmpty());
     }
 
     // ---- Volume reconciliation (PROMPT-device-volume-control §3 / §8) ----
@@ -440,13 +585,191 @@ class DeviceHeartbeatServiceTest {
         assertEquals(100, result.desiredVolume());
     }
 
-    private Device mockDevice(Long id, Device.Status currentStatus, Instant lastHeartbeat) {
+    // ----- remote view/control: capability up, desired state down (§4.2 of the contract) -----
+    //
+    // The governing rule, copied verbatim from the `volume` contract: a malformed or absent
+    // `remote` block MUST NEVER fail the beat. The heartbeat is a liveness signal first — a
+    // buggy capability reporter must not be able to take a fleet offline.
+
+    @Test
+    void heartbeat_remoteBlockAbsent_beatSucceedsAndCapabilityIsUntouched() {
+        var device = mockDevice(40L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(40L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(40L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(40L, null, null, null, null);
+
+        assertEquals(Device.Status.ONLINE, result.status());
+        verify(device, never()).recordRemoteCapability(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void heartbeat_oldClientFourArgOverload_stillWorksAndReportsNoCapability() {
+        // The exact call an un-upgraded caller makes. Byte-for-byte the old behaviour.
+        var device = mockDevice(41L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(41L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(41L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(41L, "v1", "10.0.0.1", 45);
+
+        assertEquals(Device.Status.ONLINE, result.status());
+        assertNull(result.desiredRemoteSession());
+        verify(device, never()).recordRemoteCapability(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void heartbeat_wellFormedRemoteBlock_isRecordedNormalized() {
+        var device = mockDevice(42L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(42L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(42L)).thenReturn(List.of());
+
+        service.processHeartbeat(42L, null, null, null,
+                new DeviceHeartbeatService.RemoteCapabilityReport(true, "root", "scrcpy_ws", 1280, 720));
+
+        verify(device).recordRemoteCapability(eq(true), eq("ROOT"), eq("SCRCPY_WS"),
+                eq(1280), eq(720), any());
+    }
+
+    @Test
+    void heartbeat_malformedRemoteBlock_beatSucceedsAndBadFieldsAreDropped() {
+        // Unknown enum tokens and an absurd resolution: dropped to null, WARN logged, beat lives.
+        var device = mockDevice(43L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(43L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(43L)).thenReturn(List.of());
+
+        var result = service.processHeartbeat(43L, null, null, null,
+                new DeviceHeartbeatService.RemoteCapabilityReport(true, "MAGIC", "TELEPATHY", -1, 99_999));
+
+        assertEquals(Device.Status.ONLINE, result.status(), "a malformed remote block must never fail the beat");
+        verify(device).recordRemoteCapability(eq(true), isNull(), isNull(), isNull(), isNull(), any());
+    }
+
+    @Test
+    void heartbeat_capabilityRecordingThrows_beatStillSucceeds() {
+        var device = mockDevice(44L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(44L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(44L)).thenReturn(List.of());
+        doThrow(new RuntimeException("column vanished"))
+                .when(device).recordRemoteCapability(any(), any(), any(), any(), any(), any());
+
+        var result = service.processHeartbeat(44L, null, null, null,
+                new DeviceHeartbeatService.RemoteCapabilityReport(true, "ROOT", "SCRCPY_WS", 1280, 720));
+
+        assertEquals(Device.Status.ONLINE, result.status());
+    }
+
+    @Test
+    void heartbeat_desiredRemoteSession_isReturnedWhenOneIsPending() {
+        var device = mockDevice(45L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(45L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(45L)).thenReturn(List.of());
+        var desired = new RemoteSessionService.DesiredRemoteSession("rs_abc123",
+                "wss://relay.test/agent", "tkt", Instant.now().plus(30, ChronoUnit.MINUTES),
+                false, 1280, 15, 2_000_000);
+        when(remoteSessionService.desiredFor(45L)).thenReturn(Optional.of(desired));
+
+        var result = service.processHeartbeat(45L, null, null, null, null);
+
+        assertNotNull(result.desiredRemoteSession());
+        assertEquals("rs_abc123", result.desiredRemoteSession().sessionId());
+        assertEquals("wss://relay.test/agent", result.desiredRemoteSession().relayUrl());
+    }
+
+    @Test
+    void heartbeat_desiredRemoteSession_isNullWhenThereIsNone() {
+        var device = mockDevice(46L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(46L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(46L)).thenReturn(List.of());
+        when(remoteSessionService.desiredFor(46L)).thenReturn(Optional.empty());
+
+        assertNull(service.processHeartbeat(46L, null, null, null, null).desiredRemoteSession(),
+                "null means: no session wanted; stop any running one");
+    }
+
+    @Test
+    void heartbeat_desiredSessionLookupThrows_beatStillSucceedsWithNull() {
+        var device = mockDevice(47L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(47L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(47L)).thenReturn(List.of());
+        when(remoteSessionService.desiredFor(47L)).thenThrow(new RuntimeException("db down"));
+
+        var result = service.processHeartbeat(47L, null, null, null, null);
+
+        assertEquals(Device.Status.ONLINE, result.status());
+        assertNull(result.desiredRemoteSession());
+    }
+
+    @Test
+    void heartbeat_capabilityAndVolumeAndVersion_allApplyInOneBeat() {
+        var device = mockDevice(48L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(48L)).thenReturn(Optional.of(device));
+        when(contentAssignmentService.resolveForDevice(any(), any())).thenReturn(mock(ContentAssignment.class));
+        when(remoteActionRepository.findPendingByDevice(48L)).thenReturn(List.of());
+
+        service.processHeartbeat(48L, "v9", "10.0.0.5", 45,
+                new DeviceHeartbeatService.RemoteCapabilityReport(true, "ROOT", "SCRCPY_WS", 1280, 720));
+
+        verify(device).recordReportedVolume(45);
+        verify(device).setCurrentContentVersion("v9");
+        verify(device).setLastKnownIp("10.0.0.5");
+        verify(device).recordRemoteCapability(eq(true), eq("ROOT"), eq("SCRCPY_WS"), eq(1280), eq(720), any());
+    }
+
+    @Test
+    void heartbeat_oversizedSourceIp_isNotStored() {
+        // RemoteIpValve copies X-Forwarded-For from a trusted proxy unvalidated; last_known_ip is
+        // VARCHAR(45). A garbage value must never fail the liveness signal.
+        var device = mockDevice(49L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(49L)).thenReturn(Optional.of(device));
+        when(remoteActionRepository.findPendingByDevice(49L)).thenReturn(List.of());
+
+        service.processHeartbeat(49L, null, "x".repeat(46), null);
+
+        verify(device, never()).setLastKnownIp(any());
+    }
+
+    @Test
+    void heartbeat_sourceIpAtColumnWidth_isStored() {
+        var device = mockDevice(50L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(50L)).thenReturn(Optional.of(device));
+        when(remoteActionRepository.findPendingByDevice(50L)).thenReturn(List.of());
+        var ipv6WithZone = "fe80:0000:0000:0000:0000:0000:0000:0001%eth01"; // exactly 45 chars
+
+        service.processHeartbeat(50L, null, ipv6WithZone, null);
+
+        verify(device).setLastKnownIp(ipv6WithZone);
+    }
+
+    /**
+     * {@code storedStatus} is the status column. Production never stores OFFLINE (the health
+     * monitor is derive-only), so an offline device is modelled by a STALE
+     * {@code previousHeartbeat}, not by the stored status. {@code getLastHeartbeatAt()} behaves
+     * like the entity: it returns {@code previousHeartbeat} until {@code recordHeartbeat()} runs,
+     * and "now" afterwards — so a test only passes if the service reads the previous beat first.
+     */
+    private static DeviceHeartbeatService.HeartbeatResult resultResolving(Long deviceId, String... types) {
+        return new DeviceHeartbeatService.HeartbeatResult(deviceId, Device.Status.ONLINE, List.of(), null, false,
+                DeviceVolumeResolver.DEFAULT_VOLUME, null, null, List.of(types));
+    }
+
+    private Device mockDevice(Long id, Device.Status storedStatus, Instant previousHeartbeat) {
         var device = mock(Device.class);
+        var lastHeartbeat = new AtomicReference<>(previousHeartbeat);
         when(device.getId()).thenReturn(id);
-        when(device.getStatus()).thenReturn(currentStatus);
-        // After recordHeartbeat() is called, lastHeartbeatAt is fresh.
-        // We simulate that state directly via the mock.
-        when(device.getLastHeartbeatAt()).thenReturn(lastHeartbeat);
+        when(device.getStatus()).thenReturn(storedStatus);
+        when(device.getLastHeartbeatAt()).thenAnswer(inv -> lastHeartbeat.get());
+        doAnswer(inv -> {
+            lastHeartbeat.set(Instant.now());
+            return null;
+        }).when(device).recordHeartbeat();
         return device;
     }
 }

@@ -59,8 +59,8 @@ class IncidentServiceDashboardBroadcastTest {
         var device = mockDevice(10L);
         var event = new Event(device, "DEVICE_OFFLINE", Priority.CRITICAL, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(event);
-        when(incidentRepository.findOpenByDeviceAndEventType(10L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(10L, "DEVICE_OFFLINE"))
+                .thenReturn(java.util.List.of());
         when(incidentRepository.save(any(Incident.class))).thenAnswer(inv -> inv.getArgument(0));
 
         service.processEvent(event);
@@ -101,8 +101,8 @@ class IncidentServiceDashboardBroadcastTest {
     @Test
     void autoResolve_firesIncidentUpdated_withSystemActor() {
         var incident = stubExistingIncident(7L, Incident.Status.OPEN);
-        when(incidentRepository.findOpenByDeviceAndEventType(10L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.of(incident));
+        when(incidentRepository.findAllOpenByDeviceAndEventType(10L, "DEVICE_OFFLINE"))
+                .thenReturn(java.util.List.of(incident));
 
         service.autoResolveOnRecovery(10L, "DEVICE_OFFLINE");
 

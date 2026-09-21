@@ -1,7 +1,6 @@
 package uz.orientadvertise.services.service;
 
 import java.time.Instant;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -43,6 +42,23 @@ public class ContentAssignmentService {
     private final FacilityRepository facilityRepository;
     private final DeviceGroupRepository deviceGroupRepository;
     private final OperatorScopeResolver operatorScopeResolver;
+
+    /**
+     * Audit reason stamped on the {@link ContentAssignmentExclusion} rows a partial-device
+     * supersede writes, so a narrowed predecessor's history is greppable. Formats to well under
+     * the column's 500 chars.
+     *
+     * <p>It is also the <b>key</b> that {@link #softDelete} uses to undo a narrowing: cancelling
+     * the superseding assignment deletes exactly the exclusions it caused. Always build it through
+     * {@link #partialSupersedeReason} so the write and the undo cannot drift — no second quoted
+     * copy of this string exists anywhere.
+     */
+    private static final String PARTIAL_SUPERSEDE_REASON = "superseded for these devices by assignment %d";
+
+    /** The one formatter for {@link #PARTIAL_SUPERSEDE_REASON} — written by supersede, matched by cancel. */
+    private static String partialSupersedeReason(Long supersedingAssignmentId) {
+        return PARTIAL_SUPERSEDE_REASON.formatted(supersedingAssignmentId);
+    }
 
     @Value("${app.sync.push-on-confirm-cap:5000}")
     private int pushOnConfirmCap;
@@ -143,9 +159,16 @@ public class ContentAssignmentService {
      * Either everything commits, or nothing does — this is the all-or-nothing edge case.
      *
      * <p>When {@code replaceConflicting} is true, any overlapping CONFIRMED assignment on the same
-     * target is retired (soft-deleted, or truncated if already running) in this SAME transaction
-     * before the new one goes CONFIRMED — so the target is never left empty. With it false, an
-     * overlap throws {@link AssignmentTimeOverlapException} (the FE then offers "Replace").
+     * target is {@link #supersede superseded} in this SAME transaction before the new one goes
+     * CONFIRMED — so the target is never left empty. A predecessor the new assignment covers
+     * <b>entirely</b> (all its devices AND the rest of its window) is retired in full; one that only
+     * partly overlaps in <b>devices</b> is narrowed, keeping its remaining devices playing; one the
+     * new window does not outlast is left untouched and simply outranked for the new window. With
+     * the flag false, an overlap throws {@link AssignmentTimeOverlapException} (the FE then offers
+     * "Replace").
+     *
+     * <p>Devices whose resolved playlist actually changes here also lose their {@code syncGroup}
+     * membership — see {@link #detachReassignedSyncGroupMembers}.
      */
     @Transactional
     public ContentAssignment confirmWithExclusions(Long assignmentId, java.util.Collection<Long> excludedDeviceIds,
@@ -173,10 +196,33 @@ public class ContentAssignmentService {
         // overlap gate so a doomed confirm fails fast without the (replace-destructive) supersede.
         requireNonEmptyPlaylist(assignment.getPlaylist().getId());
 
+        // The target's devices, loaded ONCE and threaded through everything below (overlap gate,
+        // partial supersede, sync-group reset, push payload) — the entities, not just ids, so the
+        // narrowing and the detach can mutate them without a second round trip. UNCAPPED on
+        // purpose: pushOnConfirmCap is a push budget, not a correctness bound, and it is applied
+        // only where it belongs — the event payload at the bottom of this method.
+        var targetDevices = listDevicesForTarget(assignment.getTargetType(), assignment.getTargetId());
+        var excludedIds = nonNullIdSet(excludedDeviceIds);
+        var effectiveDevices = targetDevices.stream()
+                .filter(device -> !excludedIds.contains(device.getId()))
+                .toList();
+
+        // Snapshot the sales-point members' currently-resolved assignment BEFORE the overlap gate
+        // mutates anything — detachReassignedSyncGroupMembers compares against it after the flip.
+        // Filtering on getSyncGroup() != null first keeps this to a handful of devices in practice.
+        var now = Instant.now();
+        var syncGroupMembers = effectiveDevices.stream()
+                .filter(device -> device.getSyncGroup() != null)
+                .toList();
+        var resolvedBefore = new java.util.HashMap<Long, ContentAssignment>();
+        for (var device : syncGroupMembers) {
+            resolvedBefore.put(device.getId(), resolveForDevice(device, now));
+        }
+
         // Device-aware overlap gate. The new assignment's effective device set is the target's
         // devices MINUS the excludedDeviceIds param (NOT the DB — exclusions are persisted below,
         // after this check). A candidate only conflicts if its effective set actually intersects.
-        resolveConfirmOverlap(assignment, assignmentId, excludedDeviceIds, replaceConflicting);
+        resolveConfirmOverlap(assignment, assignmentId, excludedIds, replaceConflicting, targetDevices);
 
         // Resolve and attach exclusions
         if (excludedDeviceIds != null && !excludedDeviceIds.isEmpty()) {
@@ -196,19 +242,104 @@ public class ContentAssignmentService {
         log.info("Confirmed assignment [id={}], excluded devices: {}",
                 assignmentId, excludedDeviceIds == null ? 0 : excludedDeviceIds.size());
 
+        // A reassigned sales-point member has left its group's content — drop its membership.
+        detachReassignedSyncGroupMembers(assignment, syncGroupMembers, resolvedBefore, now);
+
         // Publish a post-confirm event so currently-online in-scope devices get an
         // instant SYNC push. Subscribers fire on AFTER_COMMIT — if the surrounding
         // transaction rolls back (e.g. the overlap re-check above), nothing is pushed.
         // Offline devices in the same scope still pick up content on next heartbeat
         // poll via DeviceSyncService.computeSyncPlan, so the push is purely an
         // online-fast-path; we never depend on it for correctness.
-        var targetDeviceIds = resolveTargetDeviceIds(
-                assignment,
-                excludedDeviceIds == null ? Set.of() : Set.copyOf(excludedDeviceIds),
-                assignmentId);
+        var targetDeviceIds = capPushAudience(
+                effectiveDevices.stream().map(Device::getId).toList(), assignmentId);
         eventPublisher.publishEvent(new AssignmentConfirmedEvent(assignmentId, targetDeviceIds));
 
         return assignment;
+    }
+
+    /**
+     * Clear {@code device.syncGroup} for every sales-point member whose resolved playlist actually
+     * CHANGES because of this confirm. A sync group is a sales point: its members are meant to play
+     * the same content, frame-aligned, and {@code SyncGroupPlaybackService.resolveCoherence} refuses
+     * to drive a group whose members resolve different content — so one silently-reassigned member
+     * disables group control (and {@code /sync-groups/{id}/jump}) for the whole sales point.
+     *
+     * <p>The rule is deliberately NOT "clear the whole effective set". A device shadowed by a
+     * MORE SPECIFIC booking (a DEVICE_GROUP assignment while this one targets the REGION) is inside
+     * the effective set, yet {@link #resolveForDevice} keeps returning the shadowing assignment —
+     * its playlist does not change, and clearing it would break a working sales point for nothing.
+     *
+     * <p>Otherwise {@code before.priority <= new.priority}. Equal priority means the same target
+     * TYPE, and a device belongs to exactly one region / facility / device-group, so it also means
+     * the same target ID — a same-target predecessor, which the overlap gate has just rejected or
+     * superseded. Either way the new assignment wins from here: it is the most recently CONFIRMED
+     * row, which is the second term of {@link ContentAssignment#PRECEDENCE}, so it outranks the
+     * predecessor even in the v1.0.142 case where the predecessor's row survives untouched. So
+     * comparing playlists decides it: a different playlist (or no previous content at all) is a
+     * real reassignment.
+     *
+     * <p>Mutates through the entities (dirty-checked) rather than
+     * {@code DeviceRepository.bulkClearSyncGroup}: that query carries
+     * {@code clearAutomatically = true}, which would detach the just-confirmed assignment and the
+     * exclusion rows written moments earlier from the persistence context.
+     *
+     * <p><b>Not cleared, deliberately:</b> devices excluded from the new assignment (never touched),
+     * the {@code remainder} devices of a narrowed predecessor (their playlist did not change), and
+     * cancelling an assignment ({@link #softDelete} — a cancel is often followed by re-assigning the
+     * same playlist, and keeping membership lets the group heal itself).
+     *
+     * <p><b>A future-dated assignment detaches nothing.</b> {@code resolvedBefore} is sampled at
+     * {@code now}, so for a campaign that opens next week the comparison answers a question about a
+     * change that has not happened: the members keep playing the group's content until the window
+     * opens, and would revert to it when the window closes. Detaching is irreversible (the
+     * membership is not restored on cancel), so a confirm that changes nothing today must not break
+     * a working sales point today. Devices flip to the campaign at its start edge under
+     * {@link ContentAssignment#PRECEDENCE}; if that leaves the group incoherent,
+     * {@code SyncGroupPlaybackService.resolveCoherence} refuses to drive it and says why — a
+     * recoverable state, unlike a silently cleared membership.
+     */
+    private void detachReassignedSyncGroupMembers(ContentAssignment newAssignment, List<Device> members,
+                                                   java.util.Map<Long, ContentAssignment> resolvedBefore,
+                                                   Instant now) {
+        if (newAssignment.getStartTime().isAfter(now)) {
+            log.debug("Assignment {} starts at {} — no sync-group detach: no member's resolved "
+                    + "playlist changes today", newAssignment.getId(), newAssignment.getStartTime());
+            return;
+        }
+        int detached = 0;
+        for (var device : members) {
+            var before = resolvedBefore.get(device.getId());
+            boolean shadowed = before != null && before.getPriority() > newAssignment.getPriority();
+            boolean unchanged = before != null && resolvesSamePlaylist(before, newAssignment);
+            if (shadowed || unchanged) {
+                continue;
+            }
+            device.setSyncGroup(null);
+            detached++;
+        }
+        if (detached > 0) {
+            log.info("Cleared sync-group membership for {} reassigned device(s) on assignment {} "
+                    + "(their resolved playlist changed)", detached, newAssignment.getId());
+        }
+    }
+
+    /** True when both assignments carry the same (persisted) playlist. */
+    private static boolean resolvesSamePlaylist(ContentAssignment a, ContentAssignment b) {
+        var pa = a.getPlaylist();
+        var pb = b.getPlaylist();
+        return pa != null && pb != null && pa.getId() != null && pa.getId().equals(pb.getId());
+    }
+
+    /**
+     * Null-tolerant id set. A malformed element in a client-supplied exclusion list (e.g. JSON
+     * {@code [null]}) is dropped rather than blowing up on {@code Set.copyOf} — a null device id
+     * can never match a real target id anyway.
+     */
+    private static Set<Long> nonNullIdSet(java.util.Collection<Long> ids) {
+        return ids == null
+                ? Set.of()
+                : ids.stream().filter(java.util.Objects::nonNull).collect(Collectors.toSet());
     }
 
     /**
@@ -271,17 +402,24 @@ public class ContentAssignmentService {
                                                Set<Long> excludedIds,
                                                Long assignmentId) {
         var allIds = listDeviceIdsForTarget(assignment.getTargetType(), assignment.getTargetId());
-        var filtered = allIds.stream()
-                .filter(id -> !excludedIds.contains(id))
-                .toList();
+        return capPushAudience(allIds.stream().filter(id -> !excludedIds.contains(id)).toList(),
+                assignmentId);
+    }
+
+    /**
+     * Apply the push-on-confirm soft cap to an already-resolved effective device list. This is a
+     * PUSH budget only — never a correctness bound: callers that must act on every device (the
+     * sync-group reset, the partial supersede) work off the uncapped list.
+     */
+    private List<Long> capPushAudience(List<Long> effectiveIds, Long assignmentId) {
         int cap = pushOnConfirmCap > 0 ? pushOnConfirmCap : Integer.MAX_VALUE;
-        if (filtered.size() > cap) {
+        if (effectiveIds.size() > cap) {
             log.warn("Push-on-confirm cap reached for assignment {} ({}/{}); "
                     + "remaining devices will pick up on next heartbeat",
-                    assignmentId, cap, filtered.size());
-            return filtered.subList(0, cap);
+                    assignmentId, cap, effectiveIds.size());
+            return effectiveIds.subList(0, cap);
         }
-        return filtered;
+        return effectiveIds;
     }
 
     /**
@@ -292,12 +430,7 @@ public class ContentAssignmentService {
      */
     @Transactional(readOnly = true)
     public List<Long> listDeviceIdsForTarget(TargetType targetType, Long targetId) {
-        var devices = switch (targetType) {
-            case REGION -> deviceRepository.findByRegionIdAndDeletedAtIsNull(targetId);
-            case FACILITY -> deviceRepository.findByFacilityIdAndDeletedAtIsNull(targetId);
-            case DEVICE_GROUP -> deviceRepository.findByDeviceGroupIdAndDeletedAtIsNull(targetId);
-        };
-        return devices.stream().map(Device::getId).toList();
+        return listDevicesForTarget(targetType, targetId).stream().map(Device::getId).toList();
     }
 
     /**
@@ -359,7 +492,9 @@ public class ContentAssignmentService {
             var current = activeAssignments.stream()
                     .filter(a -> a.getId() == null || !excluded.contains(a.getId()))
                     .filter(a -> matchesDevice(a, device))
-                    .max(Comparator.comparingInt(ContentAssignment::getPriority))
+                    // Same total order as resolveForDevice — the preview must show exactly what the
+                    // device will play, including which of two overlapping campaigns wins now.
+                    .max(ContentAssignment.PRECEDENCE)
                     .orElse(null);
 
             // Heartbeat-derived status, not the raw column. hasContent = the device resolves an
@@ -388,12 +523,17 @@ public class ContentAssignmentService {
         };
     }
 
-    private List<Device> listDevicesForTarget(TargetType targetType, Long targetId, int cap) {
-        var all = switch (targetType) {
+    /** Every non-deleted device in the target scope — uncapped; the single load point. */
+    private List<Device> listDevicesForTarget(TargetType targetType, Long targetId) {
+        return switch (targetType) {
             case REGION -> deviceRepository.findByRegionIdAndDeletedAtIsNull(targetId);
             case FACILITY -> deviceRepository.findByFacilityIdAndDeletedAtIsNull(targetId);
             case DEVICE_GROUP -> deviceRepository.findByDeviceGroupIdAndDeletedAtIsNull(targetId);
         };
+    }
+
+    private List<Device> listDevicesForTarget(TargetType targetType, Long targetId, int cap) {
+        var all = listDevicesForTarget(targetType, targetId);
         return all.size() > cap ? all.subList(0, cap) : all;
     }
 
@@ -447,8 +587,16 @@ public class ContentAssignmentService {
 
     /**
      * Resolve which playlist a device should play at a given time.
-     * Priority rule: DEVICE_GROUP (3) > FACILITY (2) > REGION (1).
-     * Exclusions are checked — if a device is excluded from an assignment, it's skipped.
+     *
+     * <p>Winner = {@link ContentAssignment#PRECEDENCE}: most specific target
+     * (DEVICE_GROUP 3 &gt; FACILITY 2 &gt; REGION 1), then most recently CONFIRMED, then highest
+     * id. The recency term is the whole mechanism behind "Replace overrides only its own window"
+     * (v1.0.142): a short campaign and the long assignment it replaced are both CONFIRMED and
+     * overlapping, the campaign wins while it runs, and the predecessor resolves again the instant
+     * the campaign's window closes — no row surgery, so proof-of-play and the playback anchors
+     * stay intact.
+     *
+     * <p>Exclusions are checked — if a device is excluded from an assignment, it's skipped.
      */
     @Transactional(readOnly = true)
     public ContentAssignment resolveForDevice(Device device, Instant atTime) {
@@ -461,7 +609,7 @@ public class ContentAssignmentService {
         return activeAssignments.stream()
                 .filter(a -> !excludedAssignmentIds.contains(a.getId()))
                 .filter(a -> matchesDevice(a, device))
-                .max(Comparator.comparingInt(ContentAssignment::getPriority))
+                .max(ContentAssignment.PRECEDENCE)
                 .orElse(null);
     }
 
@@ -480,6 +628,13 @@ public class ContentAssignmentService {
      * re-resolve within ~1s instead of waiting a heartbeat. Cancelling a DRAFT pushes
      * nothing — it never drove any device. The push is an online-fast-path only; offline
      * devices reconcile on their next heartbeat via {@code DeviceSyncService.computeSyncPlan}.
+     *
+     * <p><b>Undoes its own narrowings.</b> If this assignment took devices off a predecessor via a
+     * partial-device REPLACE ({@link #supersede}), those {@link ContentAssignmentExclusion} rows are
+     * permanent and would outlive it — the devices would sit excluded from a still-CONFIRMED,
+     * still-running predecessor and go dark. So the same transaction deletes exactly the exclusions
+     * stamped with {@link #partialSupersedeReason} for THIS id. Operator-written exclusions (a
+     * different reason) and narrowings caused by other assignments are untouched.
      */
     @Transactional
     public void softDelete(Long assignmentId) {
@@ -496,6 +651,12 @@ public class ContentAssignmentService {
                 : List.of();
 
         assignment.softDelete();
+        int releasedNarrowings = exclusionRepository.deleteByReason(partialSupersedeReason(assignmentId));
+        if (releasedNarrowings > 0) {
+            log.info("Released {} narrowing exclusion(s) written when assignment {} superseded a "
+                    + "predecessor — those devices resolve the predecessor again", releasedNarrowings,
+                    assignmentId);
+        }
         log.info("Cancelled assignment [id={}, wasConfirmed={}], notifying {} device(s)",
                 assignmentId, wasActive, targetDeviceIds.size());
 
@@ -549,13 +710,15 @@ public class ContentAssignmentService {
      * most specific one (intentional priority layering, pinned by the resolveForDevice_* tests).
      *
      * <p>When {@code replaceConflicting} is true, ONLY the device-intersecting candidates are
-     * {@link #supersede superseded}; device-disjoint candidates are left untouched. (A
-     * partially-intersecting predecessor is retired in full, including its non-conflicting devices
-     * — there is no partial-device supersede; see README, flagged as a product decision.)
+     * handed to {@link #supersede}; device-disjoint candidates are left untouched. What supersede
+     * then does is itself bounded: a partially-intersecting predecessor is <b>narrowed to the
+     * devices it keeps</b>, and a predecessor that outlasts the new window is <b>not modified at
+     * all</b> — it is merely outranked for that window and resumes afterwards. "Replace" therefore
+     * never implies the predecessor was rejected, cancelled or deleted; check the row.
      */
     private void resolveConfirmOverlap(ContentAssignment newAssignment, Long assignmentId,
-                                       java.util.Collection<Long> excludedDeviceIds,
-                                       boolean replaceConflicting) {
+                                       Set<Long> newExcluded, boolean replaceConflicting,
+                                       List<Device> targetDevices) {
         var candidates = assignmentRepository.findOverlappingExcluding(
                 newAssignment.getTargetType(), newAssignment.getTargetId(),
                 newAssignment.getStartTime(), newAssignment.getEndTime(), assignmentId);
@@ -563,32 +726,36 @@ public class ContentAssignmentService {
             return;
         }
 
-        var targetDeviceIds = listDeviceIdsForTarget(
-                newAssignment.getTargetType(), newAssignment.getTargetId());
-        // Tolerate a malformed null element in the exclusion list (e.g. JSON [null]) rather than
-        // 500 on Set.copyOf — a null device id can never match a real target id anyway.
-        var newExcluded = excludedDeviceIds == null
-                ? Set.<Long>of()
-                : excludedDeviceIds.stream().filter(java.util.Objects::nonNull).collect(Collectors.toSet());
-        // Deterministic order (target order) so conflictingDeviceIds is stable for the FE / tests.
+        // Target order throughout (LinkedHashMap / LinkedHashSet) so conflictingDeviceIds and the
+        // handover/remainder split are stable for the FE and the tests.
+        var devicesById = new java.util.LinkedHashMap<Long, Device>();
         var newEffective = new java.util.LinkedHashSet<Long>();
-        for (var id : targetDeviceIds) {
-            if (!newExcluded.contains(id)) {
-                newEffective.add(id);
+        for (var device : targetDevices) {
+            devicesById.put(device.getId(), device);
+            if (!newExcluded.contains(device.getId())) {
+                newEffective.add(device.getId());
             }
         }
 
         var conflicts = new java.util.ArrayList<AssignmentTimeOverlapException.Conflict>();
-        var intersecting = new java.util.ArrayList<ContentAssignment>();
+        var intersecting = new java.util.ArrayList<OverlapSplit>();
         for (var candidate : candidates) {
             var candidateExcluded = Set.copyOf(
                     exclusionRepository.findDeviceIdsByAssignmentId(candidate.getId()));
-            var intersection = newEffective.stream()
-                    .filter(id -> !candidateExcluded.contains(id))
-                    .toList();
-            if (!intersection.isEmpty()) {
-                conflicts.add(AssignmentTimeOverlapException.Conflict.from(candidate, intersection));
-                intersecting.add(candidate);
+            // Split the predecessor's effective set (target MINUS its own exclusions) into the
+            // devices the new assignment takes over and the ones it leaves behind.
+            var handover = new java.util.ArrayList<Long>();
+            var remainder = new java.util.ArrayList<Long>();
+            for (var deviceId : devicesById.keySet()) {
+                if (candidateExcluded.contains(deviceId)) {
+                    continue;
+                }
+                (newEffective.contains(deviceId) ? handover : remainder).add(deviceId);
+            }
+            if (!handover.isEmpty()) {
+                conflicts.add(AssignmentTimeOverlapException.Conflict.from(
+                        candidate, handover, remainder.size()));
+                intersecting.add(new OverlapSplit(candidate, handover, remainder));
             }
         }
 
@@ -600,8 +767,8 @@ public class ContentAssignmentService {
             throw new AssignmentTimeOverlapException(
                     newAssignment.getTargetType(), newAssignment.getTargetId(), conflicts);
         }
-        for (var predecessor : intersecting) {
-            supersede(predecessor, newAssignment.getStartTime());
+        for (var split : intersecting) {
+            supersede(split, newAssignment, devicesById);
         }
         log.info("Replaced {} device-intersecting assignment(s) on {}:{} when confirming assignment {}",
                 intersecting.size(), newAssignment.getTargetType(), newAssignment.getTargetId(),
@@ -609,33 +776,132 @@ public class ContentAssignmentService {
     }
 
     /**
-     * Retire one overlapping predecessor as part of a REPLACE confirm. A predecessor already
-     * running (its window covers "now") is <b>truncated</b> to end at {@code newStart} so history
-     * shows it ran until the cutover; a future/forever predecessor is <b>soft-deleted</b>. Either
-     * way it stops resolving (both overlap and active-time queries filter {@code deletedAt IS NULL}
-     * and the window), and we emit the same after-commit cancel push the {@code DELETE} path uses
-     * so every device the predecessor drove — including any the new assignment excludes —
-     * re-resolves within ~1s. The predecessor came from {@code findOverlappingExcluding}, so it is
-     * guaranteed CONFIRMED and not yet soft-deleted.
+     * One device-intersecting predecessor and the per-device split a REPLACE has to honour:
+     * {@code handover} = the devices the new assignment takes over (never empty — that is what
+     * makes the predecessor a conflict at all), {@code remainder} = the devices the predecessor
+     * keeps driving. Both in target order.
      */
-    private void supersede(ContentAssignment predecessor, Instant newStart) {
-        // Capture the predecessor's former audience BEFORE mutating it.
-        var formerDeviceIds = resolveTargetDeviceIds(predecessor, Set.of(), predecessor.getId());
+    private record OverlapSplit(ContentAssignment predecessor, List<Long> handover, List<Long> remainder) {}
 
+    /**
+     * Retire one overlapping predecessor as part of a REPLACE confirm — <b>only as far as the new
+     * assignment actually reaches</b>, in TIME as well as in devices.
+     *
+     * <p><b>The time gate (v1.0.142).</b> A predecessor is only ever touched when the new
+     * assignment reaches at least as far as its end ({@code newEnd >= predEnd} — {@code >=}, not
+     * {@code >}, so a "forever" campaign over a "forever" booking still retires the old row: both
+     * carry the same year-2100 sentinel). When the new window ends FIRST, the predecessor is left
+     * <b>completely untouched</b> — not truncated, not soft-deleted, and with NO exclusion rows,
+     * which are permanent and would stop it resuming. The overlap is decided by
+     * {@link ContentAssignment#PRECEDENCE} instead: the newly confirmed assignment wins while it
+     * runs, and the predecessor resolves again the moment it ends. That is what makes a one-week
+     * campaign over an open-ended booking a one-week campaign rather than a permanent takeover.
+     *
+     * <p><b>{@code remainder} empty</b> and the new assignment reaches the predecessor's end: it is
+     * retired in full. {@code predStart < newStart} ⇒ <b>truncated</b> to end at the new start, so
+     * the head it already ran (or is scheduled to run before the new window opens) survives in
+     * history; otherwise ⇒ <b>soft-deleted</b>, because nothing of it would ever play.
+     *
+     * <p><b>{@code remainder} non-empty</b> and the new window covers the predecessor's whole
+     * remaining life: retiring it would take content away from devices this reassignment never
+     * selected (the operator-reported bug: "reassigning to some devices sets the playlist of the
+     * unchecked devices to null"). Instead the predecessor is <b>narrowed</b> — one
+     * {@link ContentAssignmentExclusion} per handed-over device — and stays CONFIRMED with its
+     * original window, still driving {@code remainder}.
+     *
+     * <p>A narrowing needs the <b>from-now</b> test as well as the end test, because an exclusion
+     * takes effect the instant it is written: a device handed over to a window that only opens next
+     * week would otherwise resolve nothing in the meantime. When the new window opens later, nothing
+     * is written — precedence hands that device over at the start edge, and the devices the operator
+     * did NOT select keep the predecessor through the new assignment's own exclusions.
+     *
+     * <p>Narrowings are released again by {@link #softDelete}: an exclusion outliving the assignment
+     * that caused it would strand its devices on a predecessor they are still excluded from.
+     *
+     * <p>Exclusions, not truncation or a version bump, because:
+     * <ul>
+     *   <li>{@code ContentVersionService.computeForAssignment} hashes
+     *       {@code (assignmentId, versionNumber, playlistId, files+durations)} and does NOT read
+     *       exclusions — so every {@code remainder} device's expected version stays byte-identical:
+     *       no re-download, no interruption, {@code DeviceSyncService} sees {@code hasWork=false}.
+     *       Truncating or bumping would churn devices that are not part of this reassignment at all.</li>
+     *   <li>{@code PlaybackSyncSchedule} is keyed {@code (assignment_id, version_number)} and
+     *       immutable, so {@code remainder} devices keep their frame-alignment anchor.</li>
+     *   <li>The exclusion row's {@code createdAt} records WHEN each device left — per-device history
+     *       truncation cannot express.</li>
+     * </ul>
+     *
+     * <p>No duplicate-exclusion guard is needed: {@code handover} is a subset of the new
+     * assignment's effective set, which is itself the target minus the predecessor's existing
+     * exclusions, so the {@code UNIQUE(assignment_id, device_id)} constraint cannot be hit.
+     *
+     * <p>Either way the after-commit cancel push names exactly the handed-over devices — not the
+     * predecessor's whole target — so only devices that really changed hands re-resolve. It is
+     * published even in the untouched case: those devices must switch to the new content NOW, and
+     * the predecessor row surviving does not change that.
+     */
+    private void supersede(OverlapSplit split, ContentAssignment newAssignment,
+                           java.util.Map<Long, Device> targetDevicesById) {
+        var predecessor = split.predecessor();
+        var newStart = newAssignment.getStartTime();
         var now = Instant.now();
-        boolean runningNow = !predecessor.getStartTime().isAfter(now) && predecessor.getEndTime().isAfter(now);
-        if (runningNow && predecessor.getStartTime().isBefore(newStart)) {
-            predecessor.truncateEndTo(newStart);
-            log.info("Truncated running assignment {} to end at {} (superseded by replace)",
-                    predecessor.getId(), newStart);
+        boolean narrowing = !split.remainder().isEmpty();
+
+        // Two independent "does the new assignment actually reach this far" tests:
+        //   reachesPredecessorEnd — it runs at least as long as the predecessor.
+        //     >= : the year-2100 "forever" sentinel is equal, not greater, on both rows.
+        //   coversFromNow — it opens no later than the predecessor's REMAINING life begins (the
+        //     predecessor's own start, or now if it is already running).
+        boolean reachesPredecessorEnd =
+                !newAssignment.getEndTime().isBefore(predecessor.getEndTime());
+        var predecessorFrom = predecessor.getStartTime().isAfter(now)
+                ? predecessor.getStartTime()
+                : now;
+        boolean coversFromNow = !newStart.isAfter(predecessorFrom);
+
+        // A narrowing needs BOTH: an exclusion row is permanent and takes effect the instant it is
+        // written, so writing one for a window that only opens next week blanks the handed-over
+        // device from now until then — the exact failure this change exists to remove. A retire
+        // needs only the end test: a head the new window does not cover is truncated, not lost.
+        if (!reachesPredecessorEnd || (narrowing && !coversFromNow)) {
+            log.info("Assignment {} overrides {} for its window only [{} .. {}); the predecessor "
+                    + "stays CONFIRMED until {}, keeps every device until {}, and resumes afterwards",
+                    newAssignment.getId(), predecessor.getId(), newStart,
+                    newAssignment.getEndTime(), predecessor.getEndTime(), newStart);
+        } else if (narrowing) {
+            var reason = partialSupersedeReason(newAssignment.getId());
+            for (var deviceId : split.handover()) {
+                exclusionRepository.save(new ContentAssignmentExclusion(
+                        predecessor, targetDevicesById.get(deviceId), reason));
+            }
+            log.info("Narrowed assignment {} on replace: {} device(s) handed over to assignment {}, "
+                    + "{} device(s) keep it (unchanged content version)",
+                    predecessor.getId(), split.handover().size(), newAssignment.getId(),
+                    split.remainder().size());
+        } else if (coversFromNow) {
+            // Unchanged v1.0.135 behaviour.
+            boolean runningNow = !predecessor.getStartTime().isAfter(now)
+                    && predecessor.getEndTime().isAfter(now);
+            if (runningNow && predecessor.getStartTime().isBefore(newStart)) {
+                predecessor.truncateEndTo(newStart);
+                log.info("Truncated running assignment {} to end at {} (superseded by replace)",
+                        predecessor.getId(), newStart);
+            } else {
+                predecessor.softDelete();
+                log.info("Soft-deleted assignment {} (superseded by replace)", predecessor.getId());
+            }
         } else {
-            predecessor.softDelete();
-            log.info("Soft-deleted assignment {} (superseded by replace)", predecessor.getId());
+            // Not covering, but the new window runs to the predecessor's end: the predecessor
+            // still gets to play its HEAD, from its own start until the new window opens. The
+            // pre-v1.0.142 code soft-deleted this case whenever the predecessor was not running
+            // yet, silently deleting a scheduled booking that had not even started.
+            predecessor.truncateEndTo(newStart);
+            log.info("Truncated assignment {} to end at {} (superseded by replace; its head "
+                    + "before that instant is kept)", predecessor.getId(), newStart);
         }
 
-        if (!formerDeviceIds.isEmpty()) {
-            eventPublisher.publishEvent(new AssignmentCancelledEvent(predecessor.getId(), formerDeviceIds));
-        }
+        eventPublisher.publishEvent(
+                new AssignmentCancelledEvent(predecessor.getId(), split.handover()));
     }
 
     private boolean matchesDevice(ContentAssignment assignment, Device device) {

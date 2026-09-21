@@ -61,6 +61,20 @@ class PasswordResetControllerTest {
     }
 
     @Test
+    void forgot_rateLimitIp_isTheResolvedRemoteAddress_notAClientSuppliedForwardedFor() throws Exception {
+        // AUTH-04: the controller must not read X-Forwarded-For itself (RemoteIpValve does, and only
+        // from trusted proxies).
+        mockMvc.perform(post("/api/auth/forgot-password")
+                        .with(request -> { request.setRemoteAddr("203.0.113.9"); return request; })
+                        .header("X-Forwarded-For", "9.9.9.9")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"known@example.com"}"""))
+                .andExpect(status().isAccepted());
+        verify(passwordService).requestReset("known@example.com", "203.0.113.9");
+    }
+
+    @Test
     void forgot_unknownEmail_stillReturns202_noEnumeration() throws Exception {
         // The service returns void either way; the controller must answer 202 identically.
         mockMvc.perform(post("/api/auth/forgot-password")

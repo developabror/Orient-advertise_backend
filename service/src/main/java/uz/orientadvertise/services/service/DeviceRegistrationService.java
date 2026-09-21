@@ -1,5 +1,7 @@
 package uz.orientadvertise.services.service;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.UUID;
 
 import jakarta.persistence.EntityManager;
@@ -10,11 +12,13 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import uz.orientadvertise.services.common.exception.IllegalConfigurationException;
+import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.Event;
 import uz.orientadvertise.services.domain.model.Region;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.RegionRepository;
+import uz.orientadvertise.services.service.exception.DeviceAlreadyRegisteredException;
 
 @Service
 public class DeviceRegistrationService {
@@ -39,22 +43,59 @@ public class DeviceRegistrationService {
     private final DeviceEventService deviceEventService;
     private final EntityManager entityManager;
     private final Long defaultRegionId;
+    private final Duration reregistrationWindow;
 
     public DeviceRegistrationService(DeviceRepository deviceRepository,
                                       RegionRepository regionRepository,
                                       DeviceEventService deviceEventService,
                                       EntityManager entityManager,
-                                      @Value("${app.device.default-region-id:-1}") Long defaultRegionId) {
+                                      @Value("${app.device.default-region-id:-1}") Long defaultRegionId,
+                                      @Value("${app.device.reregistration-window:PT1H}") Duration reregistrationWindow) {
         this.deviceRepository = deviceRepository;
         this.regionRepository = regionRepository;
         this.deviceEventService = deviceEventService;
         this.entityManager = entityManager;
         this.defaultRegionId = defaultRegionId;
+        if (reregistrationWindow == null || reregistrationWindow.compareTo(Duration.ofMinutes(1)) < 0) {
+            // A bare number binds as milliseconds ("60" = 60 ms), which would make the admin
+            // button a silent no-op — fail fast instead.
+            throw new IllegalConfigurationException(
+                    "app.device.reregistration-window must be at least 1 minute, e.g. PT1H "
+                            + "(set APP_DEVICE_REREGISTRATION_WINDOW)");
+        }
+        this.reregistrationWindow = reregistrationWindow;
+    }
+
+    /** Whether this serial belongs to a live, registered device — picks the rate-limit budget. */
+    @Transactional(readOnly = true)
+    public boolean isRegistered(String serialNumber) {
+        return deviceRepository.findBySerialNumberAndDeletedAtIsNull(serialNumber)
+                .map(Device::isRegistered)
+                .orElse(false);
+    }
+
+    /**
+     * AUTH-02: let this device's serial re-register once within the configured window — for a TV
+     * box that was wiped or reinstalled and lost its token. Returns when the window closes. A
+     * heartbeat from the device (proof it still holds its token) closes the window early.
+     */
+    @Transactional
+    public Instant allowReregistration(Long deviceId) {
+        var device = deviceRepository.findByIdAndDeletedAtIsNull(deviceId)
+                .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
+        var until = Instant.now().plus(reregistrationWindow);
+        device.allowReregistrationUntil(until);
+        deviceRepository.save(device);
+        log.info("Re-registration window opened [id={}, serial={}, until={}]", deviceId, device.getSerialNumber(), until);
+        return until;
     }
 
     /**
      * Register a device by serial number. TV-Box calls this on first boot.
-     * Edge case: re-registration of existing serial = upsert, not duplicate.
+     * A new serial is created; an existing but never-registered row is completed. An already
+     * registered serial is refused ({@link DeviceAlreadyRegisteredException} → 409) unless an
+     * ADMIN opened a re-registration window ({@link #allowReregistration}) — the endpoint is
+     * public, so rotating the token on request would hand any caller the device (AUTH-02).
      * Returns device ID and a device token for subsequent API calls.
      */
     @Transactional
@@ -64,7 +105,11 @@ public class DeviceRegistrationService {
         if (existing.isPresent()) {
             var device = existing.get();
             if (device.isRegistered()) {
-                // Re-registration: refresh token, keep existing data
+                // Atomic claim: of two concurrent callers only one matches the open window.
+                if (deviceRepository.claimReregistrationWindow(device.getId(), Instant.now()) != 1) {
+                    throw new DeviceAlreadyRegisteredException(serialNumber, device.getId());
+                }
+                // Re-registration allowed by an admin: refresh token, keep existing data
                 var newToken = generateToken();
                 device.register(newToken);
                 log.info("Re-registered device [serial={}, id={}, newToken]", serialNumber, device.getId());

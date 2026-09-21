@@ -35,6 +35,8 @@ import uz.orientadvertise.services.service.ContentListService;
 import uz.orientadvertise.services.service.ContentListService.ContentFileView;
 import uz.orientadvertise.services.service.ContentListService.StreamUrl;
 import uz.orientadvertise.services.service.ContentManagementService;
+import uz.orientadvertise.services.service.ContentRetranscodeService;
+import uz.orientadvertise.services.service.ContentRetranscodeService.RetranscodeResult;
 import uz.orientadvertise.services.service.ContentUploadService;
 import uz.orientadvertise.services.service.ContentUploadService.UploadResult;
 
@@ -45,15 +47,18 @@ public class ContentController {
     private final ContentUploadService uploadService;
     private final ContentListService listService;
     private final ContentManagementService managementService;
+    private final ContentRetranscodeService retranscodeService;
     private final DeviceWebSocketHandler webSocketHandler;
 
     public ContentController(ContentUploadService uploadService,
                               ContentListService listService,
                               ContentManagementService managementService,
+                              ContentRetranscodeService retranscodeService,
                               DeviceWebSocketHandler webSocketHandler) {
         this.uploadService = uploadService;
         this.listService = listService;
         this.managementService = managementService;
+        this.retranscodeService = retranscodeService;
         this.webSocketHandler = webSocketHandler;
     }
 
@@ -165,7 +170,7 @@ public class ContentController {
                                     @ExampleObject(name = "Bound to project (urgent)", value = """
                                             {
                                               "fileId": 1042,
-                                              "status": "PROCESSING",
+                                              "status": "UPLOADED",
                                               "storageKey": "raw/2026/01/abc123.mp4",
                                               "urgent": true,
                                               "projectId": 7,
@@ -176,7 +181,7 @@ public class ContentController {
                                     @ExampleObject(name = "Orphan upload (no project)", value = """
                                             {
                                               "fileId": 1043,
-                                              "status": "PROCESSING",
+                                              "status": "UPLOADED",
                                               "storageKey": "raw/2026/01/def456.mp4",
                                               "urgent": false,
                                               "projectId": null,
@@ -291,6 +296,34 @@ public class ContentController {
         return ResponseEntity.ok(listService.streamUrl(id, username, isAdvertiser, operatorOnly, expirySeconds));
     }
 
+    /**
+     * Re-queue the transcode for a stuck or failed content file — the operator's escape hatch.
+     *
+     * <p>Before v1.0.132 there was none: a file whose async dispatch was lost sat in
+     * {@code UPLOADED} forever, no endpoint could retry it, and restarting the application recovered
+     * nothing. {@code TranscodeSweeper} now re-drives such rows automatically within minutes; this
+     * endpoint is for the operator who is already looking at the row and does not want to wait.
+     *
+     * <p>The attempt counter is reset on an explicit retry — a human asking again is not the same
+     * as an automatic retry, and must not be refused because earlier automatic attempts used up the
+     * budget. The claim is the same atomic compare-and-set the sweeper uses, so a double-click (or a
+     * click that races the sweeper) starts exactly one encode.
+     */
+    @Operation(summary = "Re-queue transcoding for a stuck or failed content file")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Claimed and queued; returns the new status"),
+            @ApiResponse(responseCode = "403", description = "Caller lacks ADMIN/OPERATOR"),
+            @ApiResponse(responseCode = "404", description = "Unknown content file (or soft-deleted)"),
+            @ApiResponse(responseCode = "409", description = "Status is not UPLOADED/FAILED, the raw object "
+                    + "is missing, or another worker just claimed it — see `message`")
+    })
+    @PostMapping("/{id}/retranscode")
+    @PreAuthorize("hasAnyRole('ADMIN','OPERATOR')")
+    public ResponseEntity<RetranscodeResult> retranscode(@PathVariable Long id) {
+        var auth = SecurityContextHolder.getContext().getAuthentication();
+        return ResponseEntity.ok(retranscodeService.retranscode(id, CallerRoles.usernameOf(auth)));
+    }
+
     private static boolean isAdvertiserOnly(Authentication auth) {
         if (auth == null || auth.getAuthorities() == null) {
             return false;
@@ -312,7 +345,11 @@ public class ContentController {
     public record UploadResponse(
             @Schema(description = "Server-assigned content file id", example = "1042")
             Long fileId,
-            @Schema(description = "Processing status of the file", example = "PROCESSING")
+            // The value is ContentFile.Status.UPLOADED.name() — a status the enum can actually
+            // produce. The example used to read "PROCESSING", which it never returns.
+            @Schema(description = "Lifecycle status of the file at the moment the upload was "
+                    + "accepted; always UPLOADED (transcoding starts after the commit)",
+                    example = "UPLOADED")
             String status,
             @Schema(description = "MinIO object key under the raw bucket", example = "raw/2026/01/abc123.mp4")
             String storageKey,

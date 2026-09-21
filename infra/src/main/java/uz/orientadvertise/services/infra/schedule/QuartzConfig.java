@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.quartz.SchedulerFactoryBeanCustomizer;
 import org.springframework.context.ApplicationContext;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.quartz.SpringBeanJobFactory;
@@ -46,7 +47,14 @@ public class QuartzConfig {
         return bean -> bean.setJobFactory(jobFactory);
     }
 
+    /**
+     * LOGIC-04: dayparting schedules are stored but NOT applied to playback — nothing that decides
+     * what a device plays reads them — so evaluating them every minute only burned a full-table scan
+     * and 1,440 INFO lines a day. Off unless {@code app.schedule.evaluation-enabled=true}, which the
+     * future dayparting feature will turn on (together with {@link MissedRunCatchUp}).
+     */
     @Bean
+    @ConditionalOnProperty(name = "app.schedule.evaluation-enabled", havingValue = "true")
     public JobDetail scheduleEvaluationJobDetail() {
         return JobBuilder.newJob(ScheduleEvaluationJob.class)
                 .withIdentity("scheduleEvaluation")
@@ -59,6 +67,7 @@ public class QuartzConfig {
      * Format: sec min hour day-of-month month day-of-week
      */
     @Bean
+    @ConditionalOnProperty(name = "app.schedule.evaluation-enabled", havingValue = "true")
     public Trigger scheduleEvaluationTrigger(
             @Qualifier("scheduleEvaluationJobDetail") JobDetail scheduleEvaluationJobDetail) {
         return TriggerBuilder.newTrigger()

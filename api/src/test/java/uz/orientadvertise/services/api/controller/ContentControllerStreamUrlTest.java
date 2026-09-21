@@ -20,6 +20,7 @@ import uz.orientadvertise.services.domain.auth.UserActiveChecker;
 import uz.orientadvertise.services.service.ContentListService;
 import uz.orientadvertise.services.service.ContentListService.StreamUrl;
 import uz.orientadvertise.services.service.ContentManagementService;
+import uz.orientadvertise.services.service.ContentRetranscodeService;
 import uz.orientadvertise.services.service.ContentUploadService;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -47,6 +48,9 @@ class ContentControllerStreamUrlTest {
 
     @MockitoBean
     private ContentManagementService managementService;
+
+    @MockitoBean
+    private ContentRetranscodeService retranscodeService;
 
     @MockitoBean
     private DeviceWebSocketHandler webSocketHandler;

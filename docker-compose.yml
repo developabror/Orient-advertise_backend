@@ -19,16 +19,40 @@
 #
 # Compose's ${VAR:-default} expansion picks the env value when set; otherwise the
 # safe high-numbered fallback below.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# SECURITY: every publish binds to ${BIND_ADDR:-127.0.0.1} — LOOPBACK ONLY by default.
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# `ports: - "5432:5432"` binds 0.0.0.0. On the production box that meant Postgres, Redis, the
+# plaintext API, the SPA, MinIO and the MinIO console were ALL reachable from the internet with
+# no upstream firewall and the credentials that used to be committed in this file. Internet
+# scanners were observed probing the plaintext API within minutes of it being up.
+#
+# Loopback binding keeps every local workflow working (psql -h localhost, redis-cli, the MinIO
+# console, a reverse proxy on the same host) while refusing off-host handshakes. Set BIND_ADDR
+# explicitly — e.g. BIND_ADDR=0.0.0.0 — only if you genuinely want LAN exposure and understand it.
+#
+# In production, Caddy runs as a HOST systemd process (not a compose service), so it cannot
+# resolve compose service names — it proxies localhost:8080, localhost:3000 and localhost:9000.
+# That is why MinIO's 9000 publish must be REBOUND, never deleted: MINIO_PUBLIC_URL points at the
+# MinIO vhost, so every presigned URL a TV box downloads traverses it.
+#
+# Credentials come from `.env` and have NO defaults here. `${VAR:?message}` aborts `docker compose
+# up` with that message rather than silently starting on a well-known password, the same discipline
+# JWT_SECRET already used. Generate them with the recipes in `.env.example`.
 
 services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: appdb
-      POSTGRES_USER: appuser
-      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (generate: openssl rand -base64 32)}"
+    # Loopback only. The app reaches Postgres as DB_HOST=postgres over the compose network and
+    # never needs this publish; it exists purely so a developer can attach psql/DBeaver from the
+    # host. On subzero, delete this block outright — see DEPLOY-subzero.md.
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      - "${BIND_ADDR:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -39,9 +63,15 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Loopback only — the app reaches Redis as REDIS_HOST=redis. On subzero, delete this block.
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
+    # --requirepass is NOT optional hardening here: Redis holds the refresh-token families
+    # (`refresh:` / `family:` / `userfam:` keys written by RefreshTokenRepository), so write access
+    # is token forgery, and a single FLUSHALL drops every session AND clears every brute-force
+    # counter at the same moment. An empty value is accepted by redis-server and means "no
+    # password", which keeps a bare dev box working; production MUST set it.
+    command: redis-server --requirepass "${REDIS_PASSWORD:-}" --maxmemory 128mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -51,11 +81,15 @@ services:
   minio:
     image: minio/minio:latest
     ports:
-      - "${MINIO_HOST_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+      # S3 API — REBOUND to loopback, never deleted: the host's Caddy proxies presigned media
+      # through it, so removing this publish breaks playback on every TV box.
+      - "${BIND_ADDR:-127.0.0.1}:${MINIO_HOST_PORT:-9000}:9000"
+      # Console — loopback only. Nothing proxies it and nothing in the app uses it; reach it over
+      # an SSH tunnel when needed. On subzero, delete this line outright.
+      - "${BIND_ADDR:-127.0.0.1}:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set in .env (not 'minioadmin')}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env (generate: openssl rand -base64 32)}"
     command: server /data --console-address ":9001"
     volumes:
       - miniodata:/data
@@ -68,10 +102,29 @@ services:
   app:
 #    image: developabror/orient-advertise-backend:1.0.0
     build: .
+    # Loopback only. This port is PLAINTEXT — publishing it on 0.0.0.0 lets clients (and internet
+    # scanners) bypass Caddy and TLS entirely, which is exactly what was happening on subzero.
     ports:
-      - "${APP_HOST_PORT:-8080}:8080"
+      - "${BIND_ADDR:-127.0.0.1}:${APP_HOST_PORT:-8080}:8080"
     environment:
       SPRING_PROFILES_ACTIVE: prod
+      # JVM sizing. Overridable per environment from `.env` so the SAME image fits a 700 MiB box and
+      # a 16 GB one. MaxRAMPercentage=45 (not the JVM's 25% default, and not the 75% this used to
+      # run with) leaves room in the cgroup for ffmpeg: ffmpeg is a CHILD of the JVM, so its peak
+      # RSS is charged to the same memory limit, and at 75% of 700 MiB the heap alone entitled
+      # itself to 526 MiB — leaving nothing for the encode.
+      #
+      # Deliberately NO -XX:+UseSerialGC: JVM ergonomics already picks SerialGC at <=1 CPU / <1792 MB
+      # and G1 on a larger host. Pinning it would tune the image to today's box, which is exactly
+      # what the transcode pool's capacity planner exists to avoid.
+      JAVA_TOOL_OPTIONS: "${JAVA_TOOL_OPTIONS:--XX:MaxRAMPercentage=45 -XX:MaxMetaspaceSize=192m}"
+      # Transcode concurrency. 0 (default) = derive it from this container's CPU and memory limits;
+      # set a positive value only to override the planner. See application.yml app.video.transcode.
+      APP_VIDEO_TRANSCODE_CONCURRENCY: "${APP_VIDEO_TRANSCODE_CONCURRENCY:-0}"
+      # x264 preset. `veryfast` (~218 MiB peak) is the safe default; a host with memory to spare can
+      # set `medium` (~438 MiB peak) for better compression — raise job-memory-mb to match.
+      APP_VIDEO_PRESET: "${APP_VIDEO_PRESET:-veryfast}"
+      APP_VIDEO_MAX_HEIGHT: "${APP_VIDEO_MAX_HEIGHT:-1080}"
       # JWT signing secret — MUST be ≥32 bytes. The prod profile has NO fallback, so the
       # app fails fast at startup if it's missing. Supplied from the host `.env` only
       # (never hard-coded here). The `:?` makes `docker compose up` abort with this
@@ -81,30 +134,45 @@ services:
       # port remapping above. Do NOT change these unless you also rewire the network.
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_NAME: appdb
-      DB_USERNAME: appuser
-      DB_PASSWORD: apppass
+      DB_NAME: ${POSTGRES_DB:-appdb}
+      DB_USERNAME: ${POSTGRES_USER:-appuser}
+      DB_PASSWORD: "${POSTGRES_PASSWORD}"
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      REDIS_PASSWORD: ""
+      # Must match the --requirepass on the redis service above.
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
       MINIO_URL: http://minio:9000
       # Endpoint embedded in presigned URLs returned to browsers / TV-Box players. The
       # backend talks to MinIO over the docker network (MINIO_URL above), but clients
       # outside the network can't resolve "minio" — they need the host-published port
       # (MINIO_HOST_PORT, default 9000). Override via .env to match a deployed hostname.
       MINIO_PUBLIC_URL: "${MINIO_PUBLIC_URL:-http://localhost:${MINIO_HOST_PORT:-9000}}"
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # Same values as the MinIO root credentials above — one source, no drift.
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
       MINIO_PRESIGNED_EXPIRY: 120
+      # Days after upload that raw originals under raw/ are deleted by MinIO's lifecycle engine.
+      # 0 disables it — and content-raw then grows without bound. Processed MP4s and posters are
+      # never expired, so playback is unaffected; only retranscode-from-source stops working.
+      MINIO_RAW_EXPIRY_DAYS: "${MINIO_RAW_EXPIRY_DAYS:-30}"
+      # How often storage is re-probed WHILE degraded, so a MinIO restart or disk-full moment
+      # heals on its own instead of 503-ing every upload until the app is restarted. No MinIO
+      # calls are made while storage is healthy. ISO-8601 — a bare number means milliseconds.
+      APP_MINIO_RECHECK_INTERVAL: "${APP_MINIO_RECHECK_INTERVAL:-PT30S}"
       # Swagger UI lockdown — prod profile requires ROLE_ADMIN by default. Override to
       # false for local docker so you can browse /swagger-ui.html anonymously.
       # Re-enable in real production deployments by removing this line.
       APP_OPENAPI_ADMIN_ONLY: "false"
       # Local-development seed data — pre-registers N fake Android TV devices on boot
-      # so content-assignment flows can be exercised without a real TV-Box. Override
-      # via `.env` (APP_SEED_ENABLED=false) to disable. NEVER ship to real production.
-      APP_SEED_ENABLED: "${APP_SEED_ENABLED:-true}"
+      # and keeps the dev logins (admin/password, …) active. Default OFF; opt in via
+      # `.env` (APP_SEED_ENABLED=true) for local use. NEVER enable in real production.
+      APP_SEED_ENABLED: "${APP_SEED_ENABLED:-false}"
       APP_SEED_DEVICE_COUNT: "${APP_SEED_DEVICE_COUNT:-5}"
+      # First ADMIN when seed data is off — used only while no active ADMIN exists.
+      APP_BOOTSTRAP_ADMIN_USERNAME: "${APP_BOOTSTRAP_ADMIN_USERNAME:-}"
+      APP_BOOTSTRAP_ADMIN_PASSWORD: "${APP_BOOTSTRAP_ADMIN_PASSWORD:-}"
+      # How long an admin's "Allow re-registration" stays open for one device (AUTH-02).
+      APP_DEVICE_REREGISTRATION_WINDOW: "${APP_DEVICE_REREGISTRATION_WINDOW:-PT1H}"
       # Telegram bot — disabled by default. To enable, set TELEGRAM_BOT_ENABLED=true
       # and TELEGRAM_BOT_TOKEN=<token-from-BotFather> in your `.env` file (NOT here).
       # The token is loaded from the host env only — never commit a real value.
@@ -125,6 +193,16 @@ services:
       APP_MAIL_FROM: "${APP_MAIL_FROM:-}"
       APP_MAIL_FROM_NAME: "${APP_MAIL_FROM_NAME:-Orient Advertise}"
       APP_FRONTEND_BASE_URL: "${APP_FRONTEND_BASE_URL:-http://localhost:5173}"
+      # Remote view/control — DISABLED by default (ships dark). To enable, set
+      # APP_REMOTE_ENABLED=true plus the two relay URLs and REMOTE_RELAY_SIGNING_SECRET
+      # (>=32 bytes) in your `.env` file (NOT here). The app fails fast at startup if the
+      # secret is missing or short while enabled. The backend carries NO media — the relay
+      # is a separate service on its own VPS.
+      APP_REMOTE_ENABLED: "${APP_REMOTE_ENABLED:-false}"
+      APP_REMOTE_SESSION_TTL: "${APP_REMOTE_SESSION_TTL:-PT30M}"
+      APP_REMOTE_RELAY_AGENT_URL: "${APP_REMOTE_RELAY_AGENT_URL:-wss://relay.example.uz/agent}"
+      APP_REMOTE_RELAY_VIEWER_URL: "${APP_REMOTE_RELAY_VIEWER_URL:-wss://relay.example.uz/viewer}"
+      REMOTE_RELAY_SIGNING_SECRET: "${REMOTE_RELAY_SIGNING_SECRET:-}"
     depends_on:
       postgres:
         condition: service_healthy

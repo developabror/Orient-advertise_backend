@@ -1,5 +1,6 @@
 package uz.orientadvertise.services.service;
 
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -12,11 +13,13 @@ import uz.orientadvertise.services.domain.event.DashboardEventBroadcaster;
 import uz.orientadvertise.services.domain.event.DashboardEventBroadcaster.DeviceStatusPayload;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.Event;
-import uz.orientadvertise.services.domain.model.Incident;
+import uz.orientadvertise.services.domain.model.Project;
+import uz.orientadvertise.services.domain.model.Region;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.IncidentRepository;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -36,14 +39,20 @@ class DeviceHealthMonitorTest {
     private DeviceHealthMonitor monitor;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
         deviceRepository = mock(DeviceRepository.class);
         incidentRepository = mock(IncidentRepository.class);
         incidentService = mock(IncidentService.class);
         dashboardService = mock(DashboardService.class);
         dashboardBroadcaster = mock(DashboardEventBroadcaster.class);
         monitor = new DeviceHealthMonitor(deviceRepository, incidentRepository,
-                incidentService, dashboardService, dashboardBroadcaster);
+                incidentService, dashboardService, dashboardBroadcaster, null);
+        // Self-reference for the @Transactional(REQUIRES_NEW) escalate indirection. The unit
+        // test points it at the same instance — that the proxy IS used is what
+        // DeviceMonitorTransactionIntegrationTest proves against the real transaction manager.
+        Field selfField = DeviceHealthMonitor.class.getDeclaredField("self");
+        selfField.setAccessible(true);
+        selfField.set(monitor, monitor);
     }
 
     @Test
@@ -64,8 +73,8 @@ class DeviceHealthMonitorTest {
         when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of(d));
         when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
         when(deviceRepository.findById(1L)).thenReturn(Optional.of(d));
-        when(incidentRepository.findOpenByDeviceAndEventType(eq(1L), eq("DEVICE_OFFLINE")))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(1L), eq("DEVICE_OFFLINE")))
+.thenReturn(false);
 
         var result = monitor.runHealthCheck();
 
@@ -82,8 +91,8 @@ class DeviceHealthMonitorTest {
         when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
         when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of(d));
         when(deviceRepository.findById(2L)).thenReturn(Optional.of(d));
-        when(incidentRepository.findOpenByDeviceAndEventType(eq(2L), eq("CONTENT_VERSION_MISMATCH")))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(2L), eq("CONTENT_VERSION_MISMATCH")))
+.thenReturn(false);
 
         var result = monitor.runHealthCheck();
 
@@ -101,8 +110,8 @@ class DeviceHealthMonitorTest {
         when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of(d));
         when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
         when(deviceRepository.findById(3L)).thenReturn(Optional.of(d));
-        when(incidentRepository.findOpenByDeviceAndEventType(eq(3L), eq("DEVICE_OFFLINE")))
-                .thenReturn(Optional.of(mock(Incident.class)));
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(3L), eq("DEVICE_OFFLINE")))
+.thenReturn(true);
 
         var result = monitor.runHealthCheck();
 
@@ -148,7 +157,8 @@ class DeviceHealthMonitorTest {
         when(deviceRepository.findById(11L)).thenThrow(new RuntimeException("DB hiccup"));
         when(deviceRepository.findById(12L)).thenReturn(Optional.of(good2));
 
-        when(incidentRepository.findOpenByDeviceAndEventType(any(), any())).thenReturn(Optional.empty());
+        when(incidentRepository.existsOpenByDeviceAndEventType(any(), any()))
+.thenReturn(false);
 
         var result = monitor.runHealthCheck();
 
@@ -164,8 +174,8 @@ class DeviceHealthMonitorTest {
         when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of(d));
         when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
         when(deviceRepository.findById(20L)).thenReturn(Optional.of(d));
-        when(incidentRepository.findOpenByDeviceAndEventType(eq(20L), eq("DEVICE_OFFLINE")))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(20L), eq("DEVICE_OFFLINE")))
+.thenReturn(false);
 
         monitor.runHealthCheck();
 
@@ -181,8 +191,8 @@ class DeviceHealthMonitorTest {
         when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of(d));
         when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
         when(deviceRepository.findById(21L)).thenReturn(Optional.of(d));
-        when(incidentRepository.findOpenByDeviceAndEventType(eq(21L), eq("DEVICE_OFFLINE")))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(21L), eq("DEVICE_OFFLINE")))
+.thenReturn(false);
         doThrow(new RuntimeException("redis down")).when(dashboardBroadcaster).deviceStatusChanged(any());
 
         var result = monitor.runHealthCheck();
@@ -190,6 +200,132 @@ class DeviceHealthMonitorTest {
         // The incident was still emitted and counted — a broadcast failure is swallowed.
         assertEquals(1, result.offlineEmitted());
         verify(incidentService).processEvent(any());
+    }
+
+    @Test
+    void offlineBroadcast_takesProjectFromTheEscalation_neverFromTheDetachedDevice() {
+        // LOGIC-03: the candidate list holds DETACHED devices — navigating their LAZY region
+        // throws LazyInitializationException. The stub makes that explicit; the project must come
+        // from the device escalate() re-read inside its own transaction.
+        Device detached = staleHeartbeatDevice(22L, Duration.ofMinutes(20));
+        when(detached.getRegion()).thenThrow(new IllegalStateException("LazyInitializationException"));
+        Device managed = staleHeartbeatDevice(22L, Duration.ofMinutes(20));
+        var project = mock(Project.class);
+        when(project.getId()).thenReturn(77L);
+        var region = mock(Region.class);
+        when(region.getProject()).thenReturn(project);
+        when(managed.getRegion()).thenReturn(region);
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of(detached));
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(deviceRepository.findById(22L)).thenReturn(Optional.of(managed));
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(22L), eq("DEVICE_OFFLINE")))
+.thenReturn(false);
+
+        monitor.runHealthCheck();
+
+        ArgumentCaptor<DeviceStatusPayload> captor = ArgumentCaptor.forClass(DeviceStatusPayload.class);
+        verify(dashboardBroadcaster).deviceStatusChanged(captor.capture());
+        assertEquals(77L, captor.getValue().projectId());
+    }
+
+    @Test
+    void escalate_returnsProjectIdOnlyWhenItEscalates() {
+        Device managed = staleHeartbeatDevice(23L, Duration.ofMinutes(20));
+        var project = mock(Project.class);
+        when(project.getId()).thenReturn(78L);
+        var region = mock(Region.class);
+        when(region.getProject()).thenReturn(project);
+        when(managed.getRegion()).thenReturn(region);
+        when(deviceRepository.findById(23L)).thenReturn(Optional.of(managed));
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(23L), eq("DEVICE_OFFLINE")))
+                .thenReturn(false, true);
+
+        var first = monitor.escalate(23L, "DEVICE_OFFLINE", Event.Priority.CRITICAL, "{}", Instant.now());
+        var second = monitor.escalate(23L, "DEVICE_OFFLINE", Event.Priority.CRITICAL, "{}", Instant.now());
+
+        assertEquals(new DeviceHealthMonitor.EscalationOutcome(true, 78L), first);
+        assertEquals(new DeviceHealthMonitor.EscalationOutcome(false, null), second);
+    }
+
+    // ===== LOGIC-01: recovery sweep for incidents the heartbeat did not close =====
+
+    @Test
+    void sweep_resolvesOpenOfflineIncidentOfRecoveredDevice_andInvalidatesDashboard() {
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(incidentRepository.findDeviceIdsWithOpenIncidentAndHeartbeatAfter(eq("DEVICE_OFFLINE"), any()))
+                .thenReturn(List.of(30L, 31L));
+        when(incidentService.autoResolveOnRecovery(30L, "DEVICE_OFFLINE")).thenReturn(true);
+        when(incidentService.autoResolveOnRecovery(31L, "DEVICE_OFFLINE")).thenReturn(true);
+
+        monitor.runHealthCheck();
+
+        verify(incidentService).autoResolveOnRecovery(30L, "DEVICE_OFFLINE");
+        verify(incidentService).autoResolveOnRecovery(31L, "DEVICE_OFFLINE");
+        verify(dashboardService).invalidate();
+    }
+
+    @Test
+    void sweep_usesTheSameThresholdInstantAsTheEscalation() {
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+
+        monitor.runHealthCheck();
+
+        ArgumentCaptor<Instant> escalation = ArgumentCaptor.forClass(Instant.class);
+        ArgumentCaptor<Instant> sweep = ArgumentCaptor.forClass(Instant.class);
+        verify(deviceRepository).findRegisteredWithStaleHeartbeat(escalation.capture());
+        verify(incidentRepository).findDeviceIdsWithOpenIncidentAndHeartbeatAfter(eq("DEVICE_OFFLINE"), sweep.capture());
+        assertEquals(escalation.getValue(), sweep.getValue());
+        Instant expected = Instant.now().minus(DeviceHealthMonitor.HEARTBEAT_THRESHOLD);
+        assertTrue(Duration.between(sweep.getValue(), expected).abs().compareTo(Duration.ofSeconds(5)) < 0,
+                "threshold must be now - HEARTBEAT_THRESHOLD, was " + sweep.getValue());
+    }
+
+    @Test
+    void sweep_nothingResolved_doesNotInvalidateDashboard() {
+        // Negative: the incident was manually resolved meanwhile → autoResolve returns false.
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(incidentRepository.findDeviceIdsWithOpenIncidentAndHeartbeatAfter(eq("DEVICE_OFFLINE"), any()))
+                .thenReturn(List.of(32L));
+        when(incidentService.autoResolveOnRecovery(32L, "DEVICE_OFFLINE")).thenReturn(false);
+
+        monitor.runHealthCheck();
+
+        verify(dashboardService, never()).invalidate();
+    }
+
+    @Test
+    void sweep_failures_neverFailTheHealthCheck() {
+        Device d = staleHeartbeatDevice(33L, Duration.ofMinutes(20));
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of(d));
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(deviceRepository.findById(33L)).thenReturn(Optional.of(d));
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(33L), eq("DEVICE_OFFLINE")))
+.thenReturn(false);
+        when(incidentRepository.findDeviceIdsWithOpenIncidentAndHeartbeatAfter(any(), any()))
+                .thenThrow(new RuntimeException("db hiccup"));
+
+        var result = monitor.runHealthCheck();
+
+        assertEquals(1, result.offlineEmitted());
+        verify(dashboardService).invalidate();
+    }
+
+    @Test
+    void sweep_oneFailingResolve_doesNotBlockTheOthers() {
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(incidentRepository.findDeviceIdsWithOpenIncidentAndHeartbeatAfter(eq("DEVICE_OFFLINE"), any()))
+                .thenReturn(List.of(34L, 35L));
+        when(incidentService.autoResolveOnRecovery(34L, "DEVICE_OFFLINE")).thenThrow(new RuntimeException("boom"));
+        when(incidentService.autoResolveOnRecovery(35L, "DEVICE_OFFLINE")).thenReturn(true);
+
+        monitor.runHealthCheck();
+
+        verify(incidentService).autoResolveOnRecovery(35L, "DEVICE_OFFLINE");
+        verify(dashboardService).invalidate();
     }
 
     private static Device staleHeartbeatDevice(Long id, Duration sinceLastHeartbeat) {

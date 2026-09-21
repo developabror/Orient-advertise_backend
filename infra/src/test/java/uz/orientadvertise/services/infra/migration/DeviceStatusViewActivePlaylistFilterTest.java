@@ -59,7 +59,7 @@ class DeviceStatusViewActivePlaylistFilterTest {
             s.execute("INSERT INTO project (id, name, created_at, updated_at) "
                     + "VALUES (300, 'APProj', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
             // One region per device — isolates REGION-targeted assignments to a single device.
-            for (int r = 3001; r <= 3010; r++) {
+            for (int r = 3001; r <= 3011; r++) {
                 s.execute("INSERT INTO region (id, project_id, name, code, created_at, updated_at) "
                         + "VALUES (" + r + ", 300, 'R" + r + "', 'RC" + r + "', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
             }
@@ -75,6 +75,8 @@ class DeviceStatusViewActivePlaylistFilterTest {
             playlist(s, 3109, "Tie-Old");
             playlist(s, 3110, "Tie-New");
             playlist(s, 3111, "Facility-D10");
+            playlist(s, 3112, "Confirmed-Earlier");
+            playlist(s, 3113, "Confirmed-Later");
             playlist(s, 3199, "Hidden");   // referenced by non-winning assignments (FK NOT NULL)
 
             device(s, 3001, 3001, null, "SN-AP-1");
@@ -91,6 +93,8 @@ class DeviceStatusViewActivePlaylistFilterTest {
                     + "created_at, updated_at, last_heartbeat_at) VALUES "
                     + "(3010, 3010, 3010, 'SN-AP-10', 'SN-AP-10', 'ONLINE', "
                     + "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+
+            device(s, 3011, 3011, null, "SN-AP-11");
 
             // D1: CONFIRMED, active. start_time = now (inclusive-start boundary) → MATCHES.
             s.execute("INSERT INTO content_assignment (id, playlist_id, target_type, target_id, priority, "
@@ -120,6 +124,13 @@ class DeviceStatusViewActivePlaylistFilterTest {
             assignment(s, 3210, 3110, "REGION", 3008, 1, "CONFIRMED", false);
             // D10: CONFIRMED active FACILITY assignment (priority 2) → has "Facility-D10".
             assignment(s, 3211, 3111, "FACILITY", 3010, 2, "CONFIRMED", false);
+            // D11: two same-target, same-priority CONFIRMED rows whose ids run AGAINST their
+            // confirm order — the HIGHER id (3213) was confirmed a day EARLIER. Under the pre-V48
+            // "priority DESC, id DESC" tie-break the stale one would win; V48 orders on
+            // COALESCE(confirmed_at, created_at) DESC first, so "Confirmed-Later" must win
+            // (case h). This is the view half of ContentAssignment.PRECEDENCE.
+            confirmedAssignment(s, 3213, 3112, 3011, "CURRENT_TIMESTAMP - INTERVAL '1' DAY");
+            confirmedAssignment(s, 3212, 3113, 3011, "CURRENT_TIMESTAMP");
             // D9: no assignment at all → no playlist.
         }
     }
@@ -153,6 +164,20 @@ class DeviceStatusViewActivePlaylistFilterTest {
                 + "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP" + (deleted ? ", CURRENT_TIMESTAMP" : "") + ")");
     }
 
+    /**
+     * A CONFIRMED REGION assignment active over [now-1h, now+1h) with an EXPLICIT confirmed_at —
+     * {@code confirmedAtSql} is a SQL expression, so the caller controls the precedence instant
+     * independently of the id.
+     */
+    private static void confirmedAssignment(Statement s, long id, long playlistId, long regionId,
+                                            String confirmedAtSql) throws Exception {
+        s.execute("INSERT INTO content_assignment (id, playlist_id, target_type, target_id, priority, "
+                + "start_time, end_time, status, created_at, updated_at, confirmed_at) VALUES "
+                + "(" + id + ", " + playlistId + ", 'REGION', " + regionId + ", 1, "
+                + "CURRENT_TIMESTAMP - INTERVAL '1' HOUR, CURRENT_TIMESTAMP + INTERVAL '1' HOUR, "
+                + "'CONFIRMED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, " + confirmedAtSql + ")");
+    }
+
     private Map<String, DeviceStatusView> myRows(Boolean hasActivePlaylist) {
         var page = repository.findFiltered(null, null, null, null, null, null, null, null, null,
                 hasActivePlaylist, null /* syncUnassigned */, null /* projectIds */, PageRequest.of(0, 200));
@@ -165,8 +190,8 @@ class DeviceStatusViewActivePlaylistFilterTest {
     void hasActivePlaylistTrue_returnsOnlyDevicesWithResolvedPlaylist_withCorrectWinner() {
         var rows = myRows(Boolean.TRUE);
 
-        assertEquals(java.util.Set.of("SN-AP-1", "SN-AP-7", "SN-AP-8", "SN-AP-10"), rows.keySet(),
-                "TRUE bucket = devices with a resolved active playlist now");
+        assertEquals(java.util.Set.of("SN-AP-1", "SN-AP-7", "SN-AP-8", "SN-AP-10", "SN-AP-11"),
+                rows.keySet(), "TRUE bucket = devices with a resolved active playlist now");
         // id + name both populated, and name matches the winning playlist.
         rows.values().forEach(v -> {
             assertTrue(v.getActivePlaylistId() != null, "id set for " + v.getSerialNumber());
@@ -179,6 +204,8 @@ class DeviceStatusViewActivePlaylistFilterTest {
                 "same-target same-priority tie broken by id DESC → higher-id assignment wins");
         assertEquals("Facility-D10", rows.get("SN-AP-10").getActivePlaylistName(),
                 "FACILITY-targeted assignment resolves the device's playlist");
+        assertEquals("Confirmed-Later", rows.get("SN-AP-11").getActivePlaylistName(),
+                "V48 tie-break: most recently CONFIRMED wins, even though the other row's id is higher");
     }
 
     @Test
@@ -195,7 +222,7 @@ class DeviceStatusViewActivePlaylistFilterTest {
 
     @Test
     void hasActivePlaylistNull_returnsAll() {
-        assertEquals(10, myRows(null).size(), "null filter = no constraint");
+        assertEquals(11, myRows(null).size(), "null filter = no constraint");
     }
 
     @Test
@@ -210,6 +237,9 @@ class DeviceStatusViewActivePlaylistFilterTest {
         // inclusive start boundary + priority + tie-break + FACILITY already asserted in the TRUE test.
         assertEquals(3101L, all.get("SN-AP-1").getActivePlaylistId(), "start_time = now is inclusive → matches");
         assertEquals(3111L, all.get("SN-AP-10").getActivePlaylistId(), "FACILITY target resolves the playlist");
+        // (h) the V48 recency tie-break — id DESC alone would have picked 3213 / "Confirmed-Earlier".
+        assertEquals(3113L, all.get("SN-AP-11").getActivePlaylistId(),
+                "COALESCE(confirmed_at, created_at) DESC outranks id DESC");
     }
 
     @Test

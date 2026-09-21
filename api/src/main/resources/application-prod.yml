@@ -48,4 +48,4 @@ app:
     raw-bucket: content-raw
     thumbnail-bucket: ${MINIO_THUMBNAIL_BUCKET:content-thumbnails}
     presigned-url-expiry-minutes: ${MINIO_PRESIGNED_EXPIRY:120}
-    orphan-cleanup-after-hours: 24
+    raw-expiry-days: ${MINIO_RAW_EXPIRY_DAYS:30}

@@ -6,6 +6,7 @@ import java.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -22,6 +23,11 @@ import uz.orientadvertise.services.domain.repository.DeviceRepository;
  * After escalating, the device's pending markers are cleared so we don't re-emit the
  * same event every minute. Operators close the incident manually; the next /sync call
  * will re-arm the timer if the device is still misbehaving.
+ *
+ * <p>{@link #escalate} is called through {@code self}, the transactional proxy. Before
+ * v1.0.140 it was called on {@code this}, which bypasses the proxy: {@code REQUIRES_NEW} never
+ * applied, the device was detached, {@code clearSyncPending()} was never written, and the same
+ * device re-escalated every minute forever.
  */
 @Component
 public class SyncTimeoutMonitor {
@@ -31,19 +37,22 @@ public class SyncTimeoutMonitor {
 
     private final DeviceRepository deviceRepository;
     private final IncidentService incidentService;
+    private final SyncTimeoutMonitor self;
 
     @Value("${app.device.sync-timeout-minutes:30}")
     private long syncTimeoutMinutes;
 
-    public SyncTimeoutMonitor(DeviceRepository deviceRepository, IncidentService incidentService) {
+    public SyncTimeoutMonitor(DeviceRepository deviceRepository, IncidentService incidentService,
+                              @Lazy SyncTimeoutMonitor self) {
         this.deviceRepository = deviceRepository;
         this.incidentService = incidentService;
+        this.self = self;
     }
 
     @Scheduled(fixedDelayString = "PT1M", initialDelayString = "PT1M")
     public void scanForStuckSyncs() {
         Instant threshold = Instant.now().minus(Duration.ofMinutes(syncTimeoutMinutes));
-        var stuck = deviceRepository.findBySyncPendingSinceLessThan(threshold);
+        var stuck = deviceRepository.findBySyncPendingSinceLessThanAndDeletedAtIsNull(threshold);
         if (stuck.isEmpty()) {
             return;
         }
@@ -52,7 +61,7 @@ public class SyncTimeoutMonitor {
             // Each device is escalated in its own transaction so a failure on one
             // doesn't block the rest of the batch.
             try {
-                escalate(device.getId());
+                self.escalate(device.getId());
             } catch (Exception e) {
                 log.warn("Sync timeout escalation failed for device {}: {}", device.getId(), e.getMessage());
             }
@@ -63,9 +72,10 @@ public class SyncTimeoutMonitor {
     public void escalate(Long deviceId) {
         var device = deviceRepository.findById(deviceId).orElse(null);
         // A soft-deleted device is out of the operational fleet — never open an incident for
-        // it. softDelete() leaves syncPendingSince untouched, so a device deleted mid-sync
-        // still surfaces in findBySyncPendingSinceLessThan; this guard is the chokepoint that
-        // keeps SYNC_TIMEOUT symmetric with DeviceHealthMonitor.escalate's isDeleted() check.
+        // it. softDelete() leaves syncPendingSince untouched; the scan query now skips deleted
+        // devices, but one deleted between that query and this re-read still arrives here, so
+        // this guard stays the chokepoint that keeps SYNC_TIMEOUT symmetric with
+        // DeviceHealthMonitor.escalate's isDeleted() check.
         if (device == null || device.isDeleted() || device.getSyncPendingSince() == null) {
             return;
         }

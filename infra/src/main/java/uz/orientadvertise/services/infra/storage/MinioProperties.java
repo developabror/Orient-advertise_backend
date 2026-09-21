@@ -1,5 +1,6 @@
 package uz.orientadvertise.services.infra.storage;
 
+import java.time.Duration;
 import java.util.List;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -36,7 +37,36 @@ public class MinioProperties {
     private int presignedUrlExpiryMinutes = 60;
     private String rawBucket = "content-raw";
     private String thumbnailBucket = "content-thumbnails";
-    private int orphanCleanupAfterHours = 24;
+    /**
+     * Days after upload that a raw original under {@code raw/} is deleted by MinIO's lifecycle
+     * engine. {@code 0} disables installation entirely.
+     *
+     * <p>Replaces the former {@code orphan-cleanup-after-hours}, whose abort-incomplete-multipart
+     * rule MinIO rejected on every boot (see {@link RawBucketLifecycleInstaller}). MinIO sweeps
+     * stale multipart uploads itself via {@code stale_uploads_expiry}, so nothing is lost by
+     * dropping that action — and unlike it, this rule actually installs and actually reclaims space.
+     *
+     * <p>The processed MP4 and the poster are NEVER expired; only the source is. The cost of a short
+     * window is that {@code POST /api/content/{id}/retranscode} stops working once the source is
+     * gone.
+     */
+    private int rawExpiryDays = 30;
+    /**
+     * How often {@link MinioHealthProbe} re-probes MinIO <em>while storage is degraded</em>. When
+     * storage is healthy the probe costs one field read per tick and issues no MinIO call at all,
+     * so this is purely "how fast does an outage heal", not a polling budget.
+     *
+     * <p>Before v1.0.144 the answer was "never": {@link MinioHealthStatus} could only be set back
+     * to UP by the startup {@link MinioBucketInitializer}, so any blip 503'd storage until someone
+     * restarted the application.
+     *
+     * <p><b>Write it as an ISO-8601 duration</b> ({@code PT30S}, {@code PT2M}). This value is read
+     * twice — once bound here, once by {@code @Scheduled(fixedDelayString = ...)} — and the two
+     * readers agree on every input <em>only</em> because neither declares a unit: a bare number is
+     * milliseconds to both. Adding {@code @DurationUnit} here would make {@code 30} mean 30 seconds
+     * to this field and 30 milliseconds to the scheduler that actually drives the probe.
+     */
+    private Duration recheckInterval = Duration.ofSeconds(30);
 
     public String getUrl() {
         return url;
@@ -114,11 +144,19 @@ public class MinioProperties {
         this.thumbnailBucket = thumbnailBucket;
     }
 
-    public int getOrphanCleanupAfterHours() {
-        return orphanCleanupAfterHours;
+    public int getRawExpiryDays() {
+        return rawExpiryDays;
     }
 
-    public void setOrphanCleanupAfterHours(int orphanCleanupAfterHours) {
-        this.orphanCleanupAfterHours = orphanCleanupAfterHours;
+    public void setRawExpiryDays(int rawExpiryDays) {
+        this.rawExpiryDays = rawExpiryDays;
+    }
+
+    public Duration getRecheckInterval() {
+        return recheckInterval;
+    }
+
+    public void setRecheckInterval(Duration recheckInterval) {
+        this.recheckInterval = recheckInterval;
     }
 }

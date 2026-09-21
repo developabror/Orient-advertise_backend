@@ -87,6 +87,22 @@ class AuthControllerTest {
     }
 
     @Test
+    void login_rateLimitKey_isTheResolvedRemoteAddress_notAClientSuppliedForwardedFor() throws Exception {
+        // AUTH-04: Tomcat's RemoteIpValve resolves forwarding (only from trusted proxies). The
+        // controller must not read X-Forwarded-For itself, or any client picks its own bucket.
+        when(authService.login(any())).thenReturn(new AuthToken("access-jwt", "refresh-id"));
+
+        mockMvc.perform(post("/api/auth/login")
+                        .with(request -> { request.setRemoteAddr("203.0.113.9"); return request; })
+                        .header("X-Forwarded-For", "9.9.9.9")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content("{\"username\":\"alice\",\"password\":\"secret123\"}"))
+                .andExpect(status().isOk());
+
+        verify(loginRateLimiter).checkAllowed("203.0.113.9", "alice");
+    }
+
+    @Test
     void refresh_success_rotatesCookieAndReturnsNewAccessToken() throws Exception {
         when(authService.refresh("old-refresh")).thenReturn(new AuthToken("new-access", "new-refresh"));
 

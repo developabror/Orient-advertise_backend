@@ -33,11 +33,22 @@ import uz.orientadvertise.services.common.telegram.TelegramMessageBuilder;
 import uz.orientadvertise.services.common.telegram.TelegramMessageBuilder.Severity;
 import uz.orientadvertise.services.domain.notification.TelegramNotifier;
 import uz.orientadvertise.services.service.exception.AssignmentTimeOverlapException;
+import uz.orientadvertise.services.service.exception.RemoteCapabilityUnsupportedException;
+import uz.orientadvertise.services.service.exception.RemoteControlDisabledException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /**
+     * Constant alert text — see {@link #handleStorageUnavailable}. It must stay free of
+     * per-request values (correlation id, bucket, key, exception message) so the Telegram rate
+     * limiter's per-message-hash window can actually fold a flood of them.
+     */
+    static final String STORAGE_UNAVAILABLE_ALERT =
+            "Object storage unavailable — requests are being refused with 503. "
+            + "See the 'storage' component on GET /api/health for the reason and how long.";
     private static final int STACK_FRAMES = 5;
 
     @Value("${app.error.include-stacktrace:false}")
@@ -104,7 +115,8 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException e) {
         var correlationId = correlationId();
         var fieldErrors = e.getBindingResult().getFieldErrors().stream()
-                .map(fe -> new FieldError(fe.getField(), fe.getDefaultMessage(), fe.getRejectedValue()))
+                .map(fe -> new FieldError(fe.getField(), fe.getDefaultMessage(),
+                        safeRejectedValue(fe.getField(), fe.getRejectedValue())))
                 .toList();
         log.debug("Validation failed [correlationId={}]: {} field error(s)", correlationId, fieldErrors.size());
         return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed",
@@ -118,7 +130,7 @@ public class GlobalExceptionHandler {
                 .map(cv -> new FieldError(
                         cv.getPropertyPath().toString(),
                         cv.getMessage(),
-                        cv.getInvalidValue()))
+                        safeRejectedValue(cv.getPropertyPath().toString(), cv.getInvalidValue())))
                 .toList();
         return buildResponse(HttpStatus.BAD_REQUEST, "Validation Failed",
                 "Constraint violation — see fieldErrors for details", correlationId, fieldErrors);
@@ -199,7 +211,7 @@ public class GlobalExceptionHandler {
                 correlationId, e.getTargetType(), e.getTargetId(), e.getConflicts().size());
         var conflicts = e.getConflicts().stream()
                 .map(c -> new ConflictWindow(c.id(), c.playlistId(), c.playlistName(), c.status(),
-                        c.startTime(), c.endTime(), c.conflictingDeviceIds()))
+                        c.startTime(), c.endTime(), c.conflictingDeviceIds(), c.remainingDeviceCount()))
                 .toList();
         var details = new ConflictDetails(
                 "ASSIGNMENT_TIME_OVERLAP",
@@ -222,6 +234,22 @@ public class GlobalExceptionHandler {
         return buildResponse(HttpStatus.CONFLICT, "Conflict", message, correlationId, null);
     }
 
+    // --- 422 Unprocessable Entity ---
+
+    /**
+     * The request is well-formed and authorised, but the target cannot satisfy it and retrying
+     * will not help — today that means a device that has explicitly reported it does not support
+     * remote control. Distinct from 400 (the request is fine) and from 409 (nothing about the
+     * current state is going to change).
+     */
+    @ExceptionHandler(RemoteCapabilityUnsupportedException.class)
+    public ResponseEntity<ErrorResponse> handleCapabilityUnsupported(RemoteCapabilityUnsupportedException e) {
+        var correlationId = correlationId();
+        log.debug("Capability unsupported [correlationId={}]: {}", correlationId, e.getMessage());
+        return buildResponse(HttpStatus.UNPROCESSABLE_ENTITY, "Unprocessable Entity",
+                e.getMessage(), correlationId, null);
+    }
+
     // --- 429 Too Many Requests ---
 
     @ExceptionHandler(uz.orientadvertise.services.common.exception.RateLimitExceededException.class)
@@ -242,10 +270,44 @@ public class GlobalExceptionHandler {
         return buildResponse(HttpStatus.BAD_REQUEST, "Invalid Upload", e.getMessage(), correlationId, null);
     }
 
+    /**
+     * A capability that exists in the build but is switched off for this deployment
+     * ({@code app.remote.enabled=false}). 503, not 404: the route exists, it is just not being
+     * offered — and the caller cannot fix it by changing the request.
+     */
+    @ExceptionHandler(RemoteControlDisabledException.class)
+    public ResponseEntity<ErrorResponse> handleRemoteControlDisabled(RemoteControlDisabledException e) {
+        var correlationId = correlationId();
+        log.debug("Remote control disabled [correlationId={}]: {}", correlationId, e.getMessage());
+        return buildResponse(HttpStatus.SERVICE_UNAVAILABLE, "Service Unavailable",
+                e.getMessage(), correlationId, null);
+    }
+
+    /**
+     * Object storage refused the request. Since v1.0.144 this is reachable once per device per
+     * sync interval during a MinIO outage, so it is logged in two parts on purpose:
+     *
+     * <ul>
+     *   <li>a <b>constant-text</b> WARN, which is what reaches the operator Telegram chat.
+     *       {@code TelegramRateLimiter} keys its 5-per-5-minutes window on a SHA-256 of the
+     *       rendered message, so a per-request correlation id in the text made every occurrence a
+     *       distinct hash: the per-hash fold never applied, only the global 30/minute cap did, and
+     *       a fleet-wide outage would evict every other alert — including the ones about the
+     *       outage — from a 500-entry appender buffer.</li>
+     *   <li>an INFO line carrying the correlation id and the detail. INFO is below the appender's
+     *       WARN threshold, so it never reaches Telegram and never counts against any budget,
+     *       while the id the caller was handed stays greppable in the console/file log.</li>
+     * </ul>
+     *
+     * WARN rather than ERROR for the same reason the v1.0.137 rule exists: a caller-triggerable
+     * outcome must not be able to burn the alert budget, and the storage component on
+     * {@code /api/health} is the authoritative signal for how long this has been going on.
+     */
     @ExceptionHandler(StorageUnavailableException.class)
     public ResponseEntity<ErrorResponse> handleStorageUnavailable(StorageUnavailableException e) {
         var correlationId = correlationId();
-        log.error("Storage unavailable [correlationId={}]: {}", correlationId, e.getMessage());
+        log.warn(STORAGE_UNAVAILABLE_ALERT);
+        log.info("Storage unavailable detail [correlationId={}]: {}", correlationId, e.getMessage());
         return buildResponse(HttpStatus.SERVICE_UNAVAILABLE, "Service Unavailable",
                 e.getMessage(), correlationId, null);
     }
@@ -346,10 +408,28 @@ public class GlobalExceptionHandler {
         return b.buildChunks();
     }
 
-    private static String safePath(HttpServletRequest request) {
+    /**
+     * The path for the ops alert. Query values of sensitive parameters are masked: a 500 on
+     * {@code GET /api/auth/reset-password?token=…} must not post a live reset token to Telegram.
+     */
+    static String safePath(HttpServletRequest request) {
         String uri = request.getRequestURI();
         String query = request.getQueryString();
-        return query == null ? uri : uri + "?" + query;
+        if (query == null) {
+            return uri;
+        }
+        var masked = new StringBuilder();
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            String name = eq < 0 ? pair : pair.substring(0, eq);
+            if (masked.length() > 0) {
+                masked.append('&');
+            }
+            masked.append(eq >= 0 && uz.orientadvertise.services.common.util.SensitiveFieldMasker.isSensitiveKey(name)
+                    ? name + "=" + uz.orientadvertise.services.common.util.SensitiveFieldMasker.MASKED_VALUE
+                    : pair);
+        }
+        return uri + "?" + masked;
     }
 
     /**
@@ -419,6 +499,25 @@ public class GlobalExceptionHandler {
     public record FieldError(String field, String message, Object rejectedValue) {}
 
     /**
+     * AUTH-06: a rejected value is echoed to the client and — via AuditFilter — into audit_log. For a
+     * credential field (a too-short password on POST /api/users or login) that echo is the secret
+     * itself, so it is dropped when ANY segment of the field path is a credential name
+     * ({@code items[0].password}, {@code create.request.newPassword}, a map key {@code props[password]},
+     * a container element {@code passwords[0].<list element>}).
+     */
+    static Object safeRejectedValue(String field, Object rejectedValue) {
+        if (field == null) {
+            return rejectedValue;
+        }
+        for (String segment : field.split("[.\\[\\]<> ]")) {
+            if (uz.orientadvertise.services.common.util.SensitiveFieldMasker.isSensitiveKey(segment)) {
+                return null;
+            }
+        }
+        return rejectedValue;
+    }
+
+    /**
      * Structured {@code details} for {@link AssignmentTimeOverlapException} (409). {@code code}
      * is a stable machine token; {@code conflicts} carry each clashing assignment's id + UTC
      * window so the frontend can localize "already booked until X".
@@ -426,6 +525,12 @@ public class GlobalExceptionHandler {
     public record ConflictDetails(String code, String targetType, Long targetId,
                                   List<ConflictWindow> conflicts) {}
 
+    /**
+     * {@code remainingDeviceCount} is appended LAST so the JSON stays back-compat: how many of the
+     * conflicting assignment's own devices keep playing it if the operator replaces (i.e. Replace
+     * narrows it rather than retiring it). {@code 0} on the conservative path.
+     */
     public record ConflictWindow(Long id, Long playlistId, String playlistName, String status,
-                                 Instant startTime, Instant endTime, List<Long> conflictingDeviceIds) {}
+                                 Instant startTime, Instant endTime, List<Long> conflictingDeviceIds,
+                                 int remainingDeviceCount) {}
 }

@@ -80,6 +80,10 @@ class DeviceControllerTest {
     @MockitoBean
     private uz.orientadvertise.services.service.DeviceDiagnosticsService diagnosticsService;
 
+    /** Live socket map behind GET /{id}/connection — the port, not the WS handler itself. */
+    @MockitoBean
+    private uz.orientadvertise.services.domain.content.DevicePushChannel devicePushChannel;
+
     @MockitoBean
     private TokenValidator tokenValidator;
 
@@ -129,6 +133,149 @@ class DeviceControllerTest {
     }
 
     @Test
+    void register_alreadyRegisteredWithoutAdminWindow_returns409_onTheReregistrationBudget() throws Exception {
+        // AUTH-02: refused takeover. Counted on the re-registration budget, not the new-device
+        // one, so a wiped box's retries don't starve new boxes behind the same NAT.
+        when(registrationService.isRegistered("SN-TAKEN")).thenReturn(true);
+        when(registrationService.register(eq("SN-TAKEN"), any()))
+                .thenThrow(new uz.orientadvertise.services.service.exception.DeviceAlreadyRegisteredException("SN-TAKEN", 9L));
+
+        mockMvc.perform(post("/api/devices/register")
+                        .with(request -> { request.setRemoteAddr("203.0.113.7"); return request; })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"serialNumber\":\"SN-TAKEN\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.deviceToken").doesNotExist());
+
+        verify(registrationRateLimiter).checkReregistration("203.0.113.7");
+        org.mockito.Mockito.verify(registrationRateLimiter, org.mockito.Mockito.never()).check(any());
+    }
+
+    @Test
+    void register_newSerial_usesTheNewDeviceBudget() throws Exception {
+        when(registrationService.register(eq("SN-OK"), any()))
+                .thenReturn(new RegistrationResult(4L, "dtk_ok", "SN-OK", true, null));
+
+        mockMvc.perform(post("/api/devices/register")
+                        .with(request -> { request.setRemoteAddr("203.0.113.8"); return request; })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"serialNumber\":\"SN-OK\"}"))
+                .andExpect(status().isCreated());
+
+        verify(registrationRateLimiter).check("203.0.113.8");
+        org.mockito.Mockito.verify(registrationRateLimiter, org.mockito.Mockito.never()).checkReregistration(any());
+    }
+
+    @Test
+    void register_rateLimitKey_isTheResolvedRemoteAddress_notAClientSuppliedForwardedFor() throws Exception {
+        // AUTH-04: RemoteIpValve resolves forwarding (trusted proxies only); the controller must not.
+        when(registrationService.register(eq("SN-XFF"), any()))
+                .thenReturn(new RegistrationResult(6L, "dtk_xff", "SN-XFF", true, null));
+
+        mockMvc.perform(post("/api/devices/register")
+                        .with(request -> { request.setRemoteAddr("203.0.113.9"); return request; })
+                        .header("X-Forwarded-For", "9.9.9.9")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"serialNumber\":\"SN-XFF\"}"))
+                .andExpect(status().isCreated());
+
+        verify(registrationRateLimiter).check("203.0.113.9");
+    }
+
+    @Test
+    void register_serialWithTrailingNewline_returns400() throws Exception {
+        mockMvc.perform(post("/api/devices/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"serialNumber\":\"SN-1\\n\"}"))
+                .andExpect(status().isBadRequest());
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    void allowReregistration_anonymous_returns401() throws Exception {
+        mockMvc.perform(post("/api/devices/7/reregistration-window"))
+                .andExpect(status().isUnauthorized());
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    void register_overlongSerial_returns400() throws Exception {
+        mockMvc.perform(post("/api/devices/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"serialNumber\":\"" + "A".repeat(101) + "\"}"))
+                .andExpect(status().isBadRequest());
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    void register_serialWithFormulaOrIllegalCharacters_returns400() throws Exception {
+        for (String serial : new String[] {"=HYPERLINK(1)", "-SN", "SN 1", "SN\\u0000"}) {
+            mockMvc.perform(post("/api/devices/register")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"serialNumber\":\"" + serial + "\"}"))
+                    .andExpect(status().isBadRequest());
+        }
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    void register_realWorldSerialFormats_areAccepted() throws Exception {
+        // FAKE-TV-n seeds, ANDROID_ID hex, a persisted UUID, a MAC-style hardware id.
+        for (String serial : new String[] {"FAKE-TV-1", "9774d56d682e549c", "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+                "00:1A:2B:3C:4D:5E"}) {
+            when(registrationService.register(eq(serial), any()))
+                    .thenReturn(new RegistrationResult(5L, "dtk_fmt", serial, true, null));
+            mockMvc.perform(post("/api/devices/register")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"serialNumber\":\"" + serial + "\"}"))
+                    .andExpect(status().isCreated());
+        }
+    }
+
+    @Test
+    void register_overlongDeviceName_returns400() throws Exception {
+        mockMvc.perform(post("/api/devices/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"serialNumber\":\"SN-NAME\",\"deviceName\":\"" + "n".repeat(201) + "\"}"))
+                .andExpect(status().isBadRequest());
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "ADMIN")
+    void allowReregistration_admin_returnsWindowEnd() throws Exception {
+        when(registrationService.allowReregistration(7L)).thenReturn(Instant.parse("2026-09-19T12:00:00Z"));
+
+        mockMvc.perform(post("/api/devices/7/reregistration-window"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.allowedUntil").value("2026-09-19T12:00:00Z"));
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "OPERATOR")
+    void allowReregistration_operator_forbidden() throws Exception {
+        mockMvc.perform(post("/api/devices/7/reregistration-window"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    void allowReregistration_deviceToken_forbidden() throws Exception {
+        mockMvc.perform(post("/api/devices/7/reregistration-window").with(device(7L)))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(registrationService);
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "ADMIN")
+    void allowReregistration_unknownDevice_returns404() throws Exception {
+        when(registrationService.allowReregistration(404L)).thenThrow(new ResourceNotFoundException("Device", 404L));
+
+        mockMvc.perform(post("/api/devices/404/reregistration-window"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     void register_missingSerialNumber_returns400() throws Exception {
         mockMvc.perform(post("/api/devices/register")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -160,7 +307,7 @@ class DeviceControllerTest {
 
     @Test
     void heartbeat_knownDevice_returns200WithPendingActions() throws Exception {
-        when(heartbeatService.processHeartbeat(org.mockito.ArgumentMatchers.eq(1L), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+        when(heartbeatService.processHeartbeat(org.mockito.ArgumentMatchers.eq(1L), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                 .thenReturn(new HeartbeatResult(1L, Device.Status.ONLINE, List.of()));
 
         mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1)))
@@ -173,8 +320,37 @@ class DeviceControllerTest {
     }
 
     @Test
+    void heartbeat_resolvesRecoveredIncidents_afterTheBeatReturns_withItsResult() throws Exception {
+        // processHeartbeat commits when it returns; only then may the recovered incidents be
+        // closed — one pooled connection at a time, and never able to roll the beat back.
+        var result = new HeartbeatResult(1L, Device.Status.ONLINE, List.of(), null, false, 100, null, null,
+                List.of("DEVICE_OFFLINE"));
+        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), any(), any())).thenReturn(result);
+
+        mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1)))
+                .andExpect(status().isOk())
+                // Server-internal: the resolve list never reaches the wire.
+                .andExpect(jsonPath("$.resolveIncidentTypes").doesNotExist());
+
+        var order = org.mockito.Mockito.inOrder(heartbeatService);
+        order.verify(heartbeatService).processHeartbeat(eq(1L), any(), any(), any(), any());
+        order.verify(heartbeatService).resolveRecoveredIncidents(1L, result);
+    }
+
+    @Test
+    void heartbeat_unknownDevice_neverResolvesAnything() throws Exception {
+        when(heartbeatService.processHeartbeat(eq(998L), any(), any(), any(), any()))
+                .thenThrow(new ResourceNotFoundException("Device", 998L));
+
+        mockMvc.perform(post("/api/devices/998/heartbeat").with(device(998)))
+                .andExpect(status().isNotFound());
+
+        verify(heartbeatService, org.mockito.Mockito.never()).resolveRecoveredIncidents(any(), any());
+    }
+
+    @Test
     void heartbeat_unknownDevice_returns404() throws Exception {
-        when(heartbeatService.processHeartbeat(org.mockito.ArgumentMatchers.eq(999L), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+        when(heartbeatService.processHeartbeat(org.mockito.ArgumentMatchers.eq(999L), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                 .thenThrow(new ResourceNotFoundException("Device", 999L));
 
         mockMvc.perform(post("/api/devices/999/heartbeat").with(device(999)))
@@ -184,7 +360,7 @@ class DeviceControllerTest {
 
     @Test
     void heartbeat_emptyPendingActions_stillReturnsArray() throws Exception {
-        when(heartbeatService.processHeartbeat(org.mockito.ArgumentMatchers.eq(2L), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+        when(heartbeatService.processHeartbeat(org.mockito.ArgumentMatchers.eq(2L), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                 .thenReturn(new HeartbeatResult(2L, Device.Status.ONLINE, List.of()));
 
         mockMvc.perform(post("/api/devices/2/heartbeat").with(device(2)))
@@ -215,7 +391,7 @@ class DeviceControllerTest {
     void heartbeat_roundTripsVolumeIntoDesiredVolume() throws Exception {
         // Device reports its current volume (45); the resolved target (70) comes back as desiredVolume.
         // The resolved sync group ("fac-9") is echoed alongside so a relocated device re-groups every beat.
-        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), eq(45)))
+        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), eq(45), any()))
                 .thenReturn(new HeartbeatResult(1L, Device.Status.ONLINE, List.of(), null, false, 70, "fac-9"));
 
         mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1))
@@ -225,6 +401,149 @@ class DeviceControllerTest {
                 .andExpect(jsonPath("$.deviceId").value(1))
                 .andExpect(jsonPath("$.desiredVolume").value(70))
                 .andExpect(jsonPath("$.syncGroupId").value("fac-9"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Remote view/control — heartbeat capability up / desired state down, and live liveness
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void heartbeat_withRemoteCapabilityBlock_isLiftedOntoTheService() throws Exception {
+        var captured = org.mockito.ArgumentCaptor.forClass(
+                uz.orientadvertise.services.service.DeviceHeartbeatService.RemoteCapabilityReport.class);
+        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), any(), any()))
+                .thenReturn(new HeartbeatResult(1L, Device.Status.ONLINE, List.of()));
+
+        mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"contentVersion":"c6fe","volume":45,
+                                 "remote":{"supported":true,"input":"ROOT","transport":"SCRCPY_WS",
+                                           "maxWidth":1280,"maxHeight":720}}"""))
+                .andExpect(status().isOk());
+
+        verify(heartbeatService).processHeartbeat(eq(1L), eq("c6fe"), any(), eq(45), captured.capture());
+        org.junit.jupiter.api.Assertions.assertEquals(true, captured.getValue().supported());
+        org.junit.jupiter.api.Assertions.assertEquals("ROOT", captured.getValue().input());
+        org.junit.jupiter.api.Assertions.assertEquals("SCRCPY_WS", captured.getValue().transport());
+        org.junit.jupiter.api.Assertions.assertEquals(1280, captured.getValue().maxWidth());
+        org.junit.jupiter.api.Assertions.assertEquals(720, captured.getValue().maxHeight());
+    }
+
+    @Test
+    void heartbeat_oldClientWithoutRemoteField_succeedsAndSendsNullCapability() throws Exception {
+        // The back-compat guarantee: an un-upgraded device's exact body still works, and the
+        // response is byte-for-byte the old one apart from the new nullable key.
+        var captured = org.mockito.ArgumentCaptor.forClass(
+                uz.orientadvertise.services.service.DeviceHeartbeatService.RemoteCapabilityReport.class);
+        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), any(), any()))
+                .thenReturn(new HeartbeatResult(1L, Device.Status.ONLINE, List.of(), "c6fe", false, 70, "fac-9"));
+
+        mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"contentVersion\":\"c6fe\",\"volume\":45}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.deviceId").value(1))
+                .andExpect(jsonPath("$.status").value("ONLINE"))
+                .andExpect(jsonPath("$.expectedContentVersion").value("c6fe"))
+                .andExpect(jsonPath("$.syncRequired").value(false))
+                .andExpect(jsonPath("$.desiredVolume").value(70))
+                .andExpect(jsonPath("$.syncGroupId").value("fac-9"))
+                .andExpect(jsonPath("$.pendingActions").isArray())
+                .andExpect(jsonPath("$.serverTime").exists())
+                .andReturn();
+
+        // Pin the actual wire: the ONLY difference from the pre-feature response is the added
+        // key, emitted as null. Existing clients ignore unknown/extra fields, so they are
+        // unaffected — this is the "byte-for-byte unchanged apart from the new nullable field"
+        // guarantee, asserted on the raw body rather than through a null-tolerant JsonPath.
+        var body = mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"contentVersion\":\"c6fe\",\"volume\":45}"))
+                .andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertTrue(body.contains("\"desiredRemoteSession\":null"), body);
+
+        verify(heartbeatService, org.mockito.Mockito.atLeastOnce())
+                .processHeartbeat(eq(1L), eq("c6fe"), any(), eq(45), captured.capture());
+        org.junit.jupiter.api.Assertions.assertNull(captured.getValue());
+    }
+
+    @Test
+    void heartbeat_unknownFieldsInRemoteBlock_doNotFailTheBeat() throws Exception {
+        // Forward compatibility in the other direction: a newer device sending extra keys.
+        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), any(), any()))
+                .thenReturn(new HeartbeatResult(1L, Device.Status.ONLINE, List.of()));
+
+        mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"remote\":{\"supported\":true,\"input\":\"ROOT\",\"codec\":\"h265\"}}"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void heartbeat_desiredRemoteSession_isRenderedWhenTheServerWantsOne() throws Exception {
+        var desired = new uz.orientadvertise.services.service.RemoteSessionService.DesiredRemoteSession(
+                "rs_7f3a91c4b8e24d5a", "wss://relay.example.uz/agent", "opaque.agent.ticket",
+                Instant.parse("2026-08-27T10:45:00Z"), false, 1280, 15, 2_000_000);
+        when(heartbeatService.processHeartbeat(eq(1L), any(), any(), any(), any()))
+                .thenReturn(new HeartbeatResult(1L, Device.Status.ONLINE, List.of(), null, false,
+                        70, "fac-9", desired));
+
+        mockMvc.perform(post("/api/devices/1/heartbeat").with(device(1)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.desiredRemoteSession.sessionId").value("rs_7f3a91c4b8e24d5a"))
+                .andExpect(jsonPath("$.desiredRemoteSession.relayUrl").value("wss://relay.example.uz/agent"))
+                .andExpect(jsonPath("$.desiredRemoteSession.agentTicket").value("opaque.agent.ticket"))
+                .andExpect(jsonPath("$.desiredRemoteSession.viewOnly").value(false))
+                .andExpect(jsonPath("$.desiredRemoteSession.maxWidth").value(1280))
+                .andExpect(jsonPath("$.desiredRemoteSession.maxFps").value(15))
+                .andExpect(jsonPath("$.desiredRemoteSession.bitRate").value(2000000));
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "OPERATOR")
+    void connection_reportsLiveSocketState_notTheLaggingView() throws Exception {
+        when(devicePushChannel.isConnected(7L)).thenReturn(true);
+
+        mockMvc.perform(get("/api/devices/7/connection"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.deviceId").value(7))
+                .andExpect(jsonPath("$.connected").value(true));
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "VIEWER")
+    void connection_isReadableByViewer() throws Exception {
+        when(devicePushChannel.isConnected(7L)).thenReturn(false);
+
+        mockMvc.perform(get("/api/devices/7/connection"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.connected").value(false));
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "ADVERTISER")
+    void connection_asAdvertiser_is403() throws Exception {
+        mockMvc.perform(get("/api/devices/7/connection"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(devicePushChannel);
+    }
+
+    @Test
+    void connection_withNoAuth_is401() throws Exception {
+        mockMvc.perform(get("/api/devices/7/connection"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "OPERATOR")
+    void connection_outOfOperatorScope_is404() throws Exception {
+        org.mockito.Mockito.doThrow(new ResourceNotFoundException("Device", 7L))
+                .when(managementService).assertScopeForDevice(7L);
+
+        mockMvc.perform(get("/api/devices/7/connection"))
+                .andExpect(status().isNotFound());
+        verifyNoInteractions(devicePushChannel);
     }
 
     @Test

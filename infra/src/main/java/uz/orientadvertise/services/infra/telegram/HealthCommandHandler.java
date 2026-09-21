@@ -30,6 +30,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import uz.orientadvertise.services.common.util.DiskSpace;
+import uz.orientadvertise.services.infra.storage.MinioFailureClassifier;
+import uz.orientadvertise.services.infra.storage.MinioHealthStatus;
+import uz.orientadvertise.services.infra.storage.TranscodeExecutor;
 import uz.orientadvertise.services.common.telegram.TelegramMessageBuilder;
 import uz.orientadvertise.services.common.telegram.TelegramMessageBuilder.Severity;
 import uz.orientadvertise.services.domain.model.Device;
@@ -115,8 +119,9 @@ public class HealthCommandHandler implements TelegramCommandHandler {
     private final ObjectProvider<MinioClient> minioProvider;
     private final ObjectProvider<DeviceStatusViewRepository> statusViewRepoProvider;
     private final ObjectProvider<IncidentRepository> incidentRepoProvider;
-    private final ObjectProvider<ThreadPoolTaskExecutor> urgentTranscodeExecProvider;
+    private final ObjectProvider<TranscodeExecutor> transcodeExecProvider;
     private final ObjectProvider<ThreadPoolTaskExecutor> auditExecProvider;
+    private final MinioHealthStatus minioHealthStatus;
     private final String dataVolumePath;
 
     /**
@@ -136,8 +141,9 @@ public class HealthCommandHandler implements TelegramCommandHandler {
                                   ObjectProvider<MinioClient> minioProvider,
                                   ObjectProvider<DeviceStatusViewRepository> statusViewRepoProvider,
                                   ObjectProvider<IncidentRepository> incidentRepoProvider,
-                                  ObjectProvider<ThreadPoolTaskExecutor> urgentTranscodeExecProvider,
+                                  ObjectProvider<TranscodeExecutor> transcodeExecProvider,
                                   ObjectProvider<ThreadPoolTaskExecutor> auditExecProvider,
+                                  MinioHealthStatus minioHealthStatus,
                                   String dataVolumePath) {
         this.bot = bot;
         this.dataSourceProvider = dataSourceProvider;
@@ -145,8 +151,9 @@ public class HealthCommandHandler implements TelegramCommandHandler {
         this.minioProvider = minioProvider;
         this.statusViewRepoProvider = statusViewRepoProvider;
         this.incidentRepoProvider = incidentRepoProvider;
-        this.urgentTranscodeExecProvider = urgentTranscodeExecProvider;
+        this.transcodeExecProvider = transcodeExecProvider;
         this.auditExecProvider = auditExecProvider;
+        this.minioHealthStatus = minioHealthStatus;
         this.dataVolumePath = dataVolumePath == null || dataVolumePath.isBlank() ? "." : dataVolumePath;
     }
 
@@ -279,49 +286,72 @@ public class HealthCommandHandler implements TelegramCommandHandler {
         }
     }
 
+    /**
+     * Live MinIO probe — and, since v1.0.144, a <b>writer</b> of {@link MinioHealthStatus}.
+     *
+     * <p>An operator typing {@code /health} while storage is degraded is performing exactly the
+     * round-trip the scheduled {@link uz.orientadvertise.services.infra.storage.MinioHealthProbe}
+     * performs. Reporting "minio: UP, 4 bucket(s)" in the chat while the application went on
+     * refusing every upload because a stale flag said otherwise is the kind of contradiction that
+     * costs an hour of an incident. So the probe's verdict is fed back: a successful list heals the
+     * latch, a failure records why. Both are no-ops when the status already agrees.
+     *
+     * <p><b>A failure only degrades when {@link MinioFailureClassifier} says the server is
+     * broken.</b> {@code listBuckets} can fail with {@code AccessDenied} — a perfectly healthy
+     * MinIO refusing these credentials — and degrading on that would 503 every upload and every
+     * device {@code /sync} in the fleet because an operator typed a slash command. The chat row
+     * still reports DOWN: the check did fail, and the operator needs to see that.
+     */
     CheckResult checkMinio() {
         MinioClient minio = minioProvider.getIfAvailable();
+        // Not a probe result — it proves nothing about whether MinIO is reachable, so it must not
+        // move the flag in either direction.
         if (minio == null) return CheckResult.down("minio", "no MinioClient bean");
         try {
             int count = minio.listBuckets().size();
+            minioHealthStatus.markUp();
             return CheckResult.up("minio", count + " bucket(s)");
         } catch (Throwable t) {
+            if (MinioFailureClassifier.isConnectionLevel(t)) {
+                minioHealthStatus.markDegraded("telegram /health probe: " + t.getClass().getSimpleName());
+            }
             return CheckResult.down("minio", t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
+    /**
+     * Transcode + audit pool saturation. Reports the transcode pool's planned WIDTH alongside its
+     * depth, because that width is derived from the host at startup rather than hard-coded — seeing
+     * {@code transcode=0/1a w1} on a small box and {@code w7} on a big one is how an operator
+     * confirms the capacity planner read the machine correctly.
+     */
     CheckResult checkFFmpegQueue() {
-        ThreadPoolTaskExecutor urgent = urgentTranscodeExecProvider.getIfAvailable();
+        TranscodeExecutor transcode = transcodeExecProvider.getIfAvailable();
         ThreadPoolTaskExecutor audit = auditExecProvider.getIfAvailable();
-        if (urgent == null && audit == null) {
+        if (transcode == null && audit == null) {
             return CheckResult.down("ffmpeg", "no transcode executors");
         }
         var sb = new StringBuilder();
-        long total = 0;
-        if (urgent != null) {
-            int queue = urgent.getThreadPoolExecutor().getQueue().size();
-            int active = urgent.getActiveCount();
-            sb.append("urgent=").append(queue).append("/").append(active).append("a ");
-            total += queue;
+        boolean degraded = false;
+        if (transcode != null) {
+            sb.append("transcode=").append(transcode.getQueueDepth())
+              .append("/").append(transcode.getActiveCount()).append("a")
+              .append(" w").append(transcode.getConcurrency()).append(' ');
+            degraded = nearCapacity(transcode.getQueueDepth(), transcode.getQueueCapacity());
         }
         if (audit != null) {
             int queue = audit.getThreadPoolExecutor().getQueue().size();
-            int active = audit.getActiveCount();
-            sb.append("audit=").append(queue).append("/").append(active).append("a");
-            total += queue;
+            sb.append("audit=").append(queue).append("/").append(audit.getActiveCount()).append("a");
+            degraded |= nearCapacity(queue, audit.getQueueCapacity());
         }
-        // Saturation heuristic — degrade past 80% of capacity for any pool.
-        boolean degraded = (urgent != null && nearCapacity(urgent))
-                || (audit != null && nearCapacity(audit));
         return degraded
                 ? CheckResult.degraded("ffmpeg", sb.toString().trim() + " (queue near capacity)")
                 : CheckResult.up("ffmpeg", sb.toString().trim());
     }
 
-    private static boolean nearCapacity(ThreadPoolTaskExecutor exec) {
-        int cap = exec.getQueueCapacity();
-        if (cap <= 0) return false;
-        return exec.getThreadPoolExecutor().getQueue().size() * 5 >= cap * 4; // 80%
+    /** Saturation heuristic — degrade past 80% of a pool's queue capacity. */
+    private static boolean nearCapacity(int queued, int capacity) {
+        return capacity > 0 && queued * 5 >= capacity * 4;
     }
 
     CheckResult checkDevices() {
@@ -391,19 +421,19 @@ public class HealthCommandHandler implements TelegramCommandHandler {
         }
     }
 
+    /**
+     * Free space on the shared volume. Shares {@link DiskSpace}'s arithmetic with the
+     * {@code disk} component on {@code /api/health}, so an operator comparing the two surfaces is
+     * never chasing a discrepancy that only exists because they were computed differently.
+     */
     CheckResult checkDisk() {
         try {
-            Path p = Paths.get(dataVolumePath);
-            FileStore fs = Files.getFileStore(p);
-            long total = fs.getTotalSpace();
-            long usable = fs.getUsableSpace();
-            int freePct = (int) ((usable * 100) / Math.max(1, total));
-            String detail = "free=" + humanBytes(usable) + " / total=" + humanBytes(total)
-                    + " (" + freePct + "% free, path=" + dataVolumePath + ")";
+            DiskSpace space = DiskSpace.probe(dataVolumePath);
+            String detail = space.describe();
             // Below 10% free → degrade. Below 1% → DOWN (an operator is about to have
             // a very bad day).
-            if (freePct < 1) return CheckResult.down("disk", detail);
-            if (freePct < 10) return CheckResult.degraded("disk", detail);
+            if (space.freePercent() < 1) return CheckResult.down("disk", detail);
+            if (space.freePercent() < 10) return CheckResult.degraded("disk", detail);
             return CheckResult.up("disk", detail);
         } catch (IOException e) {
             return CheckResult.down("disk", "IOException: " + e.getMessage());
@@ -499,15 +529,9 @@ public class HealthCommandHandler implements TelegramCommandHandler {
         return s == null ? "" : s;
     }
 
+    /** Delegates to the shared formatter so the JVM-memory and disk rows render identically. */
     static String humanBytes(long bytes) {
-        if (bytes < 1024L) return bytes + " B";
-        double kb = bytes / 1024.0;
-        if (kb < 1024) return "%.1f KB".formatted(kb);
-        double mb = kb / 1024.0;
-        if (mb < 1024) return "%.1f MB".formatted(mb);
-        double gb = mb / 1024.0;
-        if (gb < 1024) return "%.1f GB".formatted(gb);
-        return "%.1f TB".formatted(gb / 1024.0);
+        return DiskSpace.humanBytes(bytes);
     }
 
     /** Map.entry helpers exposed for tests. */
@@ -518,7 +542,7 @@ public class HealthCommandHandler implements TelegramCommandHandler {
         m.put("minio", minioProvider);
         m.put("statusView", statusViewRepoProvider);
         m.put("incidentRepo", incidentRepoProvider);
-        m.put("urgentExec", urgentTranscodeExecProvider);
+        m.put("transcodeExec", transcodeExecProvider);
         m.put("auditExec", auditExecProvider);
         return m;
     }

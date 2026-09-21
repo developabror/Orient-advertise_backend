@@ -15,7 +15,7 @@ import uz.orientadvertise.services.domain.model.Device;
 
 public interface DeviceRepository extends JpaRepository<Device, Long> {
 
-    List<Device> findBySyncPendingSinceLessThan(Instant threshold);
+    List<Device> findBySyncPendingSinceLessThanAndDeletedAtIsNull(Instant threshold);
 
     @Query("SELECT d FROM Device d WHERE d.deletedAt IS NULL AND d.registeredAt IS NOT NULL " +
            "AND d.lastHeartbeatAt IS NOT NULL AND d.lastHeartbeatAt < :threshold")
@@ -206,4 +206,16 @@ public interface DeviceRepository extends JpaRepository<Device, Long> {
     @Modifying(clearAutomatically = true)
     @Query("UPDATE Device d SET d.syncGroup = NULL, d.updatedAt = :now WHERE d.syncGroup.id = :syncGroupId")
     int bulkClearSyncGroup(@Param("syncGroupId") Long syncGroupId, @Param("now") Instant now);
+
+    /**
+     * AUTH-02: atomically claim an open re-registration window. Returns 1 for exactly one caller —
+     * the row lock taken by the UPDATE makes a concurrent second claim re-read the now-NULL column
+     * and match 0 rows. Deliberately NOT {@code clearAutomatically}: the caller then rotates the
+     * token on the device it already loaded, and clearing the context would detach it so the new
+     * token would never be written.
+     */
+    @Modifying
+    @Query("UPDATE Device d SET d.reregistrationAllowedUntil = NULL " +
+           "WHERE d.id = :id AND d.reregistrationAllowedUntil > :now")
+    int claimReregistrationWindow(@Param("id") Long id, @Param("now") Instant now);
 }

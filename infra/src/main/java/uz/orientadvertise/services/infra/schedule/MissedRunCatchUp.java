@@ -3,6 +3,7 @@ package uz.orientadvertise.services.infra.schedule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
@@ -16,6 +17,7 @@ import uz.orientadvertise.services.domain.content.ScheduleEvaluator;
  * to a minute for the next cron fire.
  */
 @Component
+@ConditionalOnProperty(name = "app.schedule.evaluation-enabled", havingValue = "true") // LOGIC-04, see QuartzConfig
 public class MissedRunCatchUp {
 
     private static final Logger log = LoggerFactory.getLogger(MissedRunCatchUp.class);

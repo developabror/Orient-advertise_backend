@@ -15,8 +15,9 @@ import uz.orientadvertise.services.service.ContentListService.ContentFileView;
  * a key read the {@code ContentFile} entity directly; the wire DTO carries only the
  * presigned {@code thumbnailUrl}.
  *
- * <p>{@code thumbnailUrl} / {@code thumbnailExpiresAt} carry the same semantics as the
- * listing projection — see {@link ContentFileSummary}.
+ * <p>{@code thumbnailUrl} / {@code thumbnailExpiresAt} and the {@code invalidReason} /
+ * {@code transcodeLastError} split carry the same semantics as the listing projection — see
+ * {@link ContentFileSummary}.
  */
 public record ContentFileDetail(
         Long id,
@@ -27,6 +28,7 @@ public record ContentFileDetail(
         Integer durationSeconds,
         String status,
         String invalidReason,
+        String transcodeLastError,
         String thumbnailUrl,
         Instant thumbnailExpiresAt,
         Instant createdAt,
@@ -53,6 +55,7 @@ public record ContentFileDetail(
                 file.getDurationSeconds(),
                 file.getStatus() != null ? file.getStatus().name() : null,
                 file.getInvalidReason(),
+                file.getTranscodeLastError(),
                 view.thumbnailUrl(),
                 view.thumbnailExpiresAt(),
                 file.getCreatedAt(),

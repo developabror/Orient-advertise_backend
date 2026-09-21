@@ -16,9 +16,11 @@ import uz.orientadvertise.services.common.exception.RateLimitExceededException;
  * serial-number guessing / mass-registration abuse. Redis-backed (mirrors
  * {@link ApiKeyRateLimiter}) so the limit holds across instances.
  *
- * <p>Defense-in-depth only: it does not replace the deeper hardening (a provisioning
- * secret + proof-of-possession before token rotation on re-registration) tracked as a
- * follow-up.
+ * <p>Two budgets. {@link #check} meters registrations of new serials. {@link
+ * #checkReregistration} meters attempts on an already-registered serial (AUTH-02: refused with
+ * 409 unless an admin opened a window). Keeping them apart means a wiped box retrying every few
+ * minutes cannot starve new boxes behind the same venue NAT — and polling a known serial to snatch
+ * an admin's window is still metered, not free.
  */
 @Service
 public class DeviceRegistrationRateLimiter {
@@ -28,6 +30,9 @@ public class DeviceRegistrationRateLimiter {
 
     @Value("${app.device.register-rate-limit-per-hour:10}")
     private long limitPerHour;
+
+    @Value("${app.device.reregister-rate-limit-per-hour:60}")
+    private long reregisterLimitPerHour;
 
     private final StringRedisTemplate redis;
 
@@ -40,8 +45,17 @@ public class DeviceRegistrationRateLimiter {
      * {@link RateLimitExceededException} (→ 429) once the hourly limit is exceeded.
      */
     public void check(String clientIp) {
+        count("rate:devreg:", clientIp, limitPerHour, "Device registration");
+    }
+
+    /** Same, for an attempt on an already-registered serial — its own, larger budget. */
+    public void checkReregistration(String clientIp) {
+        count("rate:devrereg:", clientIp, reregisterLimitPerHour, "Device re-registration");
+    }
+
+    private void count(String prefix, String clientIp, long limit, String label) {
         long bucket = Instant.now().getEpochSecond() / 3600;
-        String redisKey = "rate:devreg:" + (clientIp == null ? "unknown" : clientIp) + ":" + bucket;
+        String redisKey = prefix + (clientIp == null ? "unknown" : clientIp) + ":" + bucket;
 
         Long count = redis.opsForValue().increment(redisKey);
         if (count == null) {
@@ -52,9 +66,9 @@ public class DeviceRegistrationRateLimiter {
         if (count == 1L) {
             redis.expire(redisKey, BUCKET_TTL);
         }
-        if (count > limitPerHour) {
+        if (count > limit) {
             throw new RateLimitExceededException(
-                    "Device registration rate limit exceeded (" + limitPerHour + "/hour) for this source");
+                    label + " rate limit exceeded (" + limit + "/hour) for this source");
         }
     }
 }

@@ -6,6 +6,8 @@ import java.time.temporal.ChronoUnit;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DeviceStatusEvaluatorTest {
 
@@ -79,5 +81,14 @@ class DeviceStatusEvaluatorTest {
         var lastHeartbeat = now.minus(30, ChronoUnit.MINUTES);
         var status = DeviceStatusEvaluator.evaluate(lastHeartbeat, false, now);
         assertEquals(Device.Status.OFFLINE, status);
+    }
+
+    @Test
+    void isOffline_matchesEvaluate_onBothSidesOfTheGraceBoundary() {
+        // The heartbeat derives "was this device showing OFFLINE?" from isOffline; it must agree
+        // with evaluate() exactly, or a transition would be announced that no surface displayed.
+        assertTrue(DeviceStatusEvaluator.isOffline(null, now));
+        assertFalse(DeviceStatusEvaluator.isOffline(now.minus(15, ChronoUnit.MINUTES).minus(59, ChronoUnit.SECONDS), now));
+        assertTrue(DeviceStatusEvaluator.isOffline(now.minus(16, ChronoUnit.MINUTES).minus(1, ChronoUnit.SECONDS), now));
     }
 }

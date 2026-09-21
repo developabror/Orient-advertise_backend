@@ -51,7 +51,7 @@ class PlaybackLogBatchTest {
         assignmentService = mock(ContentAssignmentService.class);
         playlistItemRepository = mock(PlaylistItemRepository.class);
         service = new PlaybackLogService(repository, deviceRepository, contentFileRepository,
-                assignmentService, playlistItemRepository, 30);
+                assignmentService, playlistItemRepository, new RetentionProperties(), 30);
 
         device = mock(Device.class);
         when(device.getId()).thenReturn(1L);

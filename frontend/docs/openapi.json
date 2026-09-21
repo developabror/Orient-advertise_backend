@@ -26,29 +26,14 @@
     "name" : "Devices",
     "description" : "Region CRUD (org tree level 2)"
   }, {
-    "name" : "Devices",
-    "description" : "Project CRUD (org tree level 1)"
-  }, {
     "name" : "Reports",
     "description" : "Aggregated reports and Excel export"
-  }, {
-    "name" : "Sensitive",
-    "description" : "Operations that mutate production state or expose protected data — audit logged"
-  }, {
-    "name" : "Reports",
-    "description" : "Dashboard summary backing FE-11/FE-12"
   }, {
     "name" : "Reports",
     "description" : "Aggregated event reports + Excel export"
   }, {
-    "name" : "Auth",
-    "description" : "JWT login / refresh / logout"
-  }, {
     "name" : "Admin",
     "description" : "ADMIN-only API key lifecycle"
-  }, {
-    "name" : "Devices",
-    "description" : "Device registration, sync, heartbeat, control"
   }, {
     "name" : "Auth",
     "description" : "Authenticated self-service: change password, set recovery email"
@@ -62,12 +47,6 @@
     "name" : "Auth",
     "description" : "Public password recovery: forgot / reset / validate"
   }, {
-    "name" : "Auth",
-    "description" : "Login, refresh, logout — JWT lifecycle"
-  }, {
-    "name" : "Playback",
-    "description" : "Proof-of-play recording and statistics"
-  }, {
     "name" : "Devices",
     "description" : "Facility CRUD (org tree level 3)"
   }, {
@@ -76,6 +55,33 @@
   }, {
     "name" : "Sync Groups",
     "description" : "SyncGroup CRUD and membership (synchronized-playback sales points)"
+  }, {
+    "name" : "Incidents",
+    "description" : "Operational incident lifecycle"
+  }, {
+    "name" : "Devices",
+    "description" : "Project CRUD (org tree level 1)"
+  }, {
+    "name" : "Sensitive",
+    "description" : "Operations that mutate production state or expose protected data — audit logged"
+  }, {
+    "name" : "Reports",
+    "description" : "Dashboard summary backing FE-11/FE-12"
+  }, {
+    "name" : "Auth",
+    "description" : "JWT login / refresh / logout"
+  }, {
+    "name" : "Devices",
+    "description" : "Device registration, sync, heartbeat, control"
+  }, {
+    "name" : "Auth",
+    "description" : "Login, refresh, logout — JWT lifecycle"
+  }, {
+    "name" : "Playback",
+    "description" : "Proof-of-play recording and statistics"
+  }, {
+    "name" : "Remote Control",
+    "description" : "Remote view/control session lifecycle (control plane only — no media)"
   }, {
     "name" : "Auth",
     "description" : "Current user profile"
@@ -91,9 +97,6 @@
   }, {
     "name" : "Content",
     "description" : "Playlist CRUD"
-  }, {
-    "name" : "Incidents",
-    "description" : "Operational incident lifecycle"
   } ],
   "paths" : {
     "/api/sync-groups/{id}" : {
@@ -1720,16 +1723,6 @@
           "required" : true
         },
         "responses" : {
-          "409" : {
-            "description" : "Username already exists",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/UserResponse"
-                }
-              }
-            }
-          },
           "201" : {
             "description" : "User created",
             "content" : {
@@ -1739,6 +1732,16 @@
                   "username" : "alice",
                   "role" : "ADVERTISER",
                   "active" : true
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "Username already exists",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/UserResponse"
                 }
               }
             }
@@ -2108,6 +2111,23 @@
           "required" : true
         },
         "responses" : {
+          "200" : {
+            "description" : "Membership applied",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
+                },
+                "example" : {
+                  "addedCount" : 1,
+                  "alreadyMember" : [ 102 ],
+                  "movedFrom" : {
+                    "103" : 2
+                  }
+                }
+              }
+            }
+          },
           "400" : {
             "description" : "Devices belong to a different project",
             "content" : {
@@ -2134,23 +2154,6 @@
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
-                }
-              }
-            }
-          },
-          "200" : {
-            "description" : "Membership applied",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/SyncGroupAddDevicesResponse"
-                },
-                "example" : {
-                  "addedCount" : 1,
-                  "alreadyMember" : [ 102 ],
-                  "movedFrom" : {
-                    "103" : 2
-                  }
                 }
               }
             }
@@ -3110,6 +3113,214 @@
         }
       }
     },
+    "/api/devices/{id}/remote" : {
+      "get" : {
+        "tags" : [ "Remote Control" ],
+        "summary" : "Current remote session for a device",
+        "operationId" : "current",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "The live session (no viewerTicket)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "404" : {
+            "description" : "No live session for this device",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller is VIEWER/ADVERTISER",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post" : {
+        "tags" : [ "Remote Control", "Sensitive" ],
+        "summary" : "[SENSITIVE] Start a remote view/control session",
+        "operationId" : "start",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/StartRemoteSessionRequest"
+              }
+            }
+          }
+        },
+        "responses" : {
+          "404" : {
+            "description" : "Device not found, soft-deleted, or out of scope",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "503" : {
+            "description" : "Remote control is disabled on this server",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "201" : {
+            "description" : "Session created",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "422" : {
+            "description" : "Device reported capability.supported == false",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Caller is VIEWER/ADVERTISER",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "A PENDING/ACTIVE session already exists",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RemoteSessionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/devices/{id}/remote/{sessionKey}/ack" : {
+      "post" : {
+        "tags" : [ "Remote Control" ],
+        "summary" : "Device acknowledges a remote session (READY / FAILED / ENDED)",
+        "operationId" : "ack",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }, {
+          "name" : "sessionKey",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/RemoteSessionAckRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Ack recorded",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AckResponse"
+                }
+              }
+            }
+          },
+          "403" : {
+            "description" : "Token belongs to a different device",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AckResponse"
+                }
+              }
+            }
+          },
+          "404" : {
+            "description" : "Unknown session, or it belongs to another device",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AckResponse"
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "Session is already terminal",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AckResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/devices/{id}/playlist/control" : {
       "post" : {
         "tags" : [ "device-controller" ],
@@ -3558,6 +3769,24 @@
               }
             }
           },
+          "200" : {
+            "description" : "Membership applied",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AddDevicesResponse"
+                },
+                "example" : {
+                  "addedCount" : 2,
+                  "alreadyMember" : [ 101 ],
+                  "movedFrom" : {
+                    "202" : 7,
+                    "203" : 9
+                  }
+                }
+              }
+            }
+          },
           "403" : {
             "description" : "Caller lacks ADMIN/OPERATOR",
             "content" : {
@@ -3574,24 +3803,6 @@
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/AddDevicesResponse"
-                }
-              }
-            }
-          },
-          "200" : {
-            "description" : "Membership applied",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/AddDevicesResponse"
-                },
-                "example" : {
-                  "addedCount" : 2,
-                  "alreadyMember" : [ 101 ],
-                  "movedFrom" : {
-                    "202" : 7,
-                    "203" : 9
-                  }
                 }
               }
             }
@@ -3629,6 +3840,64 @@
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/BulkActionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/content/{id}/retranscode" : {
+      "post" : {
+        "tags" : [ "content-controller" ],
+        "summary" : "Re-queue transcoding for a stuck or failed content file",
+        "operationId" : "retranscode",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "403" : {
+            "description" : "Caller lacks ADMIN/OPERATOR",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RetranscodeResult"
+                }
+              }
+            }
+          },
+          "404" : {
+            "description" : "Unknown content file (or soft-deleted)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RetranscodeResult"
+                }
+              }
+            }
+          },
+          "409" : {
+            "description" : "Status is not UPLOADED/FAILED, the raw object is missing, or another worker just claimed it — see `message`",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RetranscodeResult"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Claimed and queued; returns the new status",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RetranscodeResult"
                 }
               }
             }
@@ -3707,7 +3976,7 @@
                     "description" : "Bound to project (urgent)",
                     "value" : {
                       "fileId" : 1042,
-                      "status" : "PROCESSING",
+                      "status" : "UPLOADED",
                       "storageKey" : "raw/2026/01/abc123.mp4",
                       "urgent" : true,
                       "projectId" : 7,
@@ -3723,7 +3992,7 @@
                     "description" : "Orphan upload (no project)",
                     "value" : {
                       "fileId" : 1043,
-                      "status" : "PROCESSING",
+                      "status" : "UPLOADED",
                       "storageKey" : "raw/2026/01/def456.mp4",
                       "urgent" : false,
                       "projectId" : null,
@@ -3819,22 +4088,22 @@
           }
         } ],
         "responses" : {
-          "200" : {
-            "description" : "New access token in body, rotated refresh token in cookie",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/AccessTokenResponse"
-                }
-              }
-            }
-          },
           "401" : {
             "description" : "Cookie missing, token unknown, expired, or replay detected",
             "content" : {
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "New access token in body, rotated refresh token in cookie",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AccessTokenResponse"
                 }
               }
             }
@@ -4121,6 +4390,16 @@
           "required" : true
         },
         "responses" : {
+          "400" : {
+            "description" : "Blank or oversized client name",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/CreatedKey"
+                }
+              }
+            }
+          },
           "201" : {
             "description" : "Key created — plaintext returned once",
             "content" : {
@@ -4131,16 +4410,6 @@
                   "prefix" : "kx9r8s2L",
                   "clientName" : "Acme Inc.",
                   "createdAt" : "2026-05-06T10:30:00Z"
-                }
-              }
-            }
-          },
-          "400" : {
-            "description" : "Blank or oversized client name",
-            "content" : {
-              "application/json" : {
-                "schema" : {
-                  "$ref" : "#/components/schemas/CreatedKey"
                 }
               }
             }
@@ -4210,20 +4479,6 @@
           }
         } ],
         "responses" : {
-          "200" : {
-            "description" : "User detail",
-            "content" : {
-              "application/json" : {
-                "example" : {
-                  "id" : 50,
-                  "username" : "alice",
-                  "role" : "ADVERTISER",
-                  "active" : true,
-                  "createdAt" : "2026-01-15T10:30:00Z"
-                }
-              }
-            }
-          },
           "404" : {
             "description" : "Unknown or soft-deleted user",
             "content" : {
@@ -4240,6 +4495,20 @@
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/UserDetailResponse"
+                }
+              }
+            }
+          },
+          "200" : {
+            "description" : "User detail",
+            "content" : {
+              "application/json" : {
+                "example" : {
+                  "id" : 50,
+                  "username" : "alice",
+                  "role" : "ADVERTISER",
+                  "active" : true,
+                  "createdAt" : "2026-01-15T10:30:00Z"
                 }
               }
             }
@@ -4594,6 +4863,17 @@
           }
         } ],
         "responses" : {
+          "202" : {
+            "description" : "Queued; poll job",
+            "content" : {
+              "application/json" : {
+                "example" : {
+                  "status" : "PENDING",
+                  "jobId" : "8c1f5d7e-..."
+                }
+              }
+            }
+          },
           "400" : {
             "description" : "Range > 90 days or from > to",
             "content" : {
@@ -4625,17 +4905,6 @@
                     "deviceName" : "TV-1",
                     "eventCount" : 30
                   } ]
-                }
-              }
-            }
-          },
-          "202" : {
-            "description" : "Queued; poll job",
-            "content" : {
-              "application/json" : {
-                "example" : {
-                  "status" : "PENDING",
-                  "jobId" : "8c1f5d7e-..."
                 }
               }
             }
@@ -4962,19 +5231,6 @@
           }
         } ],
         "responses" : {
-          "200" : {
-            "description" : "Event history page",
-            "content" : {
-              "application/json" : {
-                "example" : [ {
-                  "occurredAt" : "2026-05-06T10:30:00Z",
-                  "eventType" : "OFFLINE",
-                  "priority" : "HIGH",
-                  "payload" : "{\"reason\":\"network-timeout\"}"
-                } ]
-              }
-            }
-          },
           "404" : {
             "description" : "Unknown serial",
             "content" : {
@@ -5011,6 +5267,19 @@
                     "$ref" : "#/components/schemas/EventEntry"
                   }
                 }
+              }
+            }
+          },
+          "200" : {
+            "description" : "Event history page",
+            "content" : {
+              "application/json" : {
+                "example" : [ {
+                  "occurredAt" : "2026-05-06T10:30:00Z",
+                  "eventType" : "OFFLINE",
+                  "priority" : "HIGH",
+                  "payload" : "{\"reason\":\"network-timeout\"}"
+                } ]
               }
             }
           }
@@ -5313,6 +5582,33 @@
               "application/json" : {
                 "schema" : {
                   "$ref" : "#/components/schemas/DiagnosticsView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/devices/{id}/connection" : {
+      "get" : {
+        "tags" : [ "device-controller" ],
+        "operationId" : "connection",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "OK",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/DeviceConnectionResponse"
                 }
               }
             }
@@ -5665,6 +5961,40 @@
           },
           "204" : {
             "description" : "Removed; subsequent positions compacted"
+          }
+        }
+      }
+    },
+    "/api/devices/{id}/remote/{sessionKey}" : {
+      "delete" : {
+        "tags" : [ "Remote Control", "Sensitive" ],
+        "summary" : "[SENSITIVE] Stop a remote view/control session",
+        "operationId" : "stop",
+        "parameters" : [ {
+          "name" : "id",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }, {
+          "name" : "sessionKey",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "404" : {
+            "description" : "Unknown session, or it belongs to another device"
+          },
+          "204" : {
+            "description" : "Stopped (or already terminal)"
+          },
+          "403" : {
+            "description" : "Caller is VIEWER/ADVERTISER"
           }
         }
       }
@@ -6806,8 +7136,8 @@
           },
           "status" : {
             "type" : "string",
-            "description" : "Processing status of the file",
-            "example" : "PROCESSING"
+            "description" : "Lifecycle status of the file at the moment the upload was accepted; always UPLOADED (transcoding starts after the commit)",
+            "example" : "UPLOADED"
           },
           "storageKey" : {
             "type" : "string",
@@ -6934,6 +7264,109 @@
           }
         }
       },
+      "StartRemoteSessionRequest" : {
+        "type" : "object",
+        "properties" : {
+          "viewOnly" : {
+            "type" : "boolean"
+          }
+        }
+      },
+      "CapabilityDto" : {
+        "type" : "object",
+        "properties" : {
+          "supported" : {
+            "type" : "boolean"
+          },
+          "input" : {
+            "type" : "string"
+          },
+          "transport" : {
+            "type" : "string"
+          },
+          "maxWidth" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "maxHeight" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "reportedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      },
+      "RemoteSessionResponse" : {
+        "type" : "object",
+        "properties" : {
+          "sessionId" : {
+            "type" : "string"
+          },
+          "deviceId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "status" : {
+            "type" : "string"
+          },
+          "relayUrl" : {
+            "type" : "string"
+          },
+          "viewerTicket" : {
+            "type" : "string"
+          },
+          "expiresAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "viewOnly" : {
+            "type" : "boolean"
+          },
+          "deliveredVia" : {
+            "type" : "string"
+          },
+          "capability" : {
+            "$ref" : "#/components/schemas/CapabilityDto"
+          }
+        }
+      },
+      "RemoteSessionAckRequest" : {
+        "required" : [ "status" ],
+        "type" : "object",
+        "properties" : {
+          "status" : {
+            "type" : "string",
+            "enum" : [ "READY", "FAILED", "ENDED" ]
+          },
+          "width" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "height" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "error" : {
+            "type" : "string"
+          },
+          "reason" : {
+            "type" : "string"
+          }
+        }
+      },
+      "AckResponse" : {
+        "type" : "object",
+        "properties" : {
+          "sessionId" : {
+            "type" : "string"
+          },
+          "status" : {
+            "type" : "string"
+          }
+        }
+      },
       "PlaylistControlRequest" : {
         "required" : [ "action" ],
         "type" : "object",
@@ -7032,6 +7465,64 @@
           "volume" : {
             "type" : "integer",
             "format" : "int32"
+          },
+          "remote" : {
+            "$ref" : "#/components/schemas/RemoteCapabilityDto"
+          }
+        }
+      },
+      "RemoteCapabilityDto" : {
+        "type" : "object",
+        "properties" : {
+          "supported" : {
+            "type" : "boolean"
+          },
+          "input" : {
+            "type" : "string"
+          },
+          "transport" : {
+            "type" : "string"
+          },
+          "maxWidth" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "maxHeight" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "DesiredRemoteSessionDto" : {
+        "type" : "object",
+        "properties" : {
+          "sessionId" : {
+            "type" : "string"
+          },
+          "relayUrl" : {
+            "type" : "string"
+          },
+          "agentTicket" : {
+            "type" : "string"
+          },
+          "expiresAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "viewOnly" : {
+            "type" : "boolean"
+          },
+          "maxWidth" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "maxFps" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "bitRate" : {
+            "type" : "integer",
+            "format" : "int32"
           }
         }
       },
@@ -7067,6 +7558,9 @@
           },
           "syncGroupId" : {
             "type" : "string"
+          },
+          "desiredRemoteSession" : {
+            "$ref" : "#/components/schemas/DesiredRemoteSessionDto"
           }
         }
       },
@@ -7323,6 +7817,21 @@
           }
         }
       },
+      "RetranscodeResult" : {
+        "type" : "object",
+        "properties" : {
+          "fileId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "status" : {
+            "type" : "string"
+          },
+          "previousStatus" : {
+            "type" : "string"
+          }
+        }
+      },
       "PushResult" : {
         "type" : "object",
         "properties" : {
@@ -7358,17 +7867,6 @@
             "type" : "string"
           }
         }
-      },
-      "AccessTokenResponse" : {
-        "type" : "object",
-        "properties" : {
-          "accessToken" : {
-            "type" : "string",
-            "description" : "Short-lived JWT access token. Send as `Authorization: Bearer <token>`.",
-            "example" : "eyJhbGciOiJIUzI1NiJ9.eyJzdWIi..."
-          }
-        },
-        "description" : "Access-token response body. The refresh token is delivered separately as an HttpOnly cookie."
       },
       "ErrorResponse" : {
         "type" : "object",
@@ -7413,6 +7911,17 @@
             "type" : "object"
           }
         }
+      },
+      "AccessTokenResponse" : {
+        "type" : "object",
+        "properties" : {
+          "accessToken" : {
+            "type" : "string",
+            "description" : "Short-lived JWT access token. Send as `Authorization: Bearer <token>`.",
+            "example" : "eyJhbGciOiJIUzI1NiJ9.eyJzdWIi..."
+          }
+        },
+        "description" : "Access-token response body. The refresh token is delivered separately as an HttpOnly cookie."
       },
       "LoginRequest" : {
         "required" : [ "password", "username" ],
@@ -7653,10 +8162,10 @@
             "type" : "integer",
             "format" : "int32"
           },
-          "paged" : {
+          "unpaged" : {
             "type" : "boolean"
           },
-          "unpaged" : {
+          "paged" : {
             "type" : "boolean"
           }
         }
@@ -9109,6 +9618,18 @@
           }
         }
       },
+      "DeviceConnectionResponse" : {
+        "type" : "object",
+        "properties" : {
+          "deviceId" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "connected" : {
+            "type" : "boolean"
+          }
+        }
+      },
       "PageRemoteActionDto" : {
         "type" : "object",
         "properties" : {
@@ -9295,6 +9816,9 @@
           "invalidReason" : {
             "type" : "string"
           },
+          "transcodeLastError" : {
+            "type" : "string"
+          },
           "thumbnailUrl" : {
             "type" : "string"
           },
@@ -9393,6 +9917,9 @@
             "type" : "string"
           },
           "invalidReason" : {
+            "type" : "string"
+          },
+          "transcodeLastError" : {
             "type" : "string"
           },
           "thumbnailUrl" : {

@@ -4,6 +4,9 @@ dependencies {
     implementation project(':common')
     implementation 'org.springframework.boot:spring-boot-starter'
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    // Bean Validation for @ConfigurationProperties that bound a DELETE (RetentionProperties):
+    // a bad window must fail startup with the property name, not run at 02:00 against prod.
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
     // BCrypt password hashing/verification (AuthService). Standalone crypto module — does
     // not pull in spring-security-web; the full security chain lives in the api module.
     implementation 'org.springframework.security:spring-security-crypto'

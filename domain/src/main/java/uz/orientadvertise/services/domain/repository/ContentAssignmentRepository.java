@@ -37,11 +37,26 @@ public interface ContentAssignmentRepository extends JpaRepository<ContentAssign
     List<ContentAssignment> findByTargetTypeAndTargetIdAndDeletedAtIsNull(
             ContentAssignment.TargetType targetType, Long targetId);
 
+    /**
+     * Every CONFIRMED, non-deleted assignment whose half-open window covers {@code now}, ordered
+     * WINNER FIRST by {@link ContentAssignment#PRECEDENCE}: most specific target, then most
+     * recently confirmed, then highest id.
+     *
+     * <p>The recency term is what lets a short campaign override a long-running assignment for its
+     * window only and hand it back afterwards (v1.0.142) — both rows stay CONFIRMED and the order
+     * decides. {@code COALESCE(confirmedAt, createdAt)} mirrors the SQL views' own COALESCE, so a
+     * pre-V48 / never-confirmed row still orders.
+     *
+     * <p>This ORDER BY is one of FOUR copies of that rule ({@code ContentAssignment.PRECEDENCE},
+     * {@code resolveForDevice}, {@code previewForTarget}, {@code device_status_view}). They MUST
+     * agree; see {@code ContentAssignmentWindowOverrideTest}, which pins the query and the view
+     * against each other.
+     */
     @Query("SELECT ca FROM ContentAssignment ca " +
            "WHERE ca.deletedAt IS NULL " +
            "AND ca.status = 'CONFIRMED' " +
            "AND ca.startTime <= :now AND ca.endTime > :now " +
-           "ORDER BY ca.priority DESC")
+           "ORDER BY ca.priority DESC, COALESCE(ca.confirmedAt, ca.createdAt) DESC, ca.id DESC")
     List<ContentAssignment> findActiveAtTime(@Param("now") Instant now);
 
     /**

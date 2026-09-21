@@ -9,12 +9,15 @@ import uz.orientadvertise.services.domain.content.SyncDispatcher;
 import uz.orientadvertise.services.service.AssignmentCancelledEvent;
 
 /**
- * Pushes a {@code SYNC_CONTENT} notification to the formerly-targeted devices the instant a
- * CONFIRMED assignment is cancelled (soft-deleted). Sibling of
- * {@link AssignmentConfirmedSyncPushListener}.
+ * Pushes a {@code SYNC_CONTENT} notification to the devices an assignment has stopped driving —
+ * a CONFIRMED assignment the operator cancelled, or the devices a REPLACE confirm handed over to
+ * a new assignment. The predecessor's row is NOT necessarily soft-deleted in the second case: it
+ * may have been truncated, narrowed by exclusions, or left completely untouched and merely
+ * outranked for the new window (v1.0.142) — all this listener needs to know is that these devices
+ * must re-resolve now. Sibling of {@link AssignmentConfirmedSyncPushListener}.
  *
- * <p>Subscribes with {@link TransactionPhase#AFTER_COMMIT} so a rolled-back cancel never
- * produces a push. On re-resolution the device picks up the next-priority active assignment
+ * <p>Subscribes with {@link TransactionPhase#AFTER_COMMIT} so a rolled-back change never
+ * produces a push. On re-resolution the device picks up the winning active assignment
  * or is told to purge its held content. The dispatcher silently skips devices that are not
  * WS-connected — they reconcile on their next heartbeat poll via
  * {@code DeviceSyncService.computeSyncPlan} (the offline fallback path that resolves

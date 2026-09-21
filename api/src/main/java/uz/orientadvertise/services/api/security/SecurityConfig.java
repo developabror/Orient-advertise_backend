@@ -153,6 +153,14 @@ public class SecurityConfig {
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/devices/*/actions/pending").hasRole("DEVICE")
                         .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/devices/*/actions/*/confirm").hasRole("DEVICE")
                         .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/devices/*/playback").hasRole("DEVICE")
+                        // Remote view/control (control plane only — no media crosses this service).
+                        // ORDER IS LOAD-BEARING: the device-only /ack sub-path must be matched
+                        // BEFORE the operator-only catch-all below, otherwise the device's
+                        // X-Device-Token principal would be rejected by the ADMIN/OPERATOR rule.
+                        // Pinning both at the chain (in addition to @PreAuthorize) means an
+                        // operator JWT can never ack and a device token can never start a session.
+                        .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/devices/*/remote/*/ack").hasRole("DEVICE")
+                        .requestMatchers("/api/devices/*/remote/**").hasAnyRole("ADMIN", "OPERATOR")
                         // File download/presign are ADMIN/OPERATOR only — never reachable by
                         // ROLE_API_CLIENT (external partners) or unauthenticated callers.
                         .requestMatchers("/api/files/**").hasAnyRole("ADMIN", "OPERATOR")

@@ -7,7 +7,9 @@ import java.util.Set;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import uz.orientadvertise.services.common.exception.AccessForbiddenException;
@@ -29,6 +31,7 @@ import uz.orientadvertise.services.domain.repository.OperatorContentAccessReposi
  *       cannot accidentally pull a huge payload.</li>
  *   <li>{@code name} is whitespace-trimmed; blank reduces to {@code null} (no filter).</li>
  *   <li>Soft-deleted rows are excluded at the repository layer, not here.</li>
+ *   <li>Ordering is made deterministic — see {@link #withDeterministicOrder}.</li>
  * </ul>
  *
  * <p>Advertiser scoping: when {@code advertiserUsername} is non-null, the listing is
@@ -42,6 +45,9 @@ import uz.orientadvertise.services.domain.repository.OperatorContentAccessReposi
 public class ContentListService {
 
     public static final int MAX_PAGE_SIZE = 100;
+
+    /** Final sort key appended to every listing request; see {@link #withDeterministicOrder}. */
+    private static final String TIEBREAKER_PROPERTY = "id";
 
     /** Lower bound on stream-url expiry — anything shorter is impractical for a video player. */
     public static final int MIN_STREAM_EXPIRY_SECONDS = 60;
@@ -86,6 +92,7 @@ public class ContentListService {
         if (pageable.getPageSize() > MAX_PAGE_SIZE) {
             throw new IllegalArgumentException("Page size cannot exceed " + MAX_PAGE_SIZE);
         }
+        Pageable ordered = withDeterministicOrder(pageable);
         String normalizedName = (name == null || name.isBlank()) ? null : name.trim();
         // The FE sends projectId=-1 for a playlist bound to the seeded "Unassigned" project,
         // but unassigned content is stored with project_id=NULL (the write path normalizes the
@@ -98,29 +105,62 @@ public class ContentListService {
             // ADVERTISER branch — unchanged: scoped to advertiser_content_access grants.
             var user = userRepository.findByUsername(advertiserUsername).orElse(null);
             if (user == null) {
-                return Page.empty(pageable);
+                return Page.empty(ordered);
             }
             var ids = accessRepository.findContentIdsByUserId(user.getId());
             if (ids.isEmpty()) {
-                return Page.empty(pageable);
+                return Page.empty(ordered);
             }
-            page = contentFileRepository.findFilteredScoped(effectiveProjectId, status, normalizedName, ids, pageable);
+            page = contentFileRepository.findFilteredScoped(effectiveProjectId, status, normalizedName, ids, ordered);
         } else if (operatorUsername != null) {
             // OPERATOR branch — scoped to owned ∪ admin-granted content (NOT project-gated).
             var user = userRepository.findByUsername(operatorUsername).orElse(null);
             if (user == null) {
-                return Page.empty(pageable);                            // fail-closed
+                return Page.empty(ordered);                             // fail-closed
             }
             Set<Long> ids = new HashSet<>(contentFileRepository.findIdsByUploadedBy(operatorUsername));
             ids.addAll(operatorAccessRepository.findContentIdsByUserId(user.getId()));
             if (ids.isEmpty()) {
-                return Page.empty(pageable);                            // empty-union short-circuit
+                return Page.empty(ordered);                             // empty-union short-circuit
             }
-            page = contentFileRepository.findFilteredScoped(effectiveProjectId, status, normalizedName, ids, pageable);
+            page = contentFileRepository.findFilteredScoped(effectiveProjectId, status, normalizedName, ids, ordered);
         } else {
-            page = contentFileRepository.findFiltered(effectiveProjectId, status, normalizedName, pageable);
+            page = contentFileRepository.findFiltered(effectiveProjectId, status, normalizedName, ordered);
         }
         return page.map(this::decorateWithThumbnail);
+    }
+
+    /**
+     * Give the listing a total order.
+     *
+     * <p>Neither listing query carries an {@code ORDER BY} of its own, so an unsorted request
+     * paginates in unspecified DB order — and that order <b>shifts as the transcode pipeline
+     * UPDATEs rows</b>, which is enough to move a row between pages while an operator is paging.
+     * Two rules, in this order:
+     *
+     * <ol>
+     *   <li>No caller sort ⇒ {@link ContentFileRepository#DEFAULT_LISTING_SORT} (newest first),
+     *       which is what every consumer of this endpoint already assumes.</li>
+     *   <li>Always append {@code id} as the final key, unless the caller already sorts by it. This
+     *       is what totally orders rows sharing a {@code createdAt} — and it is the key the
+     *       dashboard frontend structurally cannot send, because it binds a single {@code sort}
+     *       parameter per request.</li>
+     * </ol>
+     *
+     * <p>An explicit caller sort deliberately still wins: pinning the order inside the {@code @Query}
+     * instead would silence {@code sort=} for every caller of the endpoint, which is a bigger
+     * behaviour change than the bug being fixed.
+     */
+    private static Pageable withDeterministicOrder(Pageable pageable) {
+        if (pageable.isUnpaged()) {
+            return pageable;
+        }
+        Sort sort = pageable.getSort();
+        Sort effective = sort.isSorted() ? sort : ContentFileRepository.DEFAULT_LISTING_SORT;
+        if (effective.getOrderFor(TIEBREAKER_PROPERTY) == null) {
+            effective = effective.and(Sort.by(Sort.Direction.DESC, TIEBREAKER_PROPERTY));
+        }
+        return PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(), effective);
     }
 
     /**

@@ -177,9 +177,10 @@ public class TelegramBotConfig {
      * Health-check handler with optional dependencies — every backing service is
      * resolved via {@link ObjectProvider} so a missing bean (uncommon in production,
      * common in slim test slices) collapses to a per-row {@code DOWN — no … bean}
-     * rather than a startup failure. The two executor providers are name-qualified
-     * because the application has multiple {@link ThreadPoolTaskExecutor} beans
-     * (urgent transcode, audit, report) and we only want the two transcode pools.
+     * rather than a startup failure. {@code auditExec} is name-qualified because the
+     * application has several {@link ThreadPoolTaskExecutor} beans (audit, report) and
+     * only that one is wanted here; the transcode pool is its own type, so it resolves
+     * without a qualifier.
      */
     @Bean
     @ConditionalOnProperty(name = "telegram.bot.enabled", havingValue = "true")
@@ -190,12 +191,13 @@ public class TelegramBotConfig {
             ObjectProvider<MinioClient> minioProvider,
             ObjectProvider<DeviceStatusViewRepository> statusViewRepoProvider,
             ObjectProvider<IncidentRepository> incidentRepoProvider,
-            @Qualifier("urgentTranscodeExecutor") ObjectProvider<ThreadPoolTaskExecutor> urgentExec,
+            ObjectProvider<uz.orientadvertise.services.infra.storage.TranscodeExecutor> transcodeExec,
             @Qualifier("auditExecutor") ObjectProvider<ThreadPoolTaskExecutor> auditExec,
+            uz.orientadvertise.services.infra.storage.MinioHealthStatus minioHealthStatus,
             @Value("${app.health.data-volume-path:.}") String dataVolumePath) {
         return new HealthCommandHandler(bot, dataSourceProvider, redisProvider,
                 minioProvider, statusViewRepoProvider, incidentRepoProvider,
-                urgentExec, auditExec, dataVolumePath);
+                transcodeExec, auditExec, minioHealthStatus, dataVolumePath);
     }
 
     /**

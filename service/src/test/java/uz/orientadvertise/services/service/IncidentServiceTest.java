@@ -1,6 +1,7 @@
 package uz.orientadvertise.services.service;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -51,8 +53,8 @@ class IncidentServiceTest {
         var device = mockDevice(10L);
         var event = new Event(device, "DEVICE_OFFLINE", Priority.CRITICAL, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(event);
-        when(incidentRepository.findOpenByDeviceAndEventType(10L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(10L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of());
 
         service.processEvent(event);
 
@@ -64,8 +66,8 @@ class IncidentServiceTest {
         var device = mockDevice(11L);
         var event = new Event(device, "DISK_WARN", Priority.MEDIUM, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(event);
-        when(incidentRepository.findOpenByDeviceAndEventType(11L, "DISK_WARN"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(11L, "DISK_WARN"))
+                .thenReturn(List.of());
 
         service.processEvent(event);
 
@@ -81,8 +83,8 @@ class IncidentServiceTest {
         when(eventRepository.save(any(Event.class))).thenReturn(event);
         var existing = mock(Incident.class);
         when(existing.getPriority()).thenReturn(Priority.CRITICAL);
-        when(incidentRepository.findOpenByDeviceAndEventType(12L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.of(existing));
+        when(incidentRepository.findAllOpenByDeviceAndEventType(12L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of(existing));
 
         service.processEvent(event);
 
@@ -103,8 +105,8 @@ class IncidentServiceTest {
             return null;
         }).when(existing).recordRepeatOccurrence(any());
         when(existing.getDevice()).thenReturn(device);
-        when(incidentRepository.findOpenByDeviceAndEventType(13L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.of(existing));
+        when(incidentRepository.findAllOpenByDeviceAndEventType(13L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of(existing));
 
         service.processEvent(event);
 
@@ -116,8 +118,8 @@ class IncidentServiceTest {
         var device = mockDevice(1L);
         var event = new Event(device, "DISK_FULL", Priority.HIGH, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(event);
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "DISK_FULL"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DISK_FULL"))
+                .thenReturn(List.of());
         when(incidentRepository.save(any(Incident.class))).thenAnswer(inv -> inv.getArgument(0));
 
         var result = service.processEvent(event);
@@ -137,14 +139,38 @@ class IncidentServiceTest {
 
         var repeatEvent = new Event(device, "DISK_FULL", Priority.MEDIUM, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(repeatEvent);
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "DISK_FULL"))
-                .thenReturn(Optional.of(existingIncident));
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DISK_FULL"))
+                .thenReturn(List.of(existingIncident));
 
         var result = service.processEvent(repeatEvent);
 
         assertTrue(result.wasUpdated());
         assertEquals(2, result.incident().getOccurrenceCount());
         // Should NOT create a new incident
+        verify(incidentRepository, never()).save(any(Incident.class));
+    }
+
+    @Test
+    void processEvent_duplicateOpenIncidents_updatesTheOldest_insteadOfThrowing() {
+        // LOGIC-16: "one open incident per (device, type)" is service-enforced only, so duplicates
+        // can exist. The single-result lookup threw on them and the event never reached any
+        // incident; now the OLDEST (lowest id) takes the occurrence — even if the query returns it
+        // second — and nothing new is created.
+        var device = mockDevice(1L);
+        var firstEvent = new Event(device, "DISK_FULL", Priority.MEDIUM, "{}", Instant.now());
+        var newer = withId(new Incident(device, "DISK_FULL", Priority.MEDIUM, "newer", firstEvent), 42L);
+        var oldest = withId(new Incident(device, "DISK_FULL", Priority.MEDIUM, "oldest", firstEvent), 7L);
+        var repeatEvent = new Event(device, "DISK_FULL", Priority.MEDIUM, "{}", Instant.now());
+        when(eventRepository.save(any(Event.class))).thenReturn(repeatEvent);
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DISK_FULL"))
+                .thenReturn(List.of(newer, oldest));
+
+        var result = service.processEvent(repeatEvent);
+
+        assertTrue(result.wasUpdated());
+        assertEquals(7L, result.incident().getId());
+        assertEquals(2, oldest.getOccurrenceCount());
+        assertEquals(1, newer.getOccurrenceCount(), "only one incident takes the occurrence");
         verify(incidentRepository, never()).save(any(Incident.class));
     }
 
@@ -156,8 +182,8 @@ class IncidentServiceTest {
 
         var criticalEvent = new Event(device, "CONN_LOST", Priority.CRITICAL, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(criticalEvent);
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "CONN_LOST"))
-                .thenReturn(Optional.of(existingIncident));
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "CONN_LOST"))
+                .thenReturn(List.of(existingIncident));
 
         var result = service.processEvent(criticalEvent);
 
@@ -170,8 +196,8 @@ class IncidentServiceTest {
         var device = mockDevice(1L);
         var event = new Event(device, "TEMP_HIGH", Priority.MEDIUM, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(event);
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "TEMP_HIGH"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "TEMP_HIGH"))
+                .thenReturn(List.of());
         when(incidentRepository.save(any(Incident.class))).thenAnswer(inv -> inv.getArgument(0));
 
         var result = service.processEvent(event);
@@ -184,8 +210,8 @@ class IncidentServiceTest {
     void processEvent_afterResolve_createsNewIncident() {
         var device = mockDevice(1L);
         // No open incident (previous one was resolved)
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "DISK_FULL"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DISK_FULL"))
+                .thenReturn(List.of());
 
         var event = new Event(device, "DISK_FULL", Priority.HIGH, "{}", Instant.now());
         when(eventRepository.save(any(Event.class))).thenReturn(event);
@@ -241,8 +267,8 @@ class IncidentServiceTest {
         var device = mockDevice(1L);
         var event = new Event(device, "DEVICE_OFFLINE", Priority.CRITICAL, null, Instant.now());
         var incident = new Incident(device, "DEVICE_OFFLINE", Priority.CRITICAL, "d", event);
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.of(incident));
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of(incident));
 
         boolean resolved = service.autoResolveOnRecovery(1L, "DEVICE_OFFLINE");
 
@@ -253,21 +279,41 @@ class IncidentServiceTest {
     }
 
     @Test
+    void autoResolveOnRecovery_duplicateOpenIncidents_resolvesEveryOne() {
+        // "One open incident per (device, type)" is service-enforced only (no partial unique
+        // index on H2), so duplicates can exist. The single-result lookup threw on them and the
+        // device could never recover; the resolve must heal them all instead.
+        var device = mockDevice(1L);
+        var event = new Event(device, "DEVICE_OFFLINE", Priority.CRITICAL, null, Instant.now());
+        var first = new Incident(device, "DEVICE_OFFLINE", Priority.CRITICAL, "d", event);
+        var second = new Incident(device, "DEVICE_OFFLINE", Priority.CRITICAL, "d", event);
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of(first, second));
+
+        assertTrue(service.autoResolveOnRecovery(1L, "DEVICE_OFFLINE"));
+
+        assertEquals(Incident.Status.RESOLVED, first.getStatus());
+        assertEquals(Incident.Status.RESOLVED, second.getStatus());
+        verify(dashboardBroadcaster, times(2)).incidentUpdated(any());
+    }
+
+    @Test
     void autoResolveOnRecovery_noOpenIncident_returnsFalse() {
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of());
 
         assertFalse(service.autoResolveOnRecovery(1L, "DEVICE_OFFLINE"));
+        verify(dashboardBroadcaster, never()).incidentUpdated(any());
     }
 
     @Test
     void autoResolveOnRecovery_doesNotOverrideManuallyResolvedIncident() {
         // Edge case requirement: a manually-resolved incident must not be touched.
-        // findOpenByDeviceAndEventType filters out RESOLVED status (status <> RESOLVED),
+        // findAllOpenByDeviceAndEventType filters out RESOLVED status (status <> RESOLVED),
         // so the lookup is empty — auto-resolve is a no-op. This proves the manual close
         // is sealed.
-        when(incidentRepository.findOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
-                .thenReturn(Optional.empty());
+        when(incidentRepository.findAllOpenByDeviceAndEventType(1L, "DEVICE_OFFLINE"))
+                .thenReturn(List.of());
 
         boolean resolved = service.autoResolveOnRecovery(1L, "DEVICE_OFFLINE");
 
@@ -304,6 +350,17 @@ class IncidentServiceTest {
         incident.resolve();
         assertEquals(Incident.Status.RESOLVED, incident.getStatus());
         assertFalse(incident.isOpen());
+    }
+
+    private static Incident withId(Incident incident, Long id) {
+        try {
+            var f = Incident.class.getDeclaredField("id");
+            f.setAccessible(true);
+            f.set(incident, id);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+        return incident;
     }
 
     private Device mockDevice(Long id) {

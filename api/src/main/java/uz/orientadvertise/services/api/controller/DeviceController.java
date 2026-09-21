@@ -6,6 +6,10 @@ import java.util.List;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -21,6 +25,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import uz.orientadvertise.services.api.dto.SetVolumeRequest;
+import uz.orientadvertise.services.api.security.ClientIp;
+import uz.orientadvertise.services.domain.content.DevicePushChannel;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.DeviceActionType;
 import uz.orientadvertise.services.domain.model.DeviceStatusView;
@@ -32,7 +38,9 @@ import uz.orientadvertise.services.service.DeviceHeartbeatService;
 import uz.orientadvertise.services.service.DeviceManagementService;
 import uz.orientadvertise.services.service.DeviceRegistrationRateLimiter;
 import uz.orientadvertise.services.service.DeviceRegistrationService;
+import uz.orientadvertise.services.service.exception.DeviceAlreadyRegisteredException;
 import uz.orientadvertise.services.service.RemoteActionService;
+import uz.orientadvertise.services.service.RemoteSessionService.DesiredRemoteSession;
 import uz.orientadvertise.services.service.RemoteActionService.DeviceConfirmResult;
 import uz.orientadvertise.services.service.RemoteActionService.DeviceConfirmStatus;
 import uz.orientadvertise.services.service.DeviceSyncService;
@@ -52,6 +60,8 @@ import java.util.Set;
 @RequestMapping("/api/devices")
 public class DeviceController {
 
+    private static final Logger log = LoggerFactory.getLogger(DeviceController.class);
+
     private final DeviceRegistrationService registrationService;
     private final DeviceHeartbeatService heartbeatService;
     private final DeviceManagementService managementService;
@@ -61,6 +71,7 @@ public class DeviceController {
     private final RemoteActionService remoteActionService;
     private final DeviceDiagnosticsService diagnosticsService;
     private final DeviceRegistrationRateLimiter registrationRateLimiter;
+    private final DevicePushChannel devicePushChannel;
 
     public DeviceController(DeviceRegistrationService registrationService,
                              DeviceHeartbeatService heartbeatService,
@@ -70,7 +81,8 @@ public class DeviceController {
                              DeviceActionService deviceActionService,
                              RemoteActionService remoteActionService,
                              DeviceDiagnosticsService diagnosticsService,
-                             DeviceRegistrationRateLimiter registrationRateLimiter) {
+                             DeviceRegistrationRateLimiter registrationRateLimiter,
+                             DevicePushChannel devicePushChannel) {
         this.registrationService = registrationService;
         this.heartbeatService = heartbeatService;
         this.managementService = managementService;
@@ -80,6 +92,7 @@ public class DeviceController {
         this.remoteActionService = remoteActionService;
         this.diagnosticsService = diagnosticsService;
         this.registrationRateLimiter = registrationRateLimiter;
+        this.devicePushChannel = devicePushChannel;
     }
 
     @PostMapping("/register")
@@ -87,8 +100,25 @@ public class DeviceController {
                                                                jakarta.servlet.http.HttpServletRequest httpRequest) {
         // First contact has no token, so this endpoint is permitAll — rate-limit per source
         // IP to blunt serial-guessing / mass-registration.
-        registrationRateLimiter.check(resolveSourceIp(httpRequest));
-        var result = registrationService.register(request.serialNumber(), request.deviceName());
+        var sourceIp = ClientIp.of(httpRequest);
+        // AUTH-02: attempts on an already-registered serial (409 unless an admin opened a window)
+        // have their own budget, so a wiped box's retries don't starve new boxes behind the same
+        // NAT, while polling a known serial to snatch a window stays metered.
+        if (registrationService.isRegistered(request.serialNumber())) {
+            registrationRateLimiter.checkReregistration(sourceIp);
+        } else {
+            registrationRateLimiter.check(sourceIp);
+        }
+        DeviceRegistrationService.RegistrationResult result;
+        try {
+            result = registrationService.register(request.serialNumber(), request.deviceName());
+        } catch (DeviceAlreadyRegisteredException e) {
+            // INFO, like 429s: a stuck box retries every few minutes, and WARN would flood the
+            // Telegram alert budget. The serial is pattern-validated, so it is safe to log.
+            log.info("Refused re-registration of an already-registered device [id={}, serial={}, ip={}]",
+                    e.getDeviceId(), e.getSerialNumber(), sourceIp);
+            throw e;
+        }
         var status = result.newRegistration() ? 201 : 200;
         return ResponseEntity.status(status).body(new DeviceRegistrationResponse(
                 result.deviceId(),
@@ -107,8 +137,13 @@ public class DeviceController {
             jakarta.servlet.http.HttpServletRequest httpRequest) {
         String reportedVersion = request == null ? null : request.contentVersion();
         Integer reportedVolume = request == null ? null : request.volume();
-        String sourceIp = resolveSourceIp(httpRequest);
-        var result = heartbeatService.processHeartbeat(id, reportedVersion, sourceIp, reportedVolume);
+        var remote = request == null ? null : RemoteCapabilityDto.toReport(request.remote());
+        String sourceIp = ClientIp.of(httpRequest);
+        var result = heartbeatService.processHeartbeat(id, reportedVersion, sourceIp, reportedVolume, remote);
+        // The beat has committed and released its connection (no transaction spans this method;
+        // open-in-view is off). Only now close the incidents it recovered from — one pooled
+        // connection at a time, and a failure here can no longer roll the beat back.
+        heartbeatService.resolveRecoveredIncidents(id, result);
         var pending = result.pendingActions().stream()
                 .map(PendingActionDto::from)
                 .toList();
@@ -120,7 +155,8 @@ public class DeviceController {
                 result.expectedContentVersion(),
                 result.syncRequired(),
                 result.desiredVolume(),
-                result.syncGroupId()
+                result.syncGroupId(),
+                DesiredRemoteSessionDto.from(result.desiredRemoteSession())
         ));
     }
 
@@ -128,24 +164,28 @@ public class DeviceController {
      * Heartbeat body. {@code volume} (optional, 0-100) is the device's current output volume —
      * the server stores it (clamped) and never fails the beat on a bad value. The response's
      * {@code desiredVolume} is the target the device should converge to.
+     *
+     * <p>{@code remote} (optional) is the device's remote view/control capability. Records
+     * deserialize missing fields as {@code null}, so an old client that has never heard of it
+     * keeps working byte-for-byte untouched — and a malformed block is clamped and logged, never
+     * fatal to the beat.
      */
-    public record HeartbeatRequest(String contentVersion, Integer volume) {}
+    public record HeartbeatRequest(String contentVersion, Integer volume, RemoteCapabilityDto remote) {}
 
     /**
-     * Pull the client IP from {@code X-Forwarded-For} (first hop) when present, falling
-     * back to {@code request.getRemoteAddr()}. The header is typically set by the
-     * reverse proxy in front of the API; trust the first entry which is the original
-     * client.
+     * Device-reported remote capability. {@code input} ∈ {ROOT, ACCESSIBILITY, NONE},
+     * {@code transport} ∈ {SCRCPY_WS, NONE} — but they are plain Strings, not enums, on purpose:
+     * an unrecognised value must be <b>ignored with a WARN</b>, not turned into a 400 that fails
+     * the whole heartbeat.
      */
-    private static String resolveSourceIp(jakarta.servlet.http.HttpServletRequest request) {
-        if (request == null) return null;
-        String fwd = request.getHeader("X-Forwarded-For");
-        if (fwd != null && !fwd.isBlank()) {
-            int comma = fwd.indexOf(',');
-            return (comma > 0 ? fwd.substring(0, comma) : fwd).trim();
+    public record RemoteCapabilityDto(Boolean supported, String input, String transport,
+                                       Integer maxWidth, Integer maxHeight) {
+        static DeviceHeartbeatService.RemoteCapabilityReport toReport(RemoteCapabilityDto dto) {
+            return dto == null ? null : new DeviceHeartbeatService.RemoteCapabilityReport(
+                    dto.supported(), dto.input(), dto.transport(), dto.maxWidth(), dto.maxHeight());
         }
-        return request.getRemoteAddr();
     }
+
 
     /**
      * Returns the device's currently-assigned playlist as an ordered list with file URLs
@@ -180,6 +220,28 @@ public class DeviceController {
         managementService.assertScopeForDevice(id);   // operator scope ⇒ 404 if out of scope
         return ResponseEntity.ok(diagnosticsService.getDiagnostics(id));
     }
+
+    /**
+     * Live WebSocket liveness for a single device — is a socket open <em>right now</em>.
+     *
+     * <p>Deliberately <b>not</b> backed by {@code device_status_view}: that view's computed
+     * status lags up to 16 minutes ({@code OFFLINE_THRESHOLD} 15 min plus the hardcoded
+     * {@code INTERVAL '16' MINUTE} in V34, recreated in V41), which makes it useless for a
+     * Connect button. This reads the in-memory socket map through {@link DevicePushChannel}.
+     *
+     * <p>Caveat, and it is a real one: the socket map is per-replica. On a single-replica
+     * deployment (today's) this is exact; behind more than one replica it answers only for the
+     * replica that served the request. See the README's Redis-fan-out note.
+     */
+    @GetMapping("/{id}/connection")
+    @PreAuthorize("hasAnyRole('ADMIN', 'OPERATOR', 'VIEWER')")
+    public ResponseEntity<DeviceConnectionResponse> connection(@PathVariable Long id) {
+        managementService.assertScopeForDevice(id);   // operator scope ⇒ 404 if out of scope
+        return ResponseEntity.ok(new DeviceConnectionResponse(id, devicePushChannel.isConnected(id)));
+    }
+
+    /** Live socket liveness — {@code connected} is truth as of this instant, not a derived status. */
+    public record DeviceConnectionResponse(Long deviceId, boolean connected) {}
 
     /**
      * Device polls for outstanding actions to execute. Returns only PENDING entries — once
@@ -466,10 +528,28 @@ public class DeviceController {
         return ResponseEntity.noContent().build();
     }
 
+    /**
+     * AUTH-02: let this device's serial re-register once within the configured window (default
+     * 1 h) — for a TV box that was wiped or reinstalled and lost its token.
+     */
+    @PostMapping("/{id}/reregistration-window")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ReregistrationWindowResponse> allowReregistration(@PathVariable Long id) {
+        return ResponseEntity.ok(new ReregistrationWindowResponse(registrationService.allowReregistration(id)));
+    }
+
     public record DeviceRegistrationRequest(
-            @NotBlank(message = "Serial number is required") String serialNumber,
+            // Alphanumeric first char: also keeps a leading = + - @ out of spreadsheet exports.
+            @NotBlank(message = "Serial number is required")
+            @Size(max = 100, message = "Serial number must be at most 100 characters")
+            @Pattern(regexp = "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                    message = "Serial number may contain only letters, digits and . _ : - and must start with a letter or digit")
+            String serialNumber,
+            @Size(max = 200, message = "Device name must be at most 200 characters")
             String deviceName
     ) {}
+
+    public record ReregistrationWindowResponse(Instant allowedUntil) {}
 
     public record DeviceRegistrationResponse(Long deviceId, String deviceToken, String serialNumber, String status,
                                              // Sync group (§1.1): usually the region-level fallback at
@@ -492,8 +572,27 @@ public class DeviceController {
             Integer desiredVolume,
             // Synchronized-playback group (§1.1): facility ?? group ?? region. Echoed every beat so a
             // relocated device re-groups promptly; null ⇒ the device free-runs solo. Nullable.
-            String syncGroupId
+            String syncGroupId,
+            // Remote view/control desired state. Nullable and always emitted (Jackson writes it as
+            // null): existing clients ignore unknown/extra fields, so the beat stays byte-compatible
+            // apart from this one added key. null ⇒ no session wanted; stop any running one.
+            DesiredRemoteSessionDto desiredRemoteSession
     ) {}
+
+    /**
+     * The remote session the device should be running right now — the same desired-state
+     * convergence loop as {@code desiredVolume}. The device dials {@code relayUrl} with
+     * {@code agentTicket} and MUST kill the stream at {@code expiresAt} on its own clock.
+     */
+    public record DesiredRemoteSessionDto(String sessionId, String relayUrl, String agentTicket,
+                                           Instant expiresAt, boolean viewOnly,
+                                           Integer maxWidth, Integer maxFps, Integer bitRate) {
+        static DesiredRemoteSessionDto from(DesiredRemoteSession d) {
+            return d == null ? null : new DesiredRemoteSessionDto(d.sessionId(), d.relayUrl(),
+                    d.agentTicket(), d.expiresAt(), d.viewOnly(),
+                    d.maxWidth(), d.maxFps(), d.bitRate());
+        }
+    }
 
     public record PendingActionDto(Long actionId, String actionType, String payload, Instant issuedAt, Instant expiresAt) {
         public static PendingActionDto from(RemoteAction action) {
@@ -701,7 +800,9 @@ public class DeviceController {
                                 Instant lastHeartbeatAt, Instant registeredAt,
                                 Instant createdAt, Instant updatedAt, Instant deletedAt,
                                 boolean deleted,
-                                Integer reportedVolume, Integer volumeOverride, int effectiveVolume) {
+                                Integer reportedVolume, Integer volumeOverride, int effectiveVolume,
+                                // AUTH-02: open admin re-registration window; null = none.
+                                Instant reregistrationAllowedUntil) {
         public static DeviceDetail from(Device d, Device.Status computedStatus, int effectiveVolume,
                                         String syncGroupName) {
             return new DeviceDetail(d.getId(), d.getSerialNumber(), d.getName(),
@@ -713,7 +814,8 @@ public class DeviceController {
                     d.getLastHeartbeatAt(), d.getRegisteredAt(),
                     d.getCreatedAt(), d.getUpdatedAt(), d.getDeletedAt(),
                     d.isDeleted(),
-                    d.getReportedVolume(), d.getDesiredVolume(), effectiveVolume);
+                    d.getReportedVolume(), d.getDesiredVolume(), effectiveVolume,
+                    d.getReregistrationAllowedUntil());
         }
     }
 }

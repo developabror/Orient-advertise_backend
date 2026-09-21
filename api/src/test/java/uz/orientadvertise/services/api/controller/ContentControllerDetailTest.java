@@ -25,6 +25,7 @@ import uz.orientadvertise.services.domain.model.Project;
 import uz.orientadvertise.services.service.ContentListService;
 import uz.orientadvertise.services.service.ContentListService.ContentFileView;
 import uz.orientadvertise.services.service.ContentManagementService;
+import uz.orientadvertise.services.service.ContentRetranscodeService;
 import uz.orientadvertise.services.service.ContentUploadService;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -51,6 +52,9 @@ class ContentControllerDetailTest {
 
     @MockitoBean
     private ContentManagementService managementService;
+
+    @MockitoBean
+    private ContentRetranscodeService retranscodeService;
 
     @MockitoBean
     private DeviceWebSocketHandler webSocketHandler;

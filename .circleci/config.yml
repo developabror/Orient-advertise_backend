@@ -4,6 +4,14 @@ executors:
   java:
     docker:
       - image: cimg/openjdk:21.0
+      # Redis is REQUIRED to run the suite, not optional. Every full-context @SpringBootTest in the
+      # infra module starts a RedisMessageListenerContainer during context refresh, and that startup
+      # is eager: without a reachable Redis the context fails and the whole :infra:test task goes red
+      # (FlywayMigrationTest, ContentAssignmentOverlapBoundaryTest, ContentFileTranscodeLeaseTest, …).
+      # Secondary images share the primary's network namespace, so localhost:6379 resolves — matching
+      # the spring.data.redis.host default. The api module excludes Redis autoconfiguration in its
+      # test profile and does not need this.
+      - image: cimg/redis:7.2
     working_directory: ~/project
 
 jobs:

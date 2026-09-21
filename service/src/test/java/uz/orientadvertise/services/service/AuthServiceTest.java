@@ -12,6 +12,7 @@ import uz.orientadvertise.services.domain.repository.AppUserRepository;
 import uz.orientadvertise.services.infra.auth.JwtTokenProvider;
 import uz.orientadvertise.services.infra.auth.RefreshTokenRepository;
 import uz.orientadvertise.services.infra.auth.RefreshTokenRepository.RefreshTokenData;
+import uz.orientadvertise.services.service.seed.DefaultLoginPolicy;
 
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -62,13 +63,13 @@ class AuthServiceTest {
     /**
      * Guards the V33 seed migration: the committed BCrypt hash must verify against
      * 'password' with the SAME encoder the app wires (BCryptPasswordEncoder), or every
-     * dev/test login breaks after the migration runs.
+     * dev login breaks after the migration runs. The hash lives in {@link DefaultLoginPolicy},
+     * whose own test pins it to the V33/V45 literals.
      */
     @Test
     void bcryptSeedHash_matchesPassword() {
         var realEncoder = new BCryptPasswordEncoder();
-        assertTrue(realEncoder.matches("password",
-                "$2b$10$7G6HLwBeJv/5nByvd/R43.2TjtngYZFWjpO5ExQR5U5B4r9YUxUIS"));
+        assertTrue(realEncoder.matches("password", DefaultLoginPolicy.DEFAULT_PASSWORD_HASH));
     }
 
     @Test

@@ -26,6 +26,8 @@ import uz.orientadvertise.services.domain.notification.TelegramNotifier;
 import uz.orientadvertise.services.service.AuthService;
 import uz.orientadvertise.services.service.exception.AssignmentTimeOverlapException;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.never;
@@ -33,6 +35,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -98,6 +101,41 @@ class GlobalExceptionHandlerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.fieldErrors[0].field").value("username"))
                 .andExpect(jsonPath("$.fieldErrors[0].message").value("Username is required"));
+    }
+
+    @Test
+    void validationError_neverEchoesARejectedPassword() throws Exception {
+        // AUTH-06: the 400 body is written to audit_log too; a too-short password must not be echoed.
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        // "Zq!" cannot occur in the random correlation id (lowercase hex) or timestamp.
+                        .content("{\"username\":\"alice\",\"password\":\"Zq!\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.fieldErrors[0].field").value("password"))
+                .andExpect(jsonPath("$.fieldErrors[0].rejectedValue").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(content().string(org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("Zq!"))));
+    }
+
+    @Test
+    void safeRejectedValue_dropsOnlyCredentialFields() {
+        assertEquals("ab", GlobalExceptionHandler.safeRejectedValue("username", "ab"));
+        assertEquals("x", GlobalExceptionHandler.safeRejectedValue("items[0].name", "x"));
+        assertNull(GlobalExceptionHandler.safeRejectedValue("password", "abc"));
+        assertNull(GlobalExceptionHandler.safeRejectedValue("create.request.newPassword", "abc"));
+        assertNull(GlobalExceptionHandler.safeRejectedValue("users[2].password", "abc"));
+        assertNull(GlobalExceptionHandler.safeRejectedValue("passwords[0]", "abc"));
+        assertNull(GlobalExceptionHandler.safeRejectedValue("props[password]", "abc"), "a sensitive map key");
+        assertNull(GlobalExceptionHandler.safeRejectedValue("create.passwords[0].<list element>", "abc"));
+    }
+
+    @Test
+    void safePath_masksSensitiveQueryParameters_forTheTelegramAlert() {
+        var req = new org.springframework.mock.web.MockHttpServletRequest("GET", "/api/auth/reset-password");
+        req.setQueryString("token=live-reset-token&lang=ru");
+
+        var path = GlobalExceptionHandler.safePath(req);
+
+        assertEquals("/api/auth/reset-password?token=***REDACTED***&lang=ru", path);
     }
 
     @Test

@@ -26,7 +26,8 @@ import uz.orientadvertise.services.service.PlaybackLogService.PlaybackEntry;
  * <p>Edge cases enforced server-side:
  * <ul>
  *   <li>{@code playedAt} in the future (beyond clock-skew tolerance) → entry rejected with reason</li>
- *   <li>{@code playedAt} older than 90 days → entry rejected (matches retention window)</li>
+ *   <li>{@code playedAt} older than {@code app.retention.playback} (90 days by default) → entry
+ *       rejected, reading the same property the nightly cleanup deletes by</li>
  *   <li>Duplicate {@code (deviceId, contentFileId, playedAt)} → silently ignored (idempotent),
  *       counted in {@code duplicate}. Dedup happens in the INSERT itself
  *       ({@code ON CONFLICT DO NOTHING}), so a duplicate can never abort the batch transaction

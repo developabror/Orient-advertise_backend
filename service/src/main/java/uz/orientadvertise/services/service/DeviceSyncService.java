@@ -16,8 +16,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
+import uz.orientadvertise.services.common.exception.StorageUnavailableException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.ContentFile;
+import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.PlaylistItem;
 import uz.orientadvertise.services.domain.model.SyncGroupPlaybackOverride;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
@@ -38,6 +40,10 @@ import uz.orientadvertise.services.domain.repository.SyncGroupPlaybackOverrideRe
  *   <li>No active assignment → device should drop everything it currently has.
  *   <li>Files that are not yet READY (still UPLOADED/TRANSCODING) are skipped — the
  *       device will pick them up on the next sync once the pipeline finishes.
+ *   <li>A file whose object is missing from MinIO is skipped (WARN). MinIO being
+ *       <em>unreachable</em> is the opposite case: the whole call fails with
+ *       {@link StorageUnavailableException} → HTTP 503 "retry later", because a partial plan
+ *       returned as 200 is indistinguishable to the device from a correct one (v1.0.144).
  * </ul>
  */
 @Service
@@ -104,6 +110,9 @@ public class DeviceSyncService {
             // prevented FE-side by that sentinel, not by retaining stale content here.
             log.debug("Sync [device={}] no active assignment; deleting {} held files",
                     deviceId, deviceHeld.size());
+            // No expected version ⇒ nothing a confirm could ever match. A marker armed for an
+            // assignment that has since lapsed would otherwise only trip SYNC_TIMEOUT.
+            clearStalePending(device);
             // No content ⇒ no loop: still echo syncGroupId, but no anchor/schedule (device stays idle).
             return new SyncPlan(deviceId, null, fullSync,
                     List.of(),
@@ -128,9 +137,13 @@ public class DeviceSyncService {
                 .map(ContentFile::getId)
                 .collect(Collectors.toUnmodifiableSet());
 
-        // Per-file URL generation is isolated: a missing object or signing failure on one
-        // file must not block the others. Files we can't serve are simply omitted from
-        // filesToAdd (storage inconsistency is logged for ops).
+        // Per-file URL generation is isolated: a missing object or signing failure on ONE
+        // file must not block the others, so those files are simply omitted from filesToAdd
+        // (storage inconsistency is logged for ops). A storage OUTAGE is the opposite case and
+        // propagates out of tryBuildFileToAdd as StorageUnavailableException → 503: it is not a
+        // fact about one file, and answering 200 with a short list would have the device apply an
+        // incomplete plan as if it were correct. Note this runs BEFORE filesToDelete is computed,
+        // so an outage can never produce a delete instruction either.
         List<SyncFileToAdd> filesToAdd = orderedReadyFiles.stream()
                 .filter(f -> !deviceHeld.contains(f.getId()))
                 .map(this::tryBuildFileToAdd)
@@ -235,6 +248,11 @@ public class DeviceSyncService {
         boolean hasWork = !filesToAdd.isEmpty() || !filesToDelete.isEmpty() || versionChanged;
         if (hasWork && expectedVersion != null) {
             device.markSyncPending(expectedVersion);
+        } else if (!hasWork) {
+            // The device already holds the expected state (e.g. its confirm was lost), so an
+            // in-flight marker left from an earlier plan is stale — clear it before
+            // SyncTimeoutMonitor escalates a sync that has in fact completed.
+            clearStalePending(device);
         }
 
         log.debug("Sync [device={}] full={} expectedVersion={} +{} -{} order={}",
@@ -245,6 +263,17 @@ public class DeviceSyncService {
                 filesToAdd, filesToDelete, playlistOrder,
                 presignedUrlExpiryMinutes, expiresAt,
                 syncGroupId, anchorEpochMs, loopDurationMs, activateAtEpochMs);
+    }
+
+    /**
+     * Clear the in-flight marker only when one is set: {@code clearSyncPending()} also bumps
+     * {@code updatedAt}, so calling it unconditionally would write the device row on every
+     * no-op sync.
+     */
+    private static void clearStalePending(Device device) {
+        if (device.getSyncPendingSince() != null) {
+            device.clearSyncPending();
+        }
     }
 
     /**
@@ -294,11 +323,6 @@ public class DeviceSyncService {
     }
 
     /**
-     * Generate a presigned GET URL for one file. Returns null on storage inconsistency
-     * (object missing) or any signing failure — the caller filters nulls out so other
-     * files in the same diff still ship. Each failure is logged so ops can investigate.
-     */
-    /**
      * Shared deliverability predicate: a playlist item ships to devices iff its content file is
      * READY with a processed object key. This single definition is reused by {@link #computeSyncPlan}
      * (the order base set), {@link #getPlaylistView}, and {@code PlaylistControlService} (the JUMP
@@ -321,6 +345,31 @@ public class DeviceSyncService {
                 && o.getContentVersion().equals(expectedVersion);
     }
 
+    /**
+     * Two failure modes that look identical to a mock and are opposites in production:
+     *
+     * <ul>
+     *   <li><b>This object is gone</b> ({@code exists == false}, {@code NoSuchKey},
+     *       {@link ResourceNotFoundException}) — a per-file storage inconsistency. MinIO answered;
+     *       it just doesn't have this key. Skipping the file is right: the other files in the
+     *       playlist are fine and the device should get them.</li>
+     *   <li><b>Storage is unreachable</b> ({@link StorageUnavailableException}) — every file is
+     *       equally unverifiable. Skipping them all produced an HTTP <b>200</b> carrying an
+     *       <em>incomplete</em> plan, which the device applies: it deletes nothing (nothing is
+     *       scheduled for deletion), downloads nothing, and plays a shortened loop that looks
+     *       exactly like a correct answer. A 503 is the truthful answer — the device's documented
+     *       behaviour for it is "retry later", which is precisely what should happen.</li>
+     * </ul>
+     *
+     * So {@code StorageUnavailableException} is re-thrown and nothing else is. It propagates out of
+     * {@link #computeSyncPlan} <em>before</em> {@code filesToDelete} is computed, so an outage can
+     * never produce a delete instruction either. {@link #getPlaylistView} shares this method and so
+     * 503s during an outage for the same reason — a truncated playlist is not a playlist.
+     *
+     * <p>The presign call cannot fail for outage reasons any more (signing is local crypto — see
+     * {@code MinioStorageClient.generatePresignedUrl}); the re-throw is there so the rule reads the
+     * same at both call sites and cannot rot if that ever changes.
+     */
     private SyncFileToAdd tryBuildFileToAdd(ContentFile f) {
         String key = f.getProcessedStorageKey();
         try {
@@ -329,6 +378,12 @@ public class DeviceSyncService {
                         f.getId(), key);
                 return null;
             }
+        } catch (StorageUnavailableException e) {
+            throw e;
+        } catch (ResourceNotFoundException e) {
+            log.warn("Storage inconsistency: content_file id={} (key={}) is READY in DB but missing from MinIO — excluding from sync",
+                    f.getId(), key);
+            return null;
         } catch (Exception e) {
             log.warn("Storage existence check failed for content_file id={} (key={}): {} — excluding from sync",
                     f.getId(), key, e.getMessage());
@@ -339,6 +394,8 @@ public class DeviceSyncService {
             String url = fileStorageService.presignedProcessedUrl(key, presignedUrlExpiryMinutes);
             return new SyncFileToAdd(f.getId(), f.getName(), f.getContentType(), f.getSizeBytes(),
                     f.getDurationSeconds(), f.getChecksum(), url);
+        } catch (StorageUnavailableException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("Presigned URL generation failed for content_file id={} (key={}): {} — excluding from sync",
                     f.getId(), key, e.getMessage());

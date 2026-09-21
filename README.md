@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.130`
+`1.0.144`
 
 ## Architecture
 
@@ -123,15 +123,24 @@ On logout, the **entire token family** is invalidated — all refresh tokens in 
 - **Role change takes effect on next token refresh** — roles are baked into the JWT access token; when `POST /auth/refresh` is called, the user's **current** role is fetched from the repository and embedded in the new access token
 - **Role removed after login** → next refresh invalidates the token family
 
-### Default Users (V12 — persisted in `app_user` table)
+### Default Users — dev only (`APP_SEED_ENABLED=true`)
 
-| Username    | Password | Role       | Active |
-|-------------|----------|------------|--------|
+V12/V33 seed these accounts (plus the owner account `developabror@gmail.com`, ADMIN) in every
+database, but since v1.0.136 **V45 deactivates them** and they
+are only usable where seed data is enabled (`dev` profile, or `APP_SEED_ENABLED=true` in `.env`),
+where `DefaultLoginPolicy` re-activates them at startup:
+
+| Username    | Password | Role       | Active (seed on) |
+|-------------|----------|------------|------------------|
 | admin       | password | ADMIN      | yes    |
 | operator    | password | OPERATOR   | yes    |
 | viewer      | password | VIEWER     | yes    |
 | advertiser  | password | ADVERTISER | yes    |
 | deactivated | password | VIEWER     | **no** |
+
+**With seed data off, the app refuses to start** while any active account still has the default
+password. The first ADMIN of such an environment comes from `APP_BOOTSTRAP_ADMIN_USERNAME` /
+`APP_BOOTSTRAP_ADMIN_PASSWORD` (see v1.0.136 below).
 
 ### User Deactivation
 
@@ -150,7 +159,7 @@ Deactivated users (`is_active = false`) are rejected **even with a valid JWT tok
 
 ### Device Registration (V13)
 
-`POST /api/devices/register` — TV-Box calls this on first boot with its serial number. No authentication required.
+`POST /api/devices/register` — TV-Box calls this on first boot with its serial number. No authentication required. An already-registered serial gets **409** unless an ADMIN opened a re-registration window for it (v1.0.137).
 
 ```json
 // Request
@@ -253,6 +262,7 @@ If Redis is unavailable, the publish failure is logged but the heartbeat itself 
 | PUT    | `/api/devices/{id}`          | ADMIN, OPERATOR         | Update name |
 | PUT    | `/api/devices/{id}/location` | ADMIN, OPERATOR         | Move device to a new region (and optional facility) |
 | DELETE | `/api/devices/{id}`          | ADMIN                   | Soft delete only |
+| POST   | `/api/devices/{id}/reregistration-window` | ADMIN      | Allow this serial to re-register once within the window (v1.0.137) |
 
 **`PUT /api/devices/{id}/location`** — body `{"regionId": <long>, "facilityId": <long|null>}`. Used to move a device out of the default "Unassigned" region and into a real region/facility, or to transfer it later. `facilityId` is nullable — `null` keeps the device under the region directly.
 
@@ -368,9 +378,28 @@ All mutating requests (POST, PUT, DELETE, PATCH) are logged asynchronously.
 ### Edge Cases
 
 - **Audit write failure never fails the original request** — `AsyncAuditWriter.record()` catches all exceptions, logs warning, continues
-- **Sensitive fields never appear in audit logs** — `SensitiveFieldMasker` redacts: password, secret, token, accessToken, refreshToken, secretKey, accessKey, authorization, creditCard, ssn, cvv, pin
+- **Sensitive fields never appear in audit logs** (v1.0.139) — bodies are parsed as JSON and every key that
+  `SensitiveFieldMasker.isSensitiveKey` matches is replaced, at any depth and of any type: keys containing
+  `password`/`secret`/`token`/`ticket`/`authorization`, keys ending in `key` (`rawKey`, `apiKey`, …), and
+  `pin`/`ssn`/`cvv`/`creditCard`. Non-JSON bodies are stored as `[omitted: non-JSON body]`, never raw.
+- **Credential endpoints keep no bodies at all** — POST `/api/me/password`, `/api/auth/reset-password`,
+  `/api/auth/refresh`, `/api/admin/api-keys` store `[omitted: credential endpoint]` (method/path/status/principal
+  are still recorded). Validation 400s never echo a credential field's `rejectedValue`.
+- **Successful device-agent traffic is not audited** (v1.0.143) — `POST /api/devices/*/heartbeat`,
+  `*/sync/confirm`, `*/actions/*/confirm`, `*/playback` and `*/remote/*/ack` skip the caching
+  wrappers entirely, so they cost nothing. They were 98.6% of the table on the test server, and
+  nothing reads `audit_log`. **A FAILED one (status ≥ 400) still records a bodyless entry**
+  (principal, method, path, status, time — bodies are `[omitted: unaudited device-agent body]`,
+  because nothing was buffered): a device using its token against another device's id is a
+  `@PreAuthorize` **403** raised inside the controller invocation, so it unwinds back through the
+  filter and keeps its trail. An authentication **401** is emitted by the security filter chain,
+  which runs before this filter — it never reached `audit_log`, before or after v1.0.143.
+  **Every other write under `/api/devices/**` is an operator/admin action and is still audited
+  in full** — `register`, `{id}/actions`, `playlist/control`, remote start/stop,
+  `reregistration-window`, edit, delete, location and volume.
 - **Async execution** — dedicated `auditExecutor` thread pool (2-5 threads, 500 queue). If queue full, entries are silently dropped
-- **Body size limit** — max 10KB logged per request/response body (truncated with `...[truncated]`)
+- **Body size limit** — masked first, then cut to 10,000 characters (`...[truncated]`). Request caching stops just
+  above 256 KiB, and bodies (request or response) over 256 KiB are not parsed (`[omitted: … bytes]`). UTF-8.
 
 ### Storage
 
@@ -415,9 +444,16 @@ All errors use a **uniform response format** with a `correlationId` for tracing:
 
 Schema is managed exclusively by Flyway versioned migrations. **No `ddl-auto: update` in production** — only `validate` (dev) or `none` (prod).
 
-- Migrations: `infra/src/main/resources/db/migration/V*.sql`
+- Migrations: `infra/src/main/resources/db/migration/V*.sql` — **head is `V48__content_assignment_confirmed_at.sql`**
 - Rollbacks: `infra/src/test/resources/db/rollback/U*.sql`
 - Migration failure **halts application startup** (Flyway default + Spring Boot propagation)
+- **Every new migration must bump `EXPECTED_MIGRATIONS` in `FlywayMigrationTest`** — it pins both
+  the applied count and a contiguous `1..N` version run, so an out-of-order or skipped version fails
+  in CI rather than on a prod deploy. The count includes the **Java** migration `V36` (there is no
+  `V36__*.sql` on disk). It is **48** as of v1.0.142.
+- **DDL must be valid on both H2 (PostgreSQL mode, used by tests) and PostgreSQL (production).**
+  Notably: **no partial unique indexes** — H2 does not support them, so rules like "one live remote
+  session per device" live in the service layer instead.
 
 ### Domain Schema (V4)
 
@@ -497,9 +533,28 @@ content_assignment_exclusion → assignment + device
     └── Exclude specific devices from an assignment
 ```
 
-**Priority Rule: DEVICE_GROUP (3) > FACILITY (2) > REGION (1)**
+**Resolution order (the total order, v1.0.142)**
 
-When resolving which playlist a device should play at a given time, the highest-priority matching assignment wins. If a device belongs to a group with a group-level assignment, that overrides any region or facility assignment.
+```sql
+ORDER BY priority DESC,                              -- DEVICE_GROUP 3 > FACILITY 2 > REGION 1
+         COALESCE(confirmed_at, created_at) DESC,    -- most recently CONFIRMED wins a tie
+         id DESC                                     -- last resort; makes the order TOTAL
+```
+
+Among the CONFIRMED, non-deleted, non-excluded assignments whose half-open window `[start_time, end_time)` covers the instant, the first row under this order is what the device plays. The most-specific target still wins outright: a group-level assignment overrides any region or facility one.
+
+The **recency** term (`confirmed_at`, added in V48 — *not* `updated_at`, which `bumpVersion()`/`truncateEndTo()` move) is what lets two assignments overlap on purpose: a short campaign confirmed over a long-running booking wins for its own window and hands the devices back when it ends. See the v1.0.142 release note below.
+
+**This rule exists in FOUR places and they must agree exactly:**
+
+| # | Copy | Where |
+|---|------|-------|
+| 1 | `ContentAssignment.PRECEDENCE` (Java `Comparator`, null-safe) | `domain/…/model/ContentAssignment.java` |
+| 2 | `ContentAssignmentRepository.findActiveAtTime` (JPQL `ORDER BY`) | `domain/…/repository/ContentAssignmentRepository.java` |
+| 3 | `device_status_view` — embedded **3×** (`active_playlist_id`, `active_playlist_name`, `computed_status`) | `V48__content_assignment_confirmed_at.sql` |
+| 4 | The consumers of (1): `resolveForDevice` and `previewForTarget` both `.max(PRECEDENCE)` | `service/…/ContentAssignmentService.java` |
+
+`ContentAssignmentWindowOverrideTest` pins (2) and (3) against each other on the real schema; `DeviceStatusViewActivePlaylistFilterTest` pins the three in-view copies against one another.
 
 **Edge Cases:**
 
@@ -578,7 +633,7 @@ Configurable via `app.assignments.draft-ttl-minutes` (default 60). Idle drafts g
 **Implementation:**
 - Routes to the right repo by `targetType`: `findByRegionId*`, `findByFacilityId*`, `findByDeviceGroupId*`
 - One bulk query for `findActiveAtTime` + one for all exclusions; per-device matching is in-memory
-- Resolves the device's currently-assigned playlist using the same priority rules as `resolveForDevice`
+- Resolves the device's currently-assigned playlist with `ContentAssignment.PRECEDENCE` — the *same* total order as `resolveForDevice` (copy #4 above), so the preview shows exactly what the device will play, including which of two overlapping campaigns wins right now
 
 **Edge cases:**
 
@@ -590,6 +645,11 @@ Configurable via `app.assignments.draft-ttl-minutes` (default 60). Idle drafts g
 | Excluded assignments | Filtered out of `currentAssignmentId` so the preview reflects what the device actually plays |
 
 ### Schedules (V8)
+
+> **Not applied to playback (v1.0.141, LOGIC-04).** Schedules are stored and the API below still
+> works, but nothing that decides what a device plays reads them — an assignment plays for its whole
+> start/end window. The UI no longer offers schedules and the per-minute evaluation job is off
+> (`app.schedule.evaluation-enabled=false`). Real dayparting is a separate, future feature.
 
 Schedules define when a content assignment is active. Linked to `content_assignment` with optional repeat patterns.
 
@@ -763,16 +823,20 @@ Callers pattern-match on the result to determine outcome — no exceptions for e
 
 - **Auto-bucket creation on startup** — configurable bucket list
 - **Presigned URL expiry** — configurable via `app.minio.presigned-url-expiry-minutes`
-- **Graceful degradation** — if MinIO is unavailable at startup, app starts but upload endpoints return HTTP 503
+- **Graceful degradation** — if MinIO is unavailable, the app keeps serving and storage endpoints return HTTP 503 until it comes back
 
 ### Resilience
 
-- `MinioBucketInitializer` (`ApplicationRunner`) — catches all exceptions, marks status DEGRADED
-- `MinioHealthStatus` — thread-safe state holder (UP/DEGRADED)
-- All storage operations check availability before proceeding
-- `StorageUnavailableException` → HTTP 503 via `GlobalExceptionHandler`
-- `GET /api/files/status` — reports current storage availability
-- **Compose ordering** — `app` declares `depends_on: minio { condition: service_healthy }` (alongside postgres and redis), so the bucket initializer never races a still-starting MinIO. Without this gate the initializer would fail once at boot, latch the DEGRADED flag, and every upload would 503 until the app is restarted manually.
+- `MinioHealthStatus` — thread-safe holder of `UP`/`DEGRADED` **plus the reason and since when**. Logs once per transition (WARN down, INFO up with the outage duration); re-marking the same state neither logs nor moves `since`.
+- `MinioBucketInitializer` (`ApplicationRunner`) — creates the buckets, marks UP; on failure marks DEGRADED with a reason and WARNs, and the app still starts.
+- **`MinioHealthProbe` (v1.0.144) — the flag is no longer a latch.** While storage is degraded it re-probes MinIO every `app.minio.recheck-interval` (default `PT30S`) with a single `bucketExists` and clears the flag on the first success. While storage is healthy it makes **no** MinIO calls. Before this, the only writer that could set `UP` ran once at startup, so any blip 503'd storage until the application was restarted by hand.
+- **Failure classification (v1.0.144) — `MinioFailureClassifier`, shared by every writer of the flag.** Degrades on `java.io.IOException` anywhere in the cause chain (connect/timeout/unknown-host, however many SDK wrappers deep), `ServerException`, `InvalidResponseException`, and an `ErrorResponseException` that is a 5xx (by S3 code or HTTP status). Stays per-request: every 4xx — `NoSuchKey`, `NoSuchBucket`, `AccessDenied` — plus the quota `XMinioStorageFull` (HTTP 507, excluded by code: a full MinIO still serves reads) and the argument/parsing families. A blanket `catch (Exception) → degrade` is how one bad object became a fleet-wide outage; a type-only check is how "MinIO up but broken" became invisible.
+- **Presigned URLs work while MinIO is down.** `generatePresignedUrl` is an HMAC over strings with the region preconfigured and never touches the network, so it is not gated on the health flag (and never sets it).
+- All other storage operations check availability before proceeding
+- **The probe has its own short-timeout client** (`minioProbeClient`, 3 s) and the `@Scheduled` pool is sized 3, so a blackholed MinIO cannot park the single scheduler thread for minio-java's 5-minute default and silence the Telegram forwarder with it
+- `StorageUnavailableException` → HTTP 503 via `GlobalExceptionHandler`, with a **fixed** client-facing message (MinIO's own message names the endpoint, bucket and key, and this reaches TV boxes) and a **constant-text WARN** so the Telegram rate limiter can fold a flood of them; the correlation id goes on an INFO line
+- `GET /api/files/status` — reports current storage availability; `GET /api/health` carries the `storage` component (state + reason + since); the Telegram `/health` probe writes its verdict back into the flag, so an operator check also heals it
+- **Compose ordering** — `app` declares `depends_on: minio { condition: service_healthy }` (alongside postgres and redis), so the bucket initializer never races a still-starting MinIO. Since v1.0.144 losing that race is survivable anyway — the probe recovers within one tick — but the gate keeps a clean boot clean.
 
 ### Configuration
 
@@ -780,15 +844,22 @@ Callers pattern-match on the result to determine outcome — no exceptions for e
 app:
   minio:
     url: http://localhost:9000
-    access-key: minioadmin
-    secret-key: minioadmin
+    # The `minioadmin` fallbacks are for BARE-METAL dev only (a MinIO you started by hand with its
+    # own defaults). application-prod.yml has NO fallback, and docker-compose supplies the real
+    # credentials from `.env` — see .env.example. Nothing ships a working credential.
+    access-key: ${MINIO_ACCESS_KEY:minioadmin}
+    secret-key: ${MINIO_SECRET_KEY:minioadmin}
     buckets:
       - uploads
       - content-raw
       - content-processed
     raw-bucket: content-raw
     presigned-url-expiry-minutes: 60
-    orphan-cleanup-after-hours: 24
+    raw-expiry-days: ${MINIO_RAW_EXPIRY_DAYS:30}   # raw/ originals deleted after 30 days; 0 = never
+    # How fast a MinIO outage heals. Re-probed ONLY while degraded; zero MinIO calls while healthy.
+    # ISO-8601 — a bare number is milliseconds to both readers of this key, so anything under 1s
+    # fails startup naming the property rather than hammering a dead MinIO.
+    recheck-interval: ${APP_MINIO_RECHECK_INTERVAL:PT30S}
 ```
 
 ### Content Upload Pipeline (V17)
@@ -848,14 +919,23 @@ Content-Type: application/json
 1. **WebSocket push (best-effort, immediate)** — `DeviceWebSocketHandler` broadcasts to every device with an open `/ws/devices/{id}` socket. The push is fire-and-forget; failures are recorded in the response (`webSocketPush.sent / skipped / failed`) but do not error the request.
 2. **Heartbeat fallback (durable, eventual)** — devices that aren't currently connected pick up the same content on their next heartbeat poll via the existing `remote_action` queue.
 
-**Front-of-queue transcoding:**
+**Front-of-queue transcoding** (rewritten in v1.0.132):
 
 ```
-@Bean("urgentTranscodeExecutor")  — 2-4 threads, queue 20, CallerRunsPolicy
-@Bean("auditExecutor")             — 2-5 threads, queue 500, normal traffic
+TranscodeExecutor  — width auto-planned from the host (1 on a 700 MiB/1-vCPU box, 7 on 8-core/16 GB),
+                     PriorityBlockingQueue, bounded queue, rejection logged at ERROR
+@Bean("auditExecutor")  — audit rows and notifications only; NO transcodes
 ```
 
-`Transcoder.transcodeAsyncUrgent(id)` runs on the dedicated `urgentTranscodeExecutor` so urgent uploads don't queue behind backlogged normal jobs. Same pipeline (FFprobe inspect → ffmpeg → output check → upload), just on a different pool.
+`Transcoder.transcodeAsyncUrgent(id)` enqueues at `PRIORITY_URGENT`, so an urgent upload overtakes
+everything already queued at any pool width. Same pipeline (FFprobe inspect → ffmpeg → output check
+→ upload), just ahead in line. It cannot preempt an encode already running — nothing short of
+killing a live ffmpeg could — so on a host whose planned width is 1, "urgent" means *next*, not *now*.
+
+There is deliberately only **one** transcode pool: a second one makes the real ceiling on concurrent
+encodes the sum of two widths, and since ffmpeg is a child of the JVM that RSS lands in the same
+cgroup. The former `urgentTranscodeExecutor` also used `CallerRunsPolicy`, which on overflow ran the
+entire multi-minute pipeline inline on the Tomcat request thread.
 
 **Edge case: WebSocket push failure → heartbeat carries it.** The WebSocket handler returns a `PushResult(sent, skipped, failed)`:
 - `skipped` = device wasn't connected
@@ -966,21 +1046,45 @@ The endpoint is `permitAll`.
 
 ### Nightly Retention Cleanup
 
-`RetentionCleanupService` deletes `event` and `playback_log` rows older than 90 days. Scheduled at **02:00 in `Asia/Karachi` (UTC+5)** via Spring `@Scheduled(cron = "0 0 2 * * ?", zone = "Asia/Karachi")`.
+`RetentionCleanupService` deletes `event`, `playback_log` and `audit_log` rows older than **each table's own** window. Scheduled at **02:00 in `Asia/Karachi` (UTC+5)** via Spring `@Scheduled(cron = "0 0 2 * * ?", zone = "Asia/Karachi")`.
+
+**Per-table retention (`app.retention.*`, all overridable from the environment):**
+
+| Key | Env var | Default | Why |
+|-----|---------|---------|-----|
+| `audit` | `APP_RETENTION_AUDIT` | `P14D` | `audit_log` rows carry a whole HTTP request **and** response body, and **nothing reads the table** — no API, no UI, no report. Since v1.0.143 successful device-agent traffic isn't audited at all (a failure still leaves a bodyless row), so what is left is a short forensic tail of operator/admin writes. |
+| `playback` | `APP_RETENTION_PLAYBACK` | `P90D` | Proof-of-play: advertisers are billed from it and `GET /api/stats/*` reports over it. `PlaybackLogService` refuses a report older than this **same** value, so the accept bound and the sweep can't disagree. |
+| `event` | `APP_RETENTION_EVENT` | `P90D` | Incident provenance. |
+| `batch-size` | `APP_RETENTION_BATCH_SIZE` | `1000` | Rows per transaction; also the "was that a full batch?" test that keeps a drain going. |
+| `max-run-duration` | `APP_RETENTION_MAX_RUN_DURATION` | `PT15M` | Wall-clock budget for the **whole run**, shared by the three tables. |
+| `max-batches-per-run` | `APP_RETENTION_MAX_BATCHES_PER_RUN` | `5000` | Safety stop per table — not a work cap. |
+| `guard-window` | `APP_RETENTION_GUARD_WINDOW` | `true` | Refuse to run outside 01:00–04:00 Asia/Karachi. |
+
+**Units and fail-fast validation.** A bare number means **days** for the three windows and
+**minutes** for `max-run-duration` (`@DurationUnit`) — Spring Boot's own default is *milliseconds*,
+so `APP_RETENTION_PLAYBACK=90`, the obvious way to write "90 days", would otherwise bind as 90 ms
+and the next 02:00 run would delete every proof-of-play row on the box. Explicit ISO-8601 (`P90D`)
+still wins. Each window must be **≥ 1 day**, `max-run-duration` **≥ 1 minute** and both counts
+**> 0**; a bad value fails binding at **startup** with the property name, because every one of these
+bounds a `DELETE`.
 
 **How it runs:**
 
-- Each table is drained in 1000-row batches
-- Each batch is its own `Propagation.REQUIRES_NEW` transaction (self-injection via `@Lazy` so the proxy boundary is crossed) — partial progress commits even if a later batch fails
-- Per-run cap of `MAX_BATCHES_PER_RUN = 100` (≤ 100k rows per table per run) prevents a long backlog from running for hours
-- A failure on the events drain doesn't block the playback drain (orchestrated independently with isolated try/catch)
-- Each run logs: `Retention cleanup done: deleted events=N, playback_logs=M, threshold=...`
+- Every table drains against **its own** threshold (`now - audit` / `now - playback` / `now - event`) through one shared helper — the three near-identical loops are gone
+- Each table is drained in `batch-size` batches, each batch its own `Propagation.REQUIRES_NEW` transaction (self-injection via `@Lazy` so the proxy boundary is crossed) — partial progress commits even if a later batch fails
+- A drain stops on: a short batch (drained), an exception (WARN once, the run moves on to the next table), the run's `max-run-duration` budget, or the `max-batches-per-run` safety stop
+- The budget is checked **after** each batch, so every table makes progress even under a tiny budget, and the run can't outlive its window
+- A stop on budget or cap logs at **INFO** with the table and the rows deleted — a visible backlog, not an alert (WARN is forwarded to Telegram) — and the next night continues from there
+- A failure on one table doesn't block the others (orchestrated independently with isolated try/catch)
+- Each run logs: `Retention cleanup done: deleted events=N, playback_logs=M, audit_logs=K` (the three thresholds are logged when the run starts)
 
 **Edge cases:**
 
 - **Events linked to open incidents are skipped.** `EventRepository.findExpiredIdsSkippingOpenIncidents(...)` filters out any event referenced as the `firstEvent` or `lastEvent` of a non-RESOLVED incident — losing those would orphan the incident's audit trail. After the incident is resolved, the event becomes deletable on the next nightly run.
 - **Time-of-day guard.** Even if the scheduler fires late or an operator triggers `runCleanup()` manually from a console, the method aborts with a no-op return when the current time is outside the **01:00–04:00 Asia/Karachi** window. Set `app.retention.guard-window=false` to disable in non-prod environments.
-- **Bounded blast radius.** Per-table cap × batch size = 100k rows max per run; `findIds` is `ORDER BY id ASC` so progress moves monotonically and successive runs don't repeat work.
+- **The per-run cap is a safety stop, not a budget.** It used to be `MAX_BATCHES_PER_RUN = 100`, i.e. 100k rows per table per night — which silently became a *ceiling*: past roughly 26 always-on devices `playback_log` gained more rows per day than a night could delete, so the table could never shrink again. The real bound is now wall-clock time; the cap only exists so a delete that never actually removes the rows it counted can't loop forever.
+- **Monotonic progress.** `findIds` is `ORDER BY id ASC`, so successive runs don't repeat work.
+- **`entity_audit_log` is deliberately not swept.** It is business provenance (who changed which entity) in small rows, not HTTP traffic.
 
 ### Event Search: `GET /api/events`
 
@@ -1017,18 +1121,17 @@ Example: `GET /api/events?deviceId=42&priority=CRITICAL&from=2026-04-01T00:00:00
 
 Both transitions are guarded inside the `Incident` aggregate (`IllegalStateException` mapped to 409 by `GlobalExceptionHandler`). The 409 protects the manual close audit trail and prevents duplicate close events.
 
-**Auto-resolve on device recovery.** `IncidentService.autoResolveOnRecovery(deviceId, eventType)` looks up the open incident for `(deviceId, eventType)` and, if found and not already resolved, transitions it to RESOLVED with `resolved_by = "system"`. Wired into `DeviceHeartbeatService` at two points:
+**Auto-resolve on device recovery.** `IncidentService.autoResolveOnRecovery(deviceId, eventType)` looks up every open incident for `(deviceId, eventType)` (so a duplicate heals too) and transitions each one to RESOLVED with `resolved_by = "system"`. Wired in at three points:
 
 | Trigger | Auto-resolves |
 |---------|---------------|
-| Status transitions FROM `OFFLINE` to anything else | `DEVICE_OFFLINE` |
+| Heartbeat whose *previous* beat is older than `DeviceHealthMonitor.HEARTBEAT_THRESHOLD` (15 min, the escalation threshold) or absent (v1.0.140; the stored status is never OFFLINE) | `DEVICE_OFFLINE` |
 | Heartbeat reports a matching version after a previous mismatch | `CONTENT_VERSION_MISMATCH` |
+| `DeviceHealthMonitor` recovery sweep (every health check): open incident, last heartbeat newer than the threshold | `DEVICE_OFFLINE` |
 
-The recovery hook calls `tryAutoResolve(...)` in a try/catch — a failure resolving an incident never fails the heartbeat itself.
+The heartbeat resolves **after its own transaction has committed**. `processHeartbeat` only reports the recovered types in `HeartbeatResult.resolveIncidentTypes` (server-internal, not on the wire). `DeviceController.heartbeat`, which has no transaction around it (`open-in-view: false`), then calls the non-transactional `DeviceHeartbeatService.resolveRecoveredIncidents`, and each `autoResolveOnRecovery` runs in its own transaction on its own connection. Resolving inside the beat instead would either join its transaction, so a failing resolve marks the beat rollback-only and loses it, or nest a second one, which holds two pooled connections per recovery beat and deadlocks the pool when a whole region recovers at once. Each resolve is wrapped in try/catch with a WARN, so it never fails the beat; the sweep retries whatever it missed. The OFFLINE→ONLINE *status event and broadcast* use a different rule: `DeviceStatusEvaluator.isOffline` (15 min + 60 s grace, the same cut-off as `device_status_view`). A 15–16 min gap therefore resolves the incident without announcing a transition that no screen showed.
 
-**Edge case: auto-resolve must not override manually resolved incidents.** Two layers of protection:
-1. `incidentRepository.findOpenByDeviceAndEventType(...)` filters by `status <> RESOLVED`, so manually-closed incidents are not even returned to the auto-resolver.
-2. Inside `autoResolveOnRecovery`, an additional `incident.isResolved()` guard handles the race where someone resolves the incident between the lookup and the decision.
+**Edge case: auto-resolve must not override manually resolved incidents.** `incidentRepository.findAllOpenByDeviceAndEventType(...)` filters by `status <> RESOLVED`, so an incident closed manually *before* the lookup is never returned to the auto-resolver. A manual resolve that commits *concurrently* with an auto-resolve is **not** detected: `Incident` has no `@Version` (LOGIC-07), so the two writes are last-writer-wins, and `resolved_by` shows whichever committed second. (An `isResolved()` re-check used to sit here, but it could never fire, because every row it saw came from that `status <> RESOLVED` query.)
 
 The audit trail distinguishes the two cases via `resolved_by`: a username (e.g. `"alice"`) for manual closes, the literal `"system"` for auto-resolve. `Incident.wasManuallyResolved()` exposes this for downstream filters.
 
@@ -1121,7 +1224,7 @@ IncidentService ─► CriticalIncidentBroadcaster (domain port)
 **Edge case: re-check incident status before opening — avoid duplicates on recovery.** Each candidate device passes through `escalate()` in its own `Propagation.REQUIRES_NEW` transaction. Inside, before emitting an event:
 
 1. **Re-read the device fresh** from the DB. If it recovered between the candidate fetch and decision, `stillMatches(...)` returns false and the emission is skipped.
-2. **Check `incident.findOpenByDeviceAndEventType(...)`**. If an open incident already exists for this `(deviceId, eventType)`, skip — without this guard, every 5-minute pass would bump the existing incident's occurrence count forever, even after the underlying condition cleared.
+2. **Check `incidentRepository.existsOpenByDeviceAndEventType(...)`**. If an open incident already exists for this `(deviceId, eventType)`, skip — without this guard, every 5-minute pass would bump the existing incident's occurrence count forever, even after the underlying condition cleared. An exists check, so duplicate open incidents (LOGIC-16) cannot make it throw.
 
 The result of each tick is logged: `offline +N (skipped M); mismatch +N (skipped M)` so ops can distinguish "newly detected" from "still open".
 
@@ -1192,6 +1295,830 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### MinIO outages self-heal; storage on `/api/health`; `/sync` stops hiding one (v1.0.144)
+
+> **DATA-02 — "one blip and storage is down until someone restarts the app."** `MinioHealthStatus`
+> was a two-state flag that starts **DEGRADED**, and the only code in the entire application that
+> could ever set it back to **UP** was `MinioBucketInitializer`, which runs once, at startup. Every
+> other writer could only degrade it — and every writer did, from a blanket `catch (Exception)` on
+> upload, download, `exists` and `delete`. So a MinIO restart, a full disk, a five-second network
+> blip or a single unreadable object latched the process: `ensureAvailable()` then threw
+> `StorageUnavailableException` for **every** storage call, including `generatePresignedUrl`, which
+> is pure local crypto and works perfectly while MinIO is unreachable (its own comment said so).
+> Uploads 503'd, transcodes were marked FAILED — and `/sync` was worse than either, because
+> `tryBuildFileToAdd` swallowed *both* the existence check and the presign failure to `null`: the
+> endpoint answered **HTTP 200 with a silently incomplete plan**. A TV box cannot tell that apart
+> from a correct answer. It applied it, played a shortened loop, and the fleet quietly ran the wrong
+> playlist until an operator happened to restart the backend. MinIO was also **absent from
+> `GET /api/health` entirely**, so the one surface an operator checks said nothing at all.
+
+**What changed in the repo**
+
+- **`MinioHealthStatus` carries a reason and a `since`**, modelled on `StorageLifecycleStatus`: one
+  immutable snapshot behind an `AtomicReference`, so state and reason can never be read torn.
+  `markDegraded(reason)` / `markUp()` log **once, on the transition** — WARN going down with the
+  reason, INFO coming back with how long it was down and what took it down. Re-marking the state we
+  are already in logs nothing and does **not** move `since`: every device in the fleet reaches
+  `markDegraded` on every failed call, WARN is forwarded to Telegram, and "down for 4 hours" must
+  not read as "down for 30 seconds" forever.
+- **New `MinioHealthProbe`** — `@Scheduled(fixedDelayString = "${app.minio.recheck-interval:PT30S}")`,
+  the missing second writer. While storage is degraded it issues one `bucketExists` against the raw
+  bucket and clears the latch on the first successful round trip; while storage is healthy it does
+  nothing at all, so a healthy deployment pays no MinIO calls for it. It never throws out of the
+  scheduled method, and a failed probe stays at DEBUG — the outage was already announced once.
+  A reachable MinIO that answers "no such bucket" still heals the flag: that is an S3-level fact
+  about one bucket, not a connectivity failure.
+- **The probe is cheap to FAIL, not just cheap to pass.** It runs on Spring's shared scheduling
+  pool — the Telegram log forwarder, `SyncTimeoutMonitor` and `TranscodeSweeper` are on it too —
+  and minio-java's OkHttp defaults are **5 minutes**. A *blackholed* MinIO (packets dropped rather
+  than refused: a crashed host, a full conntrack table, a dropped firewall rule) would hang each
+  probe for the whole timeout, parking a pool thread for the duration of the outage and stopping
+  the alerting meant to report it. So the probe uses its own `minioProbeClient` with 3 s
+  connect/read/write timeouts (the shared client keeps its long ones — it carries whole video
+  files), and `spring.task.scheduling.pool.size` is **3**, not the default 1. `fixedDelay` already
+  serialises a job against itself, so no other guard is needed.
+- **`app.minio.recheck-interval` fails startup below 1 s, naming the property.** The key is read
+  twice — bound onto `MinioProperties` and by the `@Scheduled` placeholder — and a bare number is
+  milliseconds to both, so `APP_MINIO_RECHECK_INTERVAL=30` meaning "30 seconds" would be 33 probes
+  a second against a dead MinIO, each holding a scheduler thread.
+- **New `MinioFailureClassifier` — one definition of "MinIO is broken", used by every writer of
+  the flag** (the storage client and the Telegram `/health` probe). Checked against minio-java
+  8.5.14's real behaviour, not its exception names. Degrades on: `java.io.IOException` **anywhere in
+  the cause chain** (`S3Base.throwEncapsulatedException` rethrows nine declared types and wraps
+  everything else in a bare `RuntimeException`, so a type-only check loses real outages);
+  `ServerException`; `InvalidResponseException` (the bytes were not an S3 response at all — a proxy
+  error page, a half-started MinIO); and an `ErrorResponseException` that is a **5xx** — by S3 code
+  (`InternalError`, `SlowDown`, `ServiceUnavailable`) or by HTTP status. `ServerException` alone is
+  not enough: it is constructed in exactly one place in the SDK, for a 5xx whose body could not be
+  parsed, so "MinIO up but broken" normally arrives as an `ErrorResponseException` instead. Stays
+  per-request: every 4xx (`NoSuchKey`, `NoSuchBucket`, `AccessDenied`), the quota
+  `XMinioStorageFull` — excluded by **code**, because MinIO answers it with HTTP **507** and a full
+  MinIO still serves reads, so a status-only rule would degrade on every upload and heal on every
+  probe, flapping a WARN+INFO into the operator chat each time — and the argument/parsing families.
+  The reason handed to `markDegraded` is operation + exception **type** only
+  (`"upload: ConnectException"`), never the message or the object key, because it is published on an
+  unauthenticated endpoint.
+- **`ensureAvailable()` removed from both `generatePresignedUrl` overloads.** Signing is an HMAC
+  over strings with the region preconfigured; it never touches the network. Gating it on the health
+  flag is what turned "MinIO is down" into "every device gets a short playlist". It still does not
+  mark degraded on failure — a presign failure is an argument bug, not an availability signal.
+- **`DeviceSyncService.tryBuildFileToAdd` tells the two failures apart.** A genuinely missing object
+  (`exists == false`, `NoSuchKey`, `ResourceNotFoundException`) keeps today's WARN-and-skip: it is a
+  fact about one file and the rest of the playlist must still ship. A `StorageUnavailableException`
+  now **propagates**, so `/sync` returns **503 "retry later"** — already the documented device
+  behaviour — instead of 200 with a truncated plan. It propagates *before* `filesToDelete` is
+  computed, so an outage can never produce a delete instruction either. `/playlist` shares the
+  method and fails the same way, for the same reason.
+- **`GET /api/health` gains a `storage` component** (new `StorageHealthIndicator`, same shape as
+  `StorageLifecycleHealthIndicator`/`DiskFreeHealthIndicator`), reporting DEGRADED as DOWN with the
+  reason and since when.
+- **The Telegram `/health` MinIO probe now writes back.** An operator typing `/health` performs
+  exactly the round trip the scheduled probe performs; a success heals the latch and a failure
+  records why — through the **same classifier**, so an `AccessDenied` from `listBuckets` (a healthy
+  MinIO refusing these credentials) reports DOWN in the chat without 503-ing every upload and every
+  device `/sync` in the fleet because an operator typed a slash command. Reporting "minio UP,
+  4 bucket(s)" in the chat while the application goes on refusing uploads because a stale flag says
+  otherwise is an hour of an incident. "No MinioClient bean" is a wiring fact, not a probe result,
+  and touches neither direction.
+- **The 503 body no longer echoes MinIO's message.** Storage failures reach TV boxes through
+  `/sync` and `/playlist` now, and MinIO's messages name the endpoint, the bucket and the object
+  key. Every storage 503 out of `MinioStorageClient` carries one fixed string; the detail stays in
+  the log.
+- **The storage 503 log line is constant text at WARN, not ERROR with a correlation id in it.**
+  `TelegramRateLimiter` keys its 5-per-5-minutes window on a SHA-256 of the rendered message, so a
+  per-request id made every occurrence a distinct hash: only the global 30/minute cap applied, and
+  a fleet-wide outage would evict every other alert from the 500-entry appender buffer — including
+  the ones explaining the outage. The correlation id moves to an INFO line, below the appender's
+  WARN threshold, so it never reaches Telegram and stays greppable in the log.
+- **New `app.minio.recheck-interval`** (`APP_MINIO_RECHECK_INTERVAL`, default `PT30S`) in
+  `MinioProperties`, `application.yml`, `.env.example` and the compose `environment:` block — a var
+  in `.env` alone does not reach the container. Write it as an ISO-8601 duration: the key is read
+  both by the binding and by the `@Scheduled` that drives the probe, and they agree on every input
+  only because neither declares a unit (a bare number is milliseconds to both).
+
+**Operating notes**
+
+- **A MinIO outage now recovers within ~30 s of MinIO coming back, with no restart.** Nothing needs
+  to be run by hand; `docker restart minio`, a full disk that gets cleared, or a network blip all
+  heal on the next probe tick. `/health` in Telegram heals it immediately.
+- **`/sync` answers 503 during an outage instead of a 200 with an incomplete playlist.** Devices
+  retry, and keep playing what they already hold — the previous behaviour handed them a short plan
+  they applied as if it were correct. The cost is that a storage outage is now visible to devices;
+  that is the point.
+- **A full bucket, a denied ACL or a deleted object no longer disable storage for everyone.** They
+  fail the one request that hit them, exactly as before, and the next request is unaffected. A 5xx
+  from MinIO does degrade — that is MinIO saying it cannot serve — and heals on the next probe.
+- **Devices and browsers get a fixed "Object storage is temporarily unavailable" on a storage 503.**
+  The endpoint, bucket, key and MinIO's own message stay in the application log.
+- **`/api/health` now shows storage** (`"storage"`, DOWN with e.g.
+  `upload: ConnectException (since 2026-09-20T04:12:00Z)`), so "uploads are 503-ing" is visible on
+  the same surface an operator already checks. A freshly-started process reports it DOWN with
+  `not probed yet (startup)` until the bucket initializer runs — honest, because storage endpoints
+  really do 503 in that window.
+
+**Tests:** new `MinioHealthStatusTest` (a logback `ListAppender` on the status logger) — the DEGRADED
+and UP transitions each log exactly one line at the right level, the recovery line carries both the
+reason and the duration, re-marking either state logs nothing and leaves `since` identical
+(`assertSame`), a full degrade→recover cycle logs exactly two lines, a null/blank reason falls back
+to a placeholder so health never publishes null, and `humanize` renders seconds/minutes/hours and
+clamps a backwards clock to `0s`. New `MinioHealthProbeTest` — degraded + probe ok → UP with the
+reason cleared, the configured raw bucket is the one probed (`ArgumentCaptor`), a probe that throws
+(checked `ConnectException` *and* an unchecked `IllegalStateException`) leaves the status degraded
+with its original reason and lets nothing escape, healthy → `verifyNoInteractions(minioClient)`, a
+missing bucket still heals, and two failures followed by a success recover on exactly the third
+probe. `MinioStorageClientTest` — quota `XMinioStorageFull`, `AccessDenied` on upload/stat/download
+and `NoSuchKey` on delete all reach the caller **without** degrading; `NoSuchBucket` on stat still
+returns false; `IOException`/`ConnectException`/`SocketTimeoutException` and `ServerException` do
+degrade, with the reason asserted to be `object stat: IOException` and **not** to contain the
+exception message; an unrecognised `IllegalArgumentException` stays per-request; presigning succeeds
+while degraded on both overloads and does not heal the flag. `DeviceSyncServiceTest` — a
+`StorageUnavailableException` from the existence check propagates out of `computeSyncPlan` (and out
+of `getPlaylistView`), one unverifiable file fails the whole sync rather than shipping the others,
+and during an outage no plan is produced at all so a held-but-no-longer-expected file is never
+scheduled for deletion and the in-flight marker is never armed (`verify(device, never())`); the
+missing-object and `ResourceNotFoundException` cases are still skipped with the rest of the playlist
+shipping. `HealthServiceTest` — six components in order with `storage` last, and an unreachable
+MinIO surfacing its reason while the database stays UP. New `StorageHealthIndicatorTest` — UP/DOWN,
+the reason and `since` on the payload, the pre-startup state, and recovery without a restart.
+`HealthCommandHandlerTest` — the Telegram probe heals the latch on success, degrades it on failure
+with `telegram /health probe: ConnectException` as the reason, leaves it alone when there is no
+`MinioClient` bean, and — the fleet-safety case — reports DOWN for an `AccessDenied` from
+`listBuckets` **without** degrading storage. New `MinioFailureClassifierTest` covers each family
+against the SDK's real shapes: a buried `IOException` two wrappers deep, a 5xx
+`ErrorResponseException` by status and by code, `InvalidResponseException`, an
+`ErrorResponseException` with no parsed body (`Set.of(…).contains(null)` would throw), 4xx codes,
+`XMinioStorageFull` at 507, the argument/parsing families, null, and a self-referential cause
+chain. `MinioStorageClientTest` adds the leak guard — a MinIO message naming the endpoint, bucket,
+object key and access key never appears in the 503 body, and upload/delete/short-circuit all return
+the same fixed string. `MinioHealthProbeTest` asserts the probe uses the short-timeout client and
+never the shared one, reads the built beans' OkHttp timeouts through reflection (3 s on the probe
+client, longer on the upload client), and pins the `recheck-interval` floor. New
+`StorageUnavailableLoggingTest` — two failures produce byte-identical WARN text, the text contains
+no correlation id or endpoint, the id is on an INFO line, nothing is logged at ERROR, and the
+response is still a 503 with a per-request id.
+
+### Device traffic no longer audited; per-table retention (v1.0.143)
+
+> **DATA-01 — "`audit_log` grows with the fleet, and nobody can read it."** `AuditFilter` wrote a full
+> request **and** response row for every POST/PUT/PATCH/DELETE, device-agent calls included — a
+> heartbeat every 120 s per box, plus a playback flush, plus sync/action/remote confirms. On the test
+> server **98.6%** of `audit_log` rows were that traffic, roughly **130 MB per always-on device** over
+> the retention window, on the same 8.1 G volume as the Postgres data directory, MinIO and `/swap.img`.
+> **Nothing reads the table**: there is no API over it, no UI, no report — so the cost bought nothing,
+> and the rows it bought were the least informative ones in it (the same beat, forever). Meanwhile
+> `RetentionCleanupService` swept all three tables with one 90-day constant and at most
+> `MAX_BATCHES_PER_RUN = 100` × 1000 rows per table per night. Past roughly **26 devices**
+> `playback_log` gained more rows per day than a night could delete, so the cap was not a safety
+> valve but a ceiling: the table could never shrink again, and nothing said so.
+
+**What changed in the repo**
+
+- **`AuditFilter` stops auditing SUCCESSFUL device-agent calls** — `POST /api/devices/*/heartbeat`,
+  `*/sync/confirm`, `*/actions/*/confirm`, `*/playback`, `*/remote/*/ack`. The check runs **before**
+  the caching wrappers are created, so a skipped call costs nothing rather than buffering a body and
+  throwing it away. Matched with `AntPathMatcher` on method + the **decoded** path within the
+  application (like the AUTH-06 `BODYLESS` check), so `%68eartbeat` can't slip past and `*` spans
+  exactly one segment — `/api/devices/1/heartbeats` and `/api/devices/1/playback/extra` are different
+  endpoints and stay audited. The scope is deliberately narrow: everything else under
+  `/api/devices/**` is an operator/admin write — `register`, `{id}/actions`, `playlist/control`,
+  `POST|DELETE {id}/remote…`, `reregistration-window`, `PUT|DELETE {id}`, `{id}/location`,
+  `{id}/volume`, `PUT /api/devices/volume` — and still writes its row. The credential-endpoint
+  body omission is untouched.
+- **A FAILED agent call still leaves a row.** The skip would otherwise have deleted the evidence
+  along with the noise: a device presenting its token against *another* device's id is a
+  `@PreAuthorize` **403**, raised during the controller invocation and therefore unwound back
+  through this filter. Any status ≥ 400 on those five paths records principal, method, path,
+  status and time, with both bodies as `[omitted: unaudited device-agent body]` — nothing was
+  buffered, which is the entire point. A healthy fleet produces none of these. (An authentication
+  **401** is emitted earlier, by the security filter chain, and has never reached this filter.)
+- **`RetentionProperties` refuses to boot on a bad bound.** `@DurationUnit` makes a bare number mean
+  days (minutes for the run budget), closing the `APP_RETENTION_PLAYBACK=90` → *90 milliseconds*
+  footgun, which would have put the threshold after `now` and deleted every billing row on the first
+  nightly run — with `PlaybackLogService` then rejecting every new report, so it could not come
+  back. `@Validated` + `@DurationMin`/`@Positive` require ≥ 1 day per window, ≥ 1 minute of budget
+  and positive counts, and the failure names the property at startup. `batch-size=0` used to throw
+  inside `PageRequest.of`, get caught per table and no-op the whole job behind one WARN.
+- **Client-driven playback rejections log at INFO, not WARN** (the v1.0.137 rule). A box returning
+  from an outage flushes up to 500 queued entries, and a skewed clock or an expired window made every
+  one of them a WARN — all forwarded to Telegram.
+- **New `RetentionProperties` (`app.retention.*`)** — `audit` **P14D**, `playback` **P90D**,
+  `event` **P90D**, `batch-size` 1000, `max-run-duration` **PT15M**, `max-batches-per-run` 5000,
+  `guard-window` true, each with an `APP_RETENTION_*` env override. Typed, no Lombok, defaults in the
+  class; the inline `@Value("${app.retention.guard-window:true}")` moved onto it. Tuning retention on
+  a box is now a restart, not a rebuild.
+- **Each table drains against its own threshold.** The three near-identical loops in
+  `RetentionCleanupService` collapsed into one helper taking (label, threshold, batch callable). The
+  `@Lazy self` REQUIRES_NEW-per-batch shape, the maintenance-window guard, `CleanupResult` and the
+  summary log are unchanged.
+- **The per-run cap stopped being the limit.** A run now has a wall-clock budget
+  (`max-run-duration`, shared by all three tables) and the batch cap is only a high safety stop
+  against a delete that never removes the rows it counted. Either stop logs at **INFO** naming the
+  table and the rows deleted, so a backlog is visible — INFO, not WARN, because an unfinished table
+  is routine and WARN reaches Telegram. The budget is checked *after* a batch, so every table makes
+  progress even under a tiny budget.
+- **`PlaybackLogService` reads the same property** for its "played_at older than the retention
+  window" rejection instead of its own 90-day constant, and the day count in the message follows the
+  configured value — the accept bound and the sweep cannot drift apart. The default is still 90 days,
+  so the Android spec's contract is unchanged.
+
+**Operating note**
+
+- **`audit_log` stops growing with the fleet.** Adding devices no longer adds audit rows at all; the
+  table's size now tracks operator activity, which is flat.
+- **Existing device rows disappear within 14 days of deploying** — the first nightly run after the
+  deploy starts deleting everything older than 14 days, and it will run for several nights on a box
+  with a real backlog (each night takes `max-run-duration`, logs what it deleted at INFO, and
+  continues the next night). Nothing needs to be run by hand. Postgres reuses the freed pages; a
+  `VACUUM FULL audit_log` during a maintenance window is what actually returns the space to the
+  filesystem.
+- **Proof-of-play is unchanged at 90 days.** `playback_log` keeps its window, and the device-facing
+  `POST /api/devices/{id}/playback` still accepts reports up to 90 days old — a box that was offline
+  for weeks still gets its queued reports in. Shortening `APP_RETENTION_PLAYBACK` shortens **both**,
+  which is why they read one property.
+- **The trade-off being accepted:** there is no longer an HTTP-level record of a *successful*
+  heartbeat or playback flush, and a failed one is recorded without its bodies. The device's trail
+  is `device.last_seen_at`, `event`, `playback_log`, the action rows and the connection log — all
+  of which are read by something. If a specific agent call ever needs auditing in full again, it is
+  one line out of `DEVICE_AGENT_ENDPOINTS`.
+
+**Tests:** `AuditFilterTest` — parameterized over all five agent endpoints (no entry recorded **and**
+the response still reaches the client), a 403/404/422/500 on `POST /api/devices/2/heartbeat`
+recording a **bodyless** entry while a 200 records nothing (response untouched either way), a
+percent-encoded agent path skipped after decoding, ten
+operator/admin device writes still audited (including `POST /api/devices/register`,
+`POST /api/devices/1/remote`, `DELETE /api/devices/1/remote/abc` and `PUT /api/devices/volume`), and
+the look-alike paths `/api/devices/1/heartbeats` and `/api/devices/1/playback/extra` still audited;
+every AUTH-06 test kept. `RetentionCleanupServiceTest` binds a real `RetentionProperties` instead of
+reflecting on constants: the per-table thresholds are captured **per repository** and asserted
+against their own windows (14 vs 90 days), a drain runs past 150 batches where the old cap stopped at
+100, the run budget stops a repository that always reports a full batch after exactly one batch per
+table (with the batch cap set low so a broken budget check fails instead of hanging), the cap stop
+does the same, both stops are asserted to log at INFO with the row count, and a failing table still
+leaves the other two drained. The maintenance-window guard is now driven from a fixed instant
+(a package-private `runCleanup(Instant)` seam) instead of whatever time the suite runs at, so the
+skip asserts that **no** repository is touched. `RetentionPropertiesTest`
+(`ApplicationContextRunner`) pins every default, binds `app.retention.*` and `APP_RETENTION_*`
+(including the hyphenated `max-run-duration`), proves a bare `90` is 90 **days** and a bare `20`
+budget is 20 **minutes**, and asserts that eight bad values — `PT0S`, a negative duration, a
+sub-day window, `batch-size=0`/`-5`, `max-batches-per-run=0` — each **fail context startup with the
+property named**, with the boundary values (`P1D`, `PT1M`, `1`) accepted. `PlaybackLogServiceTest`
+sets the configured playback window to 30 days and asserts a 45-day-old play is rejected — with
+"30-day" in the message — while a 20-day-old one is accepted.
+
+### Replace overrides only its own window; assignment precedence (v1.0.142)
+
+> **LOGIC-05 — "a one-week campaign kills the booking underneath it."** `ContentAssignmentService.supersede`
+> retired a CONFIRMED predecessor unconditionally on Replace — `truncateEndTo(newStart)` when it was
+> running, `softDelete()` otherwise, plus permanent `ContentAssignmentExclusion` rows for a partial
+> device takeover. It never looked at `newAssignment.getEndTime()`. Booking a one-week campaign over a
+> "forever" (year-2100 sentinel) assignment therefore destroyed the remainder: when the campaign's
+> window closed, `resolveForDevice` returned null, the screens went blank and `/sync` told the devices
+> to purge their files. The operator's only recovery was to re-create the booking by hand.
+
+**What changed in the repo**
+
+- **The decision is precedence, not row surgery.** `V48__content_assignment_confirmed_at.sql` adds a
+  nullable `confirmed_at` (backfilled to `created_at` for existing CONFIRMED rows) and recreates
+  `device_status_view` so every copy of the resolution rule orders by
+  `priority DESC, COALESCE(confirmed_at, created_at) DESC, id DESC`. Splitting the predecessor into
+  two rows was rejected: it would fork `playback_log.assignment_id` (proof-of-play) and the
+  `(assignment_id, version_number)` `playback_sync_schedule` anchors.
+- **`ContentAssignment.confirmedAt` + `PRECEDENCE`.** `confirm()` stamps the instant; the comparator
+  lives on the entity so the two service call sites cannot drift apart. Ordering deliberately does
+  **not** use `updatedAt` — `bumpVersion()` and `truncateEndTo()` move it, so an unrelated edit would
+  steal precedence. The comparator is null-safe (`confirmedAt` falls back to `createdAt`, a null id
+  sorts last) and **total**, so Java and SQL cannot silently disagree. The same order is now in all
+  four copies: `PRECEDENCE`, `findActiveAtTime`'s JPQL `ORDER BY`, `resolveForDevice`,
+  `previewForTarget` (which had its own `max(comparingInt(priority))`), and the view's three
+  embedded predicates — see the resolution-order table under *Content Assignments (V7)*.
+- **`supersede` is gated on the window**, by two independent tests:
+  `reachesPredecessorEnd` = `newEnd >= predEnd` (`>=`, not `>`, so forever-over-forever still retires
+  the old row: both carry the same sentinel) and `coversFromNow` = `newStart <= max(predStart, now)`.
+  - **Retiring** (no devices remain) needs only the end test: `coversFromNow` → exactly v1.0.135
+    (soft-delete, or truncate a running predecessor at the cutover); otherwise **truncate** and keep
+    the head. The old `runningNow` guard soft-deleted a *future* predecessor whose head the new
+    window never covered — a scheduled booking deleted before it ever played.
+  - **Narrowing** (some devices stay) needs **both**. An exclusion row is permanent and takes effect
+    the instant it is written, so a takeover that only opens next week would blank the handed-over
+    devices from today until then — the same failure in miniature. When the new window opens later,
+    nothing is written: precedence hands those devices over at the start edge, and the unselected
+    devices keep the predecessor through the new assignment's own exclusions.
+  - When the new window **ends first**, the predecessor is left **completely untouched**.
+- **Cancelling an assignment releases the narrowings it caused.** `softDelete` deletes the
+  exclusions stamped with `partialSupersedeReason(id)` in the same transaction. An exclusion has no
+  FK to the assignment that *caused* it (only to the one it narrows), so that reason string is the
+  join key and has a single formatter. Without this, "replace on some devices, then cancel" left
+  those devices excluded from a still-CONFIRMED, still-running predecessor — dark, with no visible
+  cause. Operator-written exclusions and other assignments' narrowings are untouched.
+- **A future-dated confirm no longer detaches sync-group members.** `detachReassignedSyncGroupMembers`
+  compares against a snapshot taken at `now`, so for a campaign starting next week it was answering a
+  question about a change that had not happened — and the detach is irreversible. It is now skipped
+  when `startTime > now`; the flip happens at the start edge, and an incoherent group is reported by
+  `SyncGroupPlaybackService.resolveCoherence` (recoverable) instead of silently unwired.
+- **The cancel push is unchanged and still fires** for the handed-over devices — they must switch
+  now — but the event no longer means "the assignment was soft-deleted". Fixed the javadoc that said
+  so on `AssignmentCancelledEvent` and `AssignmentCancelledSyncPushListener`, and the stale
+  "rejected or superseded" wording on `resolveConfirmOverlap` / `detachReassignedSyncGroupMembers`.
+- **Frontend:** the Replace confirm dialog now prints `<playlist> resumes on <date>` for every
+  conflict that outlasts the new assignment, so "Move & assign" no longer reads as a permanent
+  deletion. A campaign with **no end date** outlasts everything, so no line is shown then (the
+  existing year-2100 `INDEFINITE_END_TIME` guard), and an unparseable `endTime` prints nothing rather
+  than a guessed date. Dates go through the shared Tashkent formatter; strings added in en/ru/uz.
+
+**Operating note**
+
+- A replaced assignment now **stays CONFIRMED**, so `DELETE /api/playlists/{id}`,
+  `/api/device-groups/{id}` and `/api/facilities/{id}` still answer **409** while it exists, and the
+  assignment list shows **two overlapping rows** for the same target. Both are intended: the booking
+  is genuinely still live, it is just outranked for the campaign's window. Cancelling the campaign
+  brings the booking back with no re-assignment.
+- At the **end** edge the flip is **not** pushed: devices pick the booking back up on their next
+  heartbeat, so expect up to one beat (**≤ 2 min**) of the campaign still playing, and a
+  re-download, because the files were purged at the **start** edge when the campaign took over. An
+  end-edge push (a scheduled sweep that notifies devices whose winning assignment changes at a
+  window boundary) is the obvious follow-up and is deliberately not in this change.
+
+**Tests:** `ContentAssignmentServiceTest` — shorter window leaves the predecessor untouched with no
+exclusions (whole-target and partial-device), a partial takeover whose window opens later writes no
+exclusion **yet** (and one that opens now still narrows), the handover push still fires,
+forever-over-forever still retires, a future predecessor's head is truncated not deleted,
+out-of-order ids resolve by recency, cancelling the campaign mid-window brings the predecessor back
+(and releases its narrowings, keyed by the exact reason `supersede` wrote), a future-dated confirm
+keeps sync-group membership, and `PRECEDENCE` is a total order. `ContentAssignmentPartialSupersedeTest`
+pins `deleteByReason` against the real JPQL: it releases only the narrowing, and the handed-over
+device resolves the predecessor again once the superseder is cancelled. `ContentAssignmentWindowOverrideTest` (new, real H2 + Flyway) asserts `findActiveAtTime` + the
+resolver at three instants — before / during / after the campaign — and that `device_status_view`
+picks the same winner, including when only the tie-break can decide. `AssignmentSchemaTest` pins the
+column, its nullability and the backfill; `DeviceStatusViewActivePlaylistFilterTest` gains a device
+whose ids run against its confirm order. `FlywayMigrationTest` 47 → 48; `U48` restores the V41 view
+and drops the column.
+
+**Also in this version:** `PlaybackScheduleActivationMonitor` no longer WARNs on a `0/N` cut-over
+readiness. Zero-ready is not a straggler situation — it means no device holds that version, which is
+the ordinary look of an anchor whose assignment is outranked for the current window, and overlapping
+CONFIRMED rows are now normal. WARN reaches Telegram and the poll runs every minute, so that case
+logs at INFO; a genuine partial rollout (`0 < ready < total`) still WARNs.
+
+### Dayparting schedules hidden; per-minute evaluation job off (v1.0.141)
+
+> **LOGIC-04 — "schedules have no effect on playback."** Operators could create DAILY/WEEKLY/MONTHLY
+> windows ("09:00–12:00 daily"), but `ContentAssignmentService.resolveForDevice` — which drives
+> heartbeat, `/sync`, status and the playlist view — never reads schedules, so the ad played around the
+> clock for the whole assignment. Meanwhile the Quartz job loaded the whole `schedule` table every
+> minute (soft-deleted rows included), expanded every repeat, and logged INFO 1,440 times a day.
+
+**What changed (decision: hide it until real dayparting exists; keep the data)**
+
+- **Frontend:** the content page no longer offers the *Schedules* action (`ContentPage` stops passing
+  `onSchedules`; `ContentSchedulesDrawer`, `useContentSchedules` and the API client are kept, unused).
+- **Backend:** `scheduleEvaluationJobDetail`/`scheduleEvaluationTrigger` (`QuartzConfig`) and
+  `MissedRunCatchUp` only exist with `app.schedule.evaluation-enabled=true`
+  (`APP_SCHEDULE_EVALUATION_ENABLED`, default **false**). The schedule table and REST API are unchanged.
+
+**Tests:** `ScheduleEvaluationToggleTest` (no job/trigger/catch-up by default; all three when enabled);
+frontend `ContentPage.test` (no Schedules action on a READY card).
+
+### Incident pipeline: offline auto-resolve, monitor transactions, live alerts (v1.0.140)
+
+> **LOGIC-01/02/03 — "offline incidents never close, SYNC_TIMEOUT fires every minute, no live
+> critical alerts."** Root cause, three bugs:
+> **(1)** `DeviceHeartbeatService` auto-resolved `DEVICE_OFFLINE` only when the *stored* status went
+> OFFLINE→other, but nothing ever stores OFFLINE: `DeviceHealthMonitor` is derive-only, and the beat
+> refreshes `lastHeartbeatAt` before it derives the status. Every offline incident stayed open
+> forever, the device's next outage raised no new one (the monitor skips a device that already has
+> one), and OFFLINE→ONLINE status events/broadcasts never fired.
+> **(2)/(3)** Both monitors called their `@Transactional(propagation = REQUIRES_NEW)` `escalate()` on
+> `this`, which bypasses the Spring proxy, so no transaction was opened. In `SyncTimeoutMonitor`,
+> `clearSyncPending()` ran on a detached entity and was never written, so a stuck device
+> re-escalated every minute. In `DeviceHealthMonitor`, the critical-incident broadcast and the
+> dashboard offline broadcast navigated the detached device's LAZY region and threw
+> `LazyInitializationException`. The exception was swallowed: the incident was saved, but no
+> operator was alerted live. The Mockito tests passed throughout.
+
+**What changed in the repo**
+
+- **Heartbeat recovery is judged from the previous beat's age** (`DeviceHeartbeatService`), read
+  *before* `recordHeartbeat()`. Two thresholds apply:
+  - The `DEVICE_OFFLINE` resolve fires from `DeviceHealthMonitor.HEARTBEAT_THRESHOLD`, 15 min, the
+    point where the monitor opens the incident.
+  - The OFFLINE→ONLINE `DEVICE_STATUS_CHANGED` event and dashboard broadcast fire only past
+    `DeviceStatusEvaluator.isOffline`, 15 min + 60 s grace, the same cut-off as `device_status_view`.
+    That way no transition is announced that no screen ever showed.
+- **The resolve runs after the beat has committed.** `processHeartbeat` only reports what it
+  recovered from, in `HeartbeatResult.resolveIncidentTypes` (`DEVICE_OFFLINE` and/or
+  `CONTENT_VERSION_MISMATCH`; server-internal, not on the wire). `DeviceController.heartbeat` then
+  calls the non-transactional `DeviceHeartbeatService.resolveRecoveredIncidents`, which runs each
+  `autoResolveOnRecovery` in its own transaction, best-effort. A resolve inside the beat would either
+  join its transaction (a failing resolve marks it rollback-only and the beat is lost) or nest a
+  second one. Nesting holds two pooled connections per recovery beat, and after a regional outage
+  every device has an open incident, so 20 or more simultaneous recovery beats would deadlock the
+  prod pool.
+- **Duplicate open incidents (LOGIC-16) no longer throw.** Only the service layer enforces "one open
+  incident per pair", so duplicates can exist. What changed:
+  - A resolve closes every open incident for the pair (`findAllOpenByDeviceAndEventType`).
+  - `IncidentService.processEvent` adds the occurrence to the oldest one (lowest id).
+  - `DeviceHealthMonitor.escalate` uses `existsOpenByDeviceAndEventType`.
+  - The single-result `findOpenByDeviceAndEventType`, which threw on duplicates, is removed.
+- **Recovery sweep** in `DeviceHealthMonitor.runHealthCheck`: after escalating, a scalar query
+  (`findDeviceIdsWithOpenIncidentAndHeartbeatAfter`) finds devices that have an open
+  `DEVICE_OFFLINE` incident but a last beat newer than the *same* threshold instant, and resolves
+  each one in its own transaction. Resolutions also evict the dashboard summary cache.
+- **Both monitors call `escalate` through a `@Lazy self` proxy**, so `REQUIRES_NEW` applies.
+  `DeviceHealthMonitor.escalate` now returns `EscalationOutcome(escalated, projectId)`; the project
+  is read inside that transaction and is what the dashboard offline broadcast routes on.
+- **`findBySyncPendingSinceLessThanAndDeletedAtIsNull`** replaces `findBySyncPendingSinceLessThan`,
+  so soft-deleted devices are no longer scanned. The `isDeleted()` guard in `escalate` stays, for a
+  device deleted mid-scan.
+- **`/sync` clears a stale pending marker when there is no work** (`DeviceSyncService.computeSyncPlan`),
+  including when no assignment is active. A device that already holds the expected content (its
+  confirm was lost), or whose assignment lapsed, is no longer escalated as `SYNC_TIMEOUT`. No
+  migration.
+
+**Operating notes**
+
+- **Incidents already stuck open before the deploy close by themselves within 5 minutes.** The first
+  health-check pass (Quartz, every 5 minutes) resolves the open `DEVICE_OFFLINE` incident of every
+  device that is beating again, with `resolved_by = 'system'`. Expect a one-off burst of
+  `incidentUpdated` frames on the dashboard and a `recovered N` count in the health-check log line.
+- **OFFLINE→ONLINE (or →NO_CONTENT) status events now fire** on every recovery after more than
+  16 minutes of silence (15 min + 60 s grace), **including a device's first beat** after
+  registration (`lastHeartbeatAt` is null). Expect more `DEVICE_STATUS_CHANGED` rows than before
+  (MEDIUM for →ONLINE).
+- **Live CRITICAL alerts for offline devices work again** (`/ws/admin/incidents` and the dashboard
+  feed). The `Critical incident broadcast failed … Could not initialize proxy` WARNs, which were
+  forwarded to Telegram, stop.
+- **SYNC_TIMEOUT escalates once per stuck sync**, not every minute. Existing incidents with a huge
+  `occurrence_count` stop growing; operators still close them by hand.
+- A beat never holds more than one pooled connection at a time. Resolves take one only after the
+  beat has released its own. If a resolve fails, a WARN is logged, the beat has already succeeded,
+  and the sweep closes the incident on its next pass (within 5 minutes).
+- An auto-resolve and a concurrent manual resolve are last-writer-wins on `resolved_by`: there is no
+  `@Version` yet (LOGIC-07).
+
+**Tests:** new `DeviceMonitorTransactionIntegrationTest` runs on real H2 with the real transaction
+manager. Its heartbeat cases call both steps, exactly as the controller does. It checks that:
+- a scan commits `sync_pending_since = NULL`, and a second scan adds no event;
+- a health check opens the incident and broadcasts it with the device's project;
+- a heartbeat after an outage resolves the incident the monitor opened, and a spy confirms that the
+  resolve starts only once the beat is visible to an independent transaction;
+- the sweep resolves a fresh device's open incident;
+- a heartbeat resolves two duplicate incidents, and its own `last_heartbeat_at` commits;
+- a resolve that throws inside its transaction leaves the beat committed.
+
+Each case was confirmed red against the defect it guards: `this.escalate` in either monitor, the
+stored-status gate, or moving the resolve back inside `processHeartbeat` (which fails with
+`UnexpectedRollbackException`).
+
+Unit tests:
+- `DeviceHeartbeatServiceTest` uses a device mock that behaves like the entity (its heartbeat is
+  stale until `recordHeartbeat()` runs) and never stores OFFLINE. It covers:
+  - `processHeartbeat` only reports types and never touches `IncidentService`;
+  - a stale beat whose stored status is unchanged still reports `DEVICE_OFFLINE`;
+  - 14 min: nothing; 15.5 min: resolve but no event; 16.5 min: resolve and event;
+  - a first beat;
+  - `resolveRecoveredIncidents` resolves each type and swallows a failure.
+- `DeviceControllerTest`: the controller resolves with the beat's own result, after it returns, and
+  never after a 404.
+- `DeviceStatusEvaluatorTest`: `isOffline` agrees with `evaluate` at the grace boundary.
+- `DeviceHealthMonitorTest`: the sweep resolves and invalidates the cache, uses the escalation's
+  threshold instant, a no-op doesn't invalidate, and failures never fail the check. The broadcast
+  project comes from `escalate`, not the detached device.
+- `IncidentServiceTest`: duplicates resolved, and `processEvent` picks the oldest duplicate.
+- `DeviceSyncServiceTest`: a stale marker is cleared when there is no work or no assignment, left
+  alone when none is set, and kept while there is work.
+- `SyncTimeoutMonitorTest` and `IncidentServiceDashboardBroadcastTest` were updated.
+
+### Credentials no longer written to audit_log (v1.0.139)
+
+> **AUTH-06 — "plaintext passwords and API keys in `audit_log`."** Root cause: `AuditFilter` stored
+> every mutating request/response body, cut to 10k **before** masking, and `SensitiveFieldMasker`
+> redacted only an exact list of key names with a regex. `currentPassword`/`newPassword`/
+> `confirmPassword` (password change and reset) and `rawKey` (a freshly minted API key) were not on the
+> list; a secret straddling the cut, or containing an escaped quote, slipped past the regex; and a
+> too-short password came straight back in the 400's `rejectedValue`.
+
+**What changed in the repo**
+
+- **`SensitiveFieldMasker.isSensitiveKey`** (common) replaces the exact list with a name pattern
+  (contains `password|secret|token|ticket|authorization`, ends with `key`, or is
+  `pin|ssn|cvv|credit_card`). `keyPrefix`/`apiKeyId` stay readable.
+- **`AuditBodySanitizer`** (api): parses the body with Jackson, masks every sensitive key at any depth
+  and of any type, serializes, and only then truncates (never splitting a surrogate pair). Anything
+  that isn't JSON is stored as a marker, not raw.
+- **`AuditFilter`**: the four credential endpoints (POST `/api/me/password`, `/api/auth/reset-password`,
+  `/api/auth/refresh`, `/api/admin/api-keys`, matched on the decoded path) keep no bodies; login and
+  device registration keep theirs, masked, as the audit trail. Bodies are parsed as UTF-8 (the old
+  10,000-*byte* cut could split a multi-byte character); request caching is capped at 256 KiB; and the
+  response is copied to the client in its own `finally`, so a failing audit can never blank it.
+- **`GlobalExceptionHandler`**: `rejectedValue` is dropped when any segment of the field path is a credential
+  name, and sensitive query parameters are masked in the path sent to the Telegram 500 alert (a failing
+  `GET /api/auth/reset-password?token=…` used to post the live token).
+- **`V47__scrub_credentials_from_audit_log.sql`** clears the bodies of existing rows for those four
+  endpoints, the registration responses (device tokens before v1.0.137), and 400 responses of
+  `/api/users` and `/api/auth/login` (echoed passwords), and the request bodies of all historical
+  login/user-create rows — the old regex left the tail of a password with an escaped quote (with no trace
+  of the damage) and never masked a numeric one. `U47` is a documented no-op.
+
+**After upgrading:** V47 scrubs the live table only — existing database dumps still hold these
+secrets. **Rotate every API key created before v1.0.139** (its plaintext was in `audit_log`), and
+consider re-registering devices whose tokens predate v1.0.137. Treat old dumps as containing
+credentials.
+
+**Tests:** `SensitiveFieldMaskerTest` (which keys count), `AuditBodySanitizerTest` (password-change
+fields, `rawKey`, nested/array/numeric values, escaped quotes, a secret straddling the limit, Cyrillic,
+surrogate pairs, non-JSON), `AuditFilterTest` (the four endpoints keep method/path/status only, an
+encoded path, login masked, UTF-8, unread body, oversized body, the response survives an audit
+`Error`), `GlobalExceptionHandlerTest` (no rejected password echo), `AuditLogCredentialScrubSchemaTest`
+(V46 → V47). `FlywayMigrationTest` count → 47.
+
+### Per-IP rate limits no longer trust a client-supplied X-Forwarded-For (v1.0.138)
+
+> **AUTH-04 — "every per-IP limit is bypassable."** Root cause: four copies of
+> `xff != null ? xff.split(",")[0] : getRemoteAddr()` keyed the login, refresh, forgot/reset-password,
+> device register/re-register and API-key-failure limits (and `device.last_known_ip`) on the **first**
+> `X-Forwarded-For` entry — whatever the client wrote — without checking who set the header.
+
+**What changed in the repo**
+
+- **`server.forward-headers-strategy: native`** (`application.yml`): Spring Boot installs Tomcat's
+  `RemoteIpValve`. `X-Forwarded-For` is honoured **only when the direct peer is a trusted proxy**
+  (`server.tomcat.remoteip.internal-proxies`; the default covers loopback, RFC 1918, link-local,
+  100.64/10 and IPv6 loopback/link-local/ULA — which includes Caddy → Docker's bridge gateway), and it is read **right to left**, so an entry a client prepends is ignored.
+  A client that reaches the app without the proxy gets its socket address, whatever header it sends.
+- **One helper, `api/.../security/ClientIp.of(request)`** (= `getRemoteAddr()`), replaces the four
+  private copies in `AuthController`, `PasswordResetController`, `DeviceController` and
+  `ApiKeyAuthFilter`.
+- **Heartbeat**: a resolved IP longer than `last_known_ip`'s 45 chars is not stored (logged at INFO)
+  instead of failing the beat — the valve copies a trusted proxy's header without validating it.
+
+**Side effects to know about** (the valve also honours `X-Forwarded-Proto`/`-Host` from the proxy):
+- Behind TLS the request is now seen as HTTPS, so Spring Security's default
+  `Strict-Transport-Security: max-age=31536000 ; includeSubDomains` is sent on API responses.
+- Swagger "Try it out" on the API host now counts as same-origin (a fix); the SPA stays cross-origin.
+
+**Operating it**
+- The proxy in front must set `X-Forwarded-For` itself. Caddy's default does (it replaces the header
+  from untrusted clients); if you configure `trusted_proxies`, keep it to real upstream proxies only.
+- To narrow the trusted set, set `SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES` to a regex matching only
+  your compose network's gateway, in the app service's `environment:` (a compose override, single-quoted
+  YAML — a `.env` entry alone doesn't reach the container; double quotes would eat the backslashes).
+  **Never set it to an empty value** — that trusts no proxy, so every client shares the proxy's IP and one rate bucket
+  (which is why compose deliberately does not pass it through).
+- After deploying, check a device's `last_known_ip` on its diagnostics page: it should be a public
+  address, not `172.x`.
+
+**Tests:** per-call-site tests in `AuthControllerTest`, `PasswordResetControllerTest`,
+`DeviceControllerTest` and `ApiKeyAuthFilterTest` (a client `X-Forwarded-For` doesn't change the key);
+real-Tomcat `ForwardedClientIpIntegrationTest` (single hop honoured, a prepended fake skipped, trailing
+trusted hops peeled off) and `UntrustedPeerClientIpIntegrationTest` (spoofed header from an untrusted
+peer ignored), both asserting the IP `AuthController.refresh` hands to the limiter;
+`DeviceHeartbeatServiceTest` (oversized IP not stored, 45 chars stored).
+
+### Device takeover by re-registration closed; admin re-registration window (v1.0.137)
+
+> **AUTH-02 — "anyone who knows a serial can steal the device."** Root cause: `POST
+> /api/devices/register` is public (first contact has no token) and keyed only on the client-sent
+> `serialNumber`; for an already-registered serial it rotated the live device's token and returned
+> the new one. Serials (ANDROID_ID, hardware serial, UUID) are not secrets.
+
+**What changed in the repo**
+
+- **Re-registration needs an admin.** `DeviceRegistrationService.register` refuses an
+  already-registered serial with `DeviceAlreadyRegisteredException` → **409**, unless an ADMIN opened
+  a window with **`POST /api/devices/{id}/reregistration-window`** (ADMIN only; returns
+  `{ allowedUntil }`; `APP_DEVICE_REREGISTRATION_WINDOW`, default `PT1H`). The next registration claims
+  the window with a conditional `UPDATE … WHERE reregistration_allowed_until > now`
+  (`DeviceRepository.claimReregistrationWindow`), so of two concurrent callers exactly one wins; the
+  token is rotated as before. New serials are unchanged (they land in *Unassigned* with no content).
+- **`V46__device_reregistration_window.sql`**: nullable `device.reregistration_allowed_until` (+ `U46`).
+  `DeviceDetail` exposes it as `reregistrationAllowedUntil`; the admin UI shows it.
+- **`@DynamicUpdate` on `Device`**: only changed columns are written, so a heartbeat holding a stale
+  snapshot can no longer erase a window an admin opened meanwhile (or resurrect a used one). This also
+  narrows the lost-update problem (LOGIC-07) for disjoint columns.
+- **Separate rate-limit budget for re-registration attempts**: an attempt on an already-registered
+  serial counts against `rate:devrereg:{ip}` (`app.device.reregister-rate-limit-per-hour`, default
+  60), not the 10/hour new-device budget. A wiped box retrying every few minutes can't starve new
+  boxes behind the same venue NAT, and polling a known serial to snatch an admin's window stays
+  metered. Refusals log at INFO (like 429s), so a stuck box can't flood the Telegram alert budget.
+- **A heartbeat closes an open window**: an authenticated beat proves the box still holds its token,
+  so a window opened on a healthy device by mistake closes within one heartbeat interval.
+- **`app.device.reregistration-window` must be ≥ 1 minute** or startup fails (a bare `60` would bind
+  as 60 ms). Compose passes `APP_DEVICE_REREGISTRATION_WINDOW` through.
+- **Input validation**: `serialNumber` ≤ 100 and `^[A-Za-z0-9][A-Za-z0-9._:-]*$`, `deviceName` ≤ 200 →
+  **400** instead of 500 (spec gap G-5). The alphanumeric first character also keeps a leading
+  `= + - @` out of spreadsheet exports.
+- **`SensitiveFieldMasker` now masks `deviceToken`** — the registration response is persisted by
+  `AuditFilter` and a device token never expires.
+- **Android contract** (`ANDROID_DEVICE_FLOW_SPEC.md`, R21, §1.6/§2/§4/§13/§14/§16): on 409 from
+  `/register`, keep playing cached content and retry every ~5 min with jitter.
+
+**Operating it**: a TV box that was wiped/reinstalled shows up as stuck (its `/register` gets 409). On
+its device page an ADMIN clicks *Allow re-registration*; within the hour the box's next retry gets a
+new token. Don't open a window for a device that is online and healthy — whoever registers that
+serial first inside the window gets the token (the UI warns, and the device's next heartbeat closes
+such a window anyway).
+
+**Upgrade note:** a device whose stored serial doesn't match the new pattern can never re-register
+(it gets 400). Check with `SELECT serial_number FROM device WHERE serial_number !~ '^[A-Za-z0-9][A-Za-z0-9._:-]*$'`.
+
+**Tests:** `DeviceRegistrationServiceTest` (refused + token unchanged, claimed + rotated, claim uses
+the current time, window opened, 404, `isRegistered`, window < 1 min fails fast),
+`DeviceControllerTest` (409 on the re-registration budget, new serial on the new-device budget, 400
+validation incl. a trailing newline and real-world serial formats, admin 200 / operator 403 /
+device-token 403 / anonymous 401 / 404), `DeviceHeartbeatServiceTest` (a beat closes the window),
+`DeviceReregistrationWindowRepositoryTest` on H2 (claimed exactly once, expired/none not claimable,
+rotated token persisted after a claim, a stale concurrent edit doesn't wipe the window),
+`DeviceRegistrationRateLimiterTest`, `SensitiveFieldMaskerTest`. `FlywayMigrationTest` count → 46.
+
+### Default logins removed outside dev; bootstrap admin from env (v1.0.136)
+
+> **AUTH-01 — "every environment starts with `admin`/`password`."** Root cause: V12 seeds six users
+> with the password `password` and V33 rewrites it to a fixed, publicly committed BCrypt hash. Both
+> run on **every** database, so a fresh production had a working ADMIN login out of the box. V12/V33
+> are already applied everywhere (`validate-on-migrate: true`), so the fix is additive.
+
+**What changed in the repo**
+
+- **`V45__deactivate_default_seed_logins.sql`** deactivates every account still on the V33 hash.
+  Accounts whose password was changed carry a different hash and are untouched. Rollback
+  `U45` (test/dev only — it re-opens AUTH-01).
+- **`DefaultLoginPolicy`** (`service/.../seed`, a `SmartInitializingSingleton`: runs after Flyway,
+  before the port opens):
+  - seed **on** → re-activates the five accounts V12 created active if they are inactive and still
+    on the default hash (a deleted or re-passworded account is left alone), and logs a WARN;
+  - seed **off** → **refuses to start** (`IllegalConfigurationException`) while any active account is
+    on the default hash, naming the accounts. Known gap: only the exact V33 hash is recognised.
+- **`BootstrapAdminProvisioner`** (`ApplicationRunner`): when **no active ADMIN** exists and
+  `APP_BOOTSTRAP_ADMIN_USERNAME` / `APP_BOOTSTRAP_ADMIN_PASSWORD` are set, creates that ADMIN — or, if
+  the username exists, re-activates it, promotes it to ADMIN and sets the password — and **revokes
+  every refresh-token family of that username**, as a password change does, so a session opened
+  with the old password can't survive (or come back as ADMIN). Both variables or neither; password
+  ≥ 12 characters with no leading/trailing whitespace; startup fails otherwise (the message never
+  contains the password). With no admin and no variables it logs a WARN; with an admin and the
+  variables still set it logs a WARN to remove them.
+- **`docker-compose.yml`**: `APP_SEED_ENABLED` now defaults to **false** (opt in via `.env` for local
+  use) and passes the two bootstrap variables through. `.env.example` documents all three.
+
+**Upgrading an environment with seed data off**
+
+V45 deactivates every account that still uses `password` — possibly **all** admins. Before
+deploying, either change those passwords, or set `APP_BOOTSTRAP_ADMIN_USERNAME` (the existing
+admin's exact **username** — matched on username only) and `APP_BOOTSTRAP_ADMIN_PASSWORD`; on first
+start that account is re-activated with the new password. Log in, then remove both variables.
+
+- A compose deployment that never set `APP_SEED_ENABLED` used to get **true** from the compose
+  default; it is now **false**, so the paragraph above applies to it.
+- An explicit `APP_SEED_ENABLED=true` in a deployment's `.env` keeps every default login working —
+  remove it anywhere that isn't local development.
+
+**Tests:** `DefaultSeedLoginSchemaTest` (V44 → V45 upgrade: seed accounts deactivated, changed-password
+and ordinary accounts untouched), `DefaultLoginPolicyTest` (guard, dev re-activation, the constant
+pinned to the V33/V45 literals), `BootstrapAdminProvisionerTest` (fail-fast config incl. the 12-char
+boundary and whitespace, no-op with an active admin, create, re-activate + promote, sessions revoked).
+`FlywayMigrationTest` count → 45.
+
+### Remote view/control — session control plane (v1.0.131)
+
+Lets an operator open a **live view of an Android TV box** (and, where the box supports it, drive its
+input) from the console. **DB migration `V43__remote_session.sql`** (new `remote_session` table plus
+six nullable `device` capability columns). **Ships dark** behind `app.remote.enabled=false`: with the
+flag off, `POST /api/devices/{id}/remote` returns **503** and the heartbeat never emits
+`desiredRemoteSession`, so the device wire is byte-identical to v1.0.130 apart from one added `null`
+key. Device contract: `ANDROID_DEVICE_FLOW_SPEC.md` §4, §6.1, §7. Canonical wire contract:
+`../REMOTE_CONTROL_CONTRACT.md`.
+
+> **THE BACKEND CARRIES NO MEDIA.** Not one video byte touches this service. The device and the
+> operator browser meet on a **separate relay VPS** (never `subzero` — 1 vCPU / 594 MB RAM / 294 MB
+> disk free); this service only mints the rendezvous and hands each side a signed ticket. That is
+> deliberate: it dodges the 8 KB Tomcat text cap and `TextWebSocketHandler`'s binary rejection
+> (close 1003), keeps the app server out of the media path entirely, and gives the Android team a
+> clean seam. **There is no binary-WebSocket code, no `handleBinaryMessage`, and no Tomcat buffer
+> change in this release, and none should ever be added for this feature.** The relay itself is a
+> separate deliverable (`../REMOTE_CONTROL_CONTRACT.md` §6) and is **not** built here.
+
+```
+  Operator browser                  Backend (Spring)                Device (Android TV box)
+        │ 1. POST /api/devices/{id}/remote │                                 │
+        ├─────────────────────────────────►│ 2. mint session + 2 tickets     │
+        │ 3. 201 {sessionId, relayUrl,     ├────────────────────────────────►│ 4. su -c scrcpy-server
+        │        viewerTicket}             │    REMOTE_SESSION_START (WS;    │
+        │◄─────────────────────────────────┤    heartbeat is the fallback)   │ 5. POST …/ack READY
+        │                                  │◄────────────────────────────────┤
+        │ 6. wss://relay/viewer?ticket=…   │        ┌─────────┐              │ 6. wss://relay/agent?ticket=…
+        ├─────────────────────────────────────────►│  RELAY  │◄──────────────┤
+        │◄══════════ H.264 video ══════════════════╡  (VPS)  ╞══════════════►│
+```
+
+**Session lifecycle** — `PENDING → ACTIVE → ENDED`, with `FAILED` and `EXPIRED` as the other
+terminals. Illegal transitions are rejected **in the `RemoteSession` entity**, not in the service, so
+no future caller can write a state-machine violation to the database.
+
+- **`POST /api/devices/{id}/remote`** — start. **201** with `sessionId`, `relayUrl` (the **viewer**
+  URL), `viewerTicket`, `expiresAt`, `viewOnly`, `deliveredVia`, and the device's last reported
+  `capability`. `403` for VIEWER/ADVERTISER · `404` unknown, soft-deleted, or out of operator scope ·
+  `409` a `PENDING`/`ACTIVE` session already exists · `422` the device reported
+  `capability.supported == false` · `503` the feature is disabled.
+- **`DELETE /api/devices/{id}/remote/{sessionId}`** — stop. **204**, and **idempotent**: stopping an
+  already-terminal session is still a 204, so a double-click never surfaces an error. Keeps working
+  even when the feature flag is off, so disabling remote control cannot strand a streaming box.
+- **`GET /api/devices/{id}/remote`** — the live session, **without** `viewerTicket`. Tickets are
+  single-issue; a reconnecting viewer must `POST` again. `404` when there is none.
+- **`POST /api/devices/{id}/remote/{sessionId}/ack`** — the **device** surface (`X-Device-Token`,
+  `hasRole('DEVICE') and #id == authentication.principal`). `READY` → `ACTIVE` + `started_at` +
+  dimensions; `FAILED` → `FAILED` + error; `ENDED` → `ENDED` + reason. REST rather than an inbound
+  WebSocket frame because the device sends **no** outbound WS frames today
+  (`ANDROID_DEVICE_FLOW_SPEC` §10.5) and adding an inbound path to `DeviceWebSocketHandler` is a far
+  bigger change than one endpoint.
+- **`GET /api/devices/{id}/connection`** → `{deviceId, connected}`, `ADMIN`/`OPERATOR`/`VIEWER`.
+  Backed by the live socket map, **not** `device_status_view` — that view lags up to **16 minutes**
+  (`OFFLINE_THRESHOLD` 15 min plus a hardcoded `INTERVAL '16' MINUTE` in V34, recreated in V41) and
+  is useless behind a Connect button.
+
+**Two tickets per session, one per role.** `ticket = base64url(payload) + "." +
+base64url(HMAC_SHA256(secret, payload))` over `{"sid","role","did","exp"}`. The relay verifies
+offline — no callback — so it keeps working while the backend redeploys. A leaked *viewer* ticket
+must never be usable as the *agent*, so `RemoteSessionTicketService.verify` pins the expected role
+and rejects a mismatch exactly as hard as a bad signature; comparison is constant-time
+(`MessageDigest.isEqual`). `REMOTE_RELAY_SIGNING_SECRET` is **≥32 bytes, env-only, never logged, never
+in a DTO**, and the app **fails fast at startup** if it is missing or short while the feature is on.
+Relay tickets were also added to `SensitiveFieldMasker` — `AuditFilter` persists whole response
+bodies and its key match is exact, so `viewerTicket` was *not* covered by the existing `token` entry.
+
+**Session keys are random, never derived.** `"rs_" + HexFormat.formatHex(SecureRandom, 16 bytes)`.
+Enumerable ids were the fatal flaw in the original repeater design.
+
+**One live session per device**, enforced in the service layer — *not* with a partial unique index,
+because **H2 (the test database) does not support them** and the DDL has to be valid on both H2 and
+PostgreSQL. This mirrors `remote_action`'s one-PENDING-per-type rule exactly.
+
+**Heartbeat: capability up, desired state down.** The request gains an optional `remote` block
+(`supported`, `input`, `transport`, `maxWidth`, `maxHeight`) and the response a nullable
+`desiredRemoteSession`. Both are **additive** — records deserialize missing fields as `null`, and
+existing clients ignore extra keys. This is the same desired-state convergence loop as
+`desiredVolume`, which is why the WS push is an *optimisation* rather than a dependency: a device
+that never opens a socket still gets remote control, just with up to one beat of latency.
+**A malformed or absent `remote` block never fails the beat** — unknown enum tokens and out-of-range
+dimensions are dropped with a WARN and the beat carries on, exactly the rule that already governs
+`volume`.
+
+**`expiresAt` is enforced by the device, on its own clock.** `RemoteSessionExpirationJob`
+(`@Scheduled(fixedDelayString = "PT1M")`) flips stale `PENDING`/`ACTIVE` rows to `EXPIRED`, but it is
+a **janitor, not the enforcement mechanism**: if it stops running, rows linger in a table — no box
+keeps streaming. A dead backend can never leave a device broadcasting.
+
+**Why not reuse `remote_action`:** that table's 5-minute `DEFAULT_TIMEOUT`, one-PENDING-per-type
+rule, once-and-terminal confirm and `RemoteActionExpirationJob` would all fight a long-lived session.
+`remote_action` *initiates* things; `remote_session` *holds* one.
+
+**Push types come from the enum, never a literal.** `PushMessageType.REMOTE_SESSION_START` /
+`REMOTE_SESSION_STOP` are formatted via `.name()`, and `PushMessageTypeWireTest` asserts the emitted
+`type` string **equals the enum constant name** — a guard against repeating the `SYNC_CONTENT` drift
+described below. `grep -rn '"REMOTE_SESSION' --include=*.java` returns nothing by design.
+
+**Configuration** (all env-overridable; see `.env.example` and `docker-compose.yml`):
+
+```
+app.remote.enabled=false                       # feature flag; ship dark          APP_REMOTE_ENABLED
+app.remote.session-ttl=PT30M                   # hard ceiling                     APP_REMOTE_SESSION_TTL
+app.remote.max-width=1280                      # encoder hint                     APP_REMOTE_MAX_WIDTH
+app.remote.max-fps=15                          # encoder hint                     APP_REMOTE_MAX_FPS
+app.remote.bit-rate=2000000                    # encoder hint                     APP_REMOTE_BIT_RATE
+app.remote.relay.agent-url=wss://relay.example.uz/agent    APP_REMOTE_RELAY_AGENT_URL
+app.remote.relay.viewer-url=wss://relay.example.uz/viewer  APP_REMOTE_RELAY_VIEWER_URL
+app.remote.relay.signing-secret=${REMOTE_RELAY_SIGNING_SECRET}   # >=32 bytes, env only, never logged
+```
+
+`max-width` is further clamped **down** to the device's own reported `remote_max_width` when it has
+reported one — capability is reported, not assumed.
+
+#### Known pre-existing defects — filed here, deliberately **not** fixed in this change
+
+Folding unrelated fixes into a feature branch makes both harder to review and to revert. Each of
+these is real and each deserves its own change:
+
+1. **`BatchedSyncDispatcher:73-74` emits the literal `"SYNC_CONTENT"`**, a wire type that is **not a
+   member of `PushMessageType`**. The enum is decorative for that one message. Devices happen to
+   handle it, so it is not user-visible — but it is exactly the drift the new
+   `PushMessageTypeWireTest` exists to prevent recurring.
+2. **No live `ACTION_PENDING` push on issue.** `DeviceWebSocketHandler` replays pending actions on
+   *connect*, but issuing an action to an already-connected device pushes nothing — the device only
+   learns about it on its next heartbeat, up to 2 minutes later.
+3. **`LayerDependencyTest` defines the `Api` layer as `uz.orientadvertise.services.service..`** — the
+   same package as the `Service` layer, almost certainly a copy-paste slip. The consequence is that
+   `whereLayer("Api").mayNotBeAccessedByAnyLayer()` is vacuous and no rule actually analyses the
+   `...api..` packages. Module boundaries are still enforced at compile time by Gradle
+   (`service` has no dependency on `api`), so nothing is currently broken — but the architecture test
+   is weaker than it reads.
+
+#### Known limitation — WebSocket session map is per-replica
+
+`DeviceWebSocketHandler`'s socket map is an in-process `ConcurrentHashMap`. On the current
+single-replica deployment `GET /api/devices/{id}/connection` and `deliveredVia: "WS"` are exact.
+Behind more than one replica they would answer only for the replica that served the request, and a
+push would reach a device only if it happened to land on the right node. The fix is a Redis fan-out
+for the session map. That is a **latent single-replica problem, not this feature's problem** — the
+heartbeat fallback means nothing is lost even today, only latency. Noted here rather than solved.
 
 ### Playback batch: DB-level idempotent insert (v1.0.130)
 
@@ -1291,6 +2218,344 @@ FK; `device_status_view` recreated to expose `sync_group_id`).
 `ANDROID_DEVICE_FLOW_SPEC.md` (§3/§4) and `frontend/docs/openapi.json` updated. **No** content-hash,
 assignment-resolution, or `playback_sync_schedule` change — membership propagates solely via the
 heartbeat `syncGroupId` echo.
+
+### Partial-device supersede + sync-group reset on reassignment (v1.0.135)
+
+Two operator-reported reassignment bugs. Both root causes sat in
+`ContentAssignmentService`; **no migration, no controller change, no Android change.**
+
+> **Bug 1 — "reassigning a playlist to *some* devices sets the playlist of the *unchecked* devices
+> to null."** Root cause: `supersede()` retired a conflicting predecessor **in full** even when the
+> new assignment only took over part of its device set. `resolveConfirmOverlap` already computed the
+> exact per-candidate intersection for the 409 payload, then threw it away when deciding *how much*
+> of the predecessor to retire. (This was the gap flagged as an open product decision under
+> v1.0.108 — the operator report is that decision arriving from production.)
+>
+> **Bug 2 — "after changing a device's playlist it still remembers its old sync group."** Root
+> cause: `device.sync_group_id` had exactly three production writers, all in
+> `SyncGroupManagementService` / `DeviceRepository.bulkClearSyncGroup`. **No assignment path ever
+> touched it**, so a device carried its sales point forever after being moved to different content.
+
+#### 1. Partial-device supersede
+
+For each device-intersecting predecessor `P` and the new assignment `N`:
+
+```
+Dn        = N's effective device set        (target MINUS the excludedDeviceIds param)
+Dp        = P's effective device set        (target MINUS P's own exclusions)
+handover  = Dp ∩ Dn      remainder = Dp \ Dn
+```
+
+| case | action |
+|---|---|
+| `remainder` **empty** — `N` covers `P` entirely | retire in full: **truncate** to `N.startTime` if `P` is running, else **soft-delete**. Unchanged from v1.0.107. |
+| `remainder` **non-empty** | **narrow `P`**: one `ContentAssignmentExclusion(P, device, "superseded for these devices by assignment {N}")` per handed-over device. `P` stays `CONFIRMED` with its original `startTime`/`endTime` and keeps driving `remainder`. |
+
+**Why exclusions rather than truncation or a version bump —** `ContentVersionService.computeForAssignment`
+hashes `(assignmentId, versionNumber, playlistId, files+durations)` and **does not read exclusions**.
+Narrowing therefore leaves every `remainder` device's expected content version **byte-identical**:
+no re-download, no interruption, `DeviceSyncService` computes `hasWork=false` for them. Truncating
+`P` or calling `bumpVersion()` would churn devices that are not part of the reassignment at all —
+so **neither is done**. `PlaybackSyncSchedule` is keyed `(assignment_id, version_number)` and
+immutable, so those devices also keep their frame-alignment anchor. The exclusion row's `createdAt`
+records *when* each device left `P` — per-device history truncation cannot express.
+
+`content_assignment_exclusion` has `UNIQUE(assignment_id, device_id)` and `handover ⊆ Dn`, where
+`Dn` is the target minus `P`'s existing exclusions — so a duplicate insert is structurally
+impossible and no defensive `existsBy…` probe is needed (pinned by
+`confirm_replaceConflicting_predecessorWithOwnExclusions_handoverExcludesThem`).
+
+**`AssignmentCancelledEvent` is now scoped to `handover`.** Previously `supersede` resolved the
+predecessor's whole target *and ignored the predecessor's own exclusions*, pushing `SYNC_CONTENT` to
+devices it never drove. It now names exactly the devices that changed hands.
+
+**Unchanged:** the no-flag (`replaceConflicting:false`) path still 409s with the same structured
+`details.conflicts`; cross-target layering is still not a conflict; there is no new request flag —
+Replace simply became correctly scoped.
+
+#### 2. Sync-group reset on reassignment
+
+A sync group is a **sales point**: its members are meant to play the same content, frame-aligned.
+`SyncGroupPlaybackService.resolveCoherence` refuses to drive a group whose members resolve different
+`(assignmentId, versionNumber)` pairs — so **one silently-reassigned member disabled group control
+and 409'd `POST /api/sync-groups/{id}/jump` for the whole sales point**, while `/sync` kept echoing
+`sg-{id}` for a device that no longer shared the group's content.
+
+`confirmWithExclusions` (the single production confirm path — `confirmWithIncludedDevices` delegates
+to it) now clears `device.syncGroup` for exactly the devices whose **resolved playlist actually
+changes**:
+
+```
+# snapshot BEFORE the overlap gate mutates anything
+candidates = [d in effectiveDevices if d.syncGroup != null]      # in practice a handful
+before[d]  = resolveForDevice(d, now)
+
+# after assignment.confirm()
+before == null                      -> clear    # the device gains content
+before.priority > N.priority        -> KEEP     # shadowed by a more specific booking
+before.playlistId != N.playlistId   -> clear    # a real reassignment
+otherwise                           -> KEEP     # same playlist, nothing changed
+```
+
+**The naive rule ("clear the whole effective set") is wrong**, and that is the load-bearing detail:
+a device shadowed by a higher-priority booking (a `DEVICE_GROUP` assignment while the new one
+targets its `REGION`) sits inside the effective set, yet `resolveForDevice` keeps returning the
+shadowing assignment — its playlist does not change, and clearing it would break a working sales
+point for nothing. Pinned by `confirm_deviceShadowedByHigherPriorityAssignment_keepsSyncGroup`.
+
+`before.priority == N.priority` implies the same target *type*, and a device belongs to exactly one
+region / facility / device-group, so it implies the same target *id* — a same-target predecessor,
+which the overlap gate has just rejected or superseded. `N` wins from there, so comparing playlists
+decides it.
+
+Implementation notes:
+
+- **Never capped.** `app.sync.push-on-confirm-cap` is a *push budget*, not a correctness bound. The
+  target's devices are now loaded **once, uncapped**, in `confirmWithExclusions` and threaded through
+  the overlap gate, the narrowing and the detach; the cap is applied only to the
+  `AssignmentConfirmedEvent` payload. Pinned by `confirm_syncGroupClear_isNotCappedByPushBudget`.
+- **Mutated through the entities** (dirty-checked), not `DeviceRepository.bulkClearSyncGroup`: that
+  query carries `clearAutomatically = true`, which would detach the just-confirmed assignment and the
+  exclusion rows written moments earlier from the persistence context. No new repository method.
+- No extra push: the reassigned devices already receive `SYNC_CONTENT` from
+  `AssignmentConfirmedEvent`, and the next `/sync` naturally returns the new wire label.
+
+**Deliberately NOT cleared (documented, not omissions):**
+
+- **Cancelling an assignment** (`DELETE /api/assignments/{id}`) does not clear sync groups. A cancel
+  is often followed by re-assigning the same playlist; keeping membership lets the group heal itself,
+  and `resolveCoherence` already reports *"N member(s) have no active playlist"* honestly meanwhile.
+- **`remainder` devices of a narrowed predecessor** keep their sync group — their playlist did not
+  change; that is the whole point of §1.
+- **Excluded devices** are never touched.
+- **No `SyncGroupPlaybackOverride` cleanup.** The override is keyed by `sync_group_id` and matched on
+  `(assignmentId, versionNumber, contentVersion)`; the members that stay behind still match it, and
+  `sync_group_playback_override` has `ON DELETE CASCADE` on `sync_group` (V42).
+- **No Android change.** `syncGroupId` is opaque to the client (`ANDROID_DEVICE_FLOW_SPEC` §5.2) and is
+  re-read every heartbeat. Clearing the explicit group reverts the label to the next fallback tier —
+  `fac-…` / `grp-…` / `reg-…` — never to `null` for a device that has a region.
+
+#### 3. The 409 now names the remainder
+
+`AssignmentTimeOverlapException.Conflict` (and `details.conflicts[]`) gained
+**`remainingDeviceCount`** — how many of that conflicting assignment's own devices keep playing it if
+the operator replaces. Appended **last** so the JSON stays back-compat; `0` on the conservative
+same-target path (`Conflict.from(a)`), which reads the same as "nothing is left behind". With
+partial supersede in place, Replace is no longer "this deletes the other booking", so the frontend
+can render *"2 devices keep **Korzinka promo**"* instead of implying total deletion. The field is
+advisory copy only — the FE degrades to neutral wording when it is absent.
+
+```json
+{ "id":6, "playlistId":3, "playlistName":"Korzinka promo", "status":"CONFIRMED",
+  "startTime":"2026-06-03T19:37:00Z", "endTime":"2100-01-01T00:00:00Z",
+  "conflictingDeviceIds":[1], "remainingDeviceCount":2 }
+```
+
+#### What changes on the wire
+
+| surface | before | after |
+|---|---|---|
+| Replace, predecessor fully covered | retired | unchanged |
+| Replace, predecessor partially covered | **whole predecessor retired; unselected devices go dark** | predecessor narrowed; unselected devices keep playing, **same content version, no re-download** |
+| `AssignmentCancelledEvent` on supersede | predecessor's whole target, exclusions ignored | exactly the handed-over devices |
+| Reassigned device's `sync_group_id` | kept forever | `NULL` |
+| Reassigned device's `/sync` `syncGroupId` | `sg-9` | falls back to `fac-…` / `grp-…` / `reg-…` — opaque to Android |
+| Sync-group jump after a partial reassign | 409 *"members resolve different content"* | works — the split device left the group |
+| `details.conflicts[]` | — | `+ remainingDeviceCount` |
+| DB schema | — | **no migration** |
+
+Coverage: 13 new/updated cases in `ContentAssignmentServiceTest` (both branches of the supersede
+split, the exclusion-blind cancel push, all four sync-group outcomes, the uncapped-clear negative)
+plus `ContentAssignmentPartialSupersedeTest` in `infra` — the narrowed end state resolved through the
+real `findActiveAtTime` + exclusion queries on H2 under the full Flyway schema.
+
+### Content live-feed hardening: ordering, FAILED reasons, abandon frames, per-session routing (v1.0.134)
+
+Four defects found while investigating an operator report — *"new content doesn't appear until
+reload; it never flips to ready without another reload"*. **None of them is that bug**, which was a
+frontend subscription-topology defect and shipped separately. All four are real, and all four are
+independent.
+
+- **`GET /api/content` had no `ORDER BY`.** Both listing queries end at the LIKE predicate and the
+  controller takes a bare `Pageable`, so page membership was unspecified DB order — and it *shifts as
+  the transcode pipeline UPDATEs rows*, which is enough to move a row between pages while an operator
+  pages through it. `ContentListService` now normalises every request: no caller sort ⇒
+  `ContentFileRepository.DEFAULT_LISTING_SORT` (`createdAt DESC, id DESC`), and the `id` tiebreaker is
+  appended to *any* caller sort. An explicit `sort=` deliberately still wins — pinning the order
+  inside the `@Query` would have silenced `sort=` for every caller, a bigger change than the bug.
+  `id` is also the key the frontend structurally cannot send, since it binds one `sort` parameter per
+  request. Proven against a real database (`ContentListingOrderTest`) with two rows sharing a
+  `createdAt` — the case a unit test on the `Pageable` cannot see.
+- **A FAILED frame carried no reason.** `markFailed` wrote the ffmpeg error to
+  `transcode_last_error` and then broadcast an explicit `null`, with the text in scope one line
+  above. Neither DTO exposed the column either, so **a FAILED card could not say why it failed on any
+  surface**. The frame now carries the same truncated string that is persisted, and
+  `ContentFileSummary` / `ContentFileDetail` expose it as `transcodeLastError`.
+- **`TranscodeSweeper.abandon` wrote a terminal FAILED and told nobody.** The class injected no
+  broadcaster at all. It is the one terminal transition the transcoder does not write, so an
+  exhausted row went FAILED server-side while every operator's grid kept showing "Transcoding" until
+  the next poll — exactly the failure the live feed exists to report. It now broadcasts, after the CAS
+  returns 1 (never announce a state that was not written) and best-effort (a Redis outage must not
+  stop a backlog from draining).
+- **Content frames leaked across projects.** `contentStatusChanged` skipped the routing envelope every
+  other event type uses, and the handler sends an unwrapped frame byte-identically to every open
+  session — so every operator received every content id, status and ffmpeg diagnostic regardless of
+  project or ownership. Frames are now enveloped like everything else, and the envelope gained an
+  `_owner` alongside `_projectId`: content visibility is **owned ∪ granted**, never project-gated, and
+  orphan content has no project, so project-only routing would have silently dropped an operator's own
+  transcode updates. See "Dashboard Live Feed" for the routing table.
+
+Also: the upload response's documented `status` example was `"PROCESSING"`, a value
+`ContentFile.Status` cannot produce. It is `"UPLOADED"`.
+
+**No frontend change is required by any of this**, and no schema migration ships with it.
+
+### Production exposure hardening: closed ports, rotated credentials, bounded disk (v1.0.133)
+
+Tracing an unrelated `"Error parsing HTTP request header"` log storm turned up internet scanners
+sending TLS ClientHellos at the **plaintext** `0.0.0.0:8080` (Palo Alto Cortex Xpanse, and a Google
+Cloud host probing 12 path variants). `ss -lntp` showed **six** ports listening on `0.0.0.0` with no
+upstream firewall — Postgres 5432, Redis 6379, the API 8080, the SPA 3000, MinIO 9000 and the MinIO
+console 9001 — all completing a handshake from off-host on the credentials committed in this repo.
+
+**Redis was the sharp end.** It is not just a cache: `RefreshTokenRepository` stores `refresh:` /
+`family:` / `userfam:` keys there, so write access is **token forgery**, and one `FLUSHALL` drops
+every session *and* clears every brute-force counter at the same moment. `requirepass` was empty.
+Postgres answered `SSLRequest` with `N` (queries in cleartext over the internet) on `apppass`, and
+MinIO was `minioadmin`/`minioadmin`.
+
+**What changed in the repo** (the host half is a runbook — see below):
+
+- **Loopback by default.** Every publish in `docker-compose.yml` is now
+  `"${BIND_ADDR:-127.0.0.1}:<host>:<container>"`. Local tooling still works; off-host handshakes are
+  refused. `BIND_ADDR=0.0.0.0` is an explicit, documented opt-in.
+  ⚠️ **MinIO's 9000 publish is rebound, never deleted** — Caddy runs as a *host systemd process*,
+  cannot resolve compose service names, and proxies presigned media through `localhost:9000`.
+  Deleting it breaks playback on every TV box.
+- **No credential left in git.** `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` and
+  `REDIS_PASSWORD` are `${VAR:?message}` — `docker compose up` aborts rather than starting on a
+  well-known password, the discipline `JWT_SECRET` already used. The app's S3 keys reference the same
+  variables, so they cannot drift.
+- **Redis authentication.** `--requirepass "${REDIS_PASSWORD:-}"` on the redis service; Spring
+  already bound `spring.data.redis.password` from the same variable. An empty value is accepted by
+  `redis-server` and means "no password", so a bare dev box is unaffected.
+- **`audit_log` is finally pruned.** `RetentionCleanupService` covered only `event` and
+  `playback_log`. `audit_log` — the fattest table on the box, every row carrying the full HTTP
+  request *and* response body — was pruned by nothing at all. Now drained at the same 90-day
+  `RETENTION`, in the same batched own-transaction shape. *(Superseded in **v1.0.143**: the shared
+  `RETENTION` constant is gone — each table now has its own window from `app.retention.*`, and
+  `audit_log` is swept at 14 days.)* `entity_audit_log` is deliberately left
+  alone: it is the business provenance trail in small rows, not HTTP traffic.
+- **Raw originals expire** — see the storage section above. This is what stops `content-raw` growing
+  forever on a volume that was 386 MB from failing.
+- **Two new health components.** `disk` reports free space on the shared volume (Down below
+  `app.health.disk-warn-free-percent`, default **15%**, so it fires at 85% used rather than at 99%
+  when there is no room left to manoeuvre) and `storage-lifecycle` reports whether cleanup is
+  actually installed. Both share `app.health.data-volume-path` and `DiskSpace`'s arithmetic with the
+  Telegram `/health` command, so the two surfaces cannot disagree.
+
+**Two rotation mechanics were verified locally before writing the runbook**, and one of them is a
+trap that would have caused an outage:
+
+- **Postgres:** changing `POSTGRES_PASSWORD` and recreating the container against an *existing* data
+  volume does **nothing** — the variable is only read when the data directory is first initialised.
+  The old password keeps working and the new one fails. Edit `.env` first and the app presents a
+  password the server does not have. `ALTER USER` must come **first**, then `.env`.
+- **MinIO:** restarting with new root credentials against an existing volume rotates cleanly — new
+  credentials work, every object survives, old credentials are rejected. No special procedure.
+
+**`DEPLOY-subzero.md` (new)** carries the host half, which is not something the image can do:
+credential rotation in the correct order, the port rebinds **one service at a time** with a presigned
+MinIO download verified after each, `ufw` default-deny, off-host handshake verification, disk
+reclamation, and the one `curl` that settles whether Caddy's `encode gzip` is compressing `video/mp4`
+— which would strip `Content-Length` and `Accept-Ranges` and break ExoPlayer seek on every TV box.
+
+**Not a regression:** `DeviceTokenAuthFilter` logging device requests with no `X-Device-Token`, and
+`POST /api/devices/{id}/remote` returning 503, are the known-unbuilt remote-control relay and Android
+halves. The feature ships dark on purpose.
+
+### Transcode pipeline: lost dispatch, missing recovery, and host-adaptive capacity (v1.0.132)
+
+Two MP4s uploaded to production sat at `status = UPLOADED` with `processed_storage_key`,
+`duration_seconds`, `checksum` and `thumbnail_storage_key` all NULL. **ffmpeg had never executed once
+in that deployment.** The entire trace was two lines:
+`WARN FFmpegTranscoder : Transcode requested for missing content file [id=1|2]`.
+
+**Root cause — a commit-ordering race, not a determinism.** `ContentUploadService.upload(...)` was
+`@Transactional` and called `transcoder.transcodeAsync(saved.getId())` ten lines after `save()`,
+**still inside that transaction**. `ContentFile` is `GenerationType.IDENTITY`, so Hibernate had
+issued the INSERT to obtain the id — but the row was uncommitted, and under READ COMMITTED a plain
+SELECT on another connection takes no lock against a foreign uncommitted INSERT. Whichever finished
+first — *(executor handoff + connection acquire + SELECT)* or *(tx unwind + COMMIT + WAL fsync)* —
+decided the outcome. It passed in dev and CI every time and lost 2-of-2 on the production box.
+
+**Why it became permanent.** `OrphanedTranscodeRecoverer` queried only `status='TRANSCODING'`, and
+`TRANSCODING` was never committed: `runPipeline` wrapped its whole body in one transaction and every
+exit path overwrote the status with a terminal value first, so the DB went
+`UPLOADED → READY|FAILED|INVALID` in a single commit. Its predicate was unsatisfiable, no `@Scheduled`
+job touched `content_file`, no endpoint could retry, and a restart recovered nothing.
+
+**Seven fixes, deliberately shipped together** — fixing the dispatch alone would have turned a silent
+stuck row into an OOM-killed backend on the very next upload:
+
+- **Dispatch after commit.** `ContentUploadService` publishes `ContentUploadedEvent`;
+  `ContentUploadedTranscodeListener` consumes it at `@TransactionalEventListener(AFTER_COMMIT)`. A
+  rolled-back upload now dispatches nothing. The MinIO PUT also moved **out** of the transaction — a
+  multi-MB transfer must not hold a Hikari connection.
+- **`TRANSCODING` is a committed, observable state.** `@Transactional` is gone from both async entry
+  points; the pipeline is three short self-committing statements (lease → work → terminal) with
+  **no connection held across ffmpeg**. That also silences the false "Apparent connection leak
+  detected" traces that `leak-detection-threshold: 30000` fired on *every* real transcode, and makes
+  the "Transcode complete" INFO after-commit by construction rather than before a possible rollback.
+  ⚠️ These statements are `REQUIRES_NEW`, not `REQUIRED`: inside an `afterCommit` callback the
+  completed transaction's resources are still bound to the thread, so a `REQUIRED` statement joins a
+  transaction that has already committed and Hibernate throws *"no transaction is in progress"* —
+  which the synchronization machinery then swallows, silently losing the dispatch again.
+- **`V44__content_file_transcode_lease.sql`** adds `transcode_started_at`, `transcode_attempts`,
+  `transcode_last_error` and a `(status, transcode_started_at)` index, plus the claiming
+  `TranscodeSweeper` described above. **The two stuck rows self-heal on the first sweep.**
+- **A dedicated, host-planned transcode pool.** Transcodes ran on the **audit** pool, whose
+  documented rejection policy is *silently drop* — a rejected transcode reproduced this incident with
+  zero diagnostic trail. `TranscodeExecutor` is now the only place ffmpeg concurrency is decided: one
+  bounded pool, width auto-planned from CPU + container memory (`TranscodeCapacityPlanner`), a
+  `PriorityBlockingQueue` so urgent uploads still jump the queue at any width, and a **loud** ERROR
+  on rejection. The old `urgentTranscodeExecutor` is deleted: a second pool made the real ceiling the
+  sum of two widths, and its `CallerRunsPolicy` ran the whole pipeline inline on the Tomcat request
+  thread on overflow. `auditExecutor`'s dead `maxPoolSize` (unreachable below ~505 queued tasks) is
+  fixed to `core == max` with `allowCoreThreadTimeOut`, and it now drains on shutdown.
+- **The encode fits the cgroup, on any host.** `-preset` and the resolution cap are configurable
+  (`veryfast` default: measured 218 MiB peak / 14.3 s versus `medium`'s 438 MiB / 44.9 s on the same
+  13 s 1080p25 input — the allocation is x264 lookahead, i.e. per-frame, so a 3 MB and a 50 MB clip
+  cost the same). `JAVA_TOOL_OPTIONS` in compose defaults to `-XX:MaxRAMPercentage=45` and is
+  overridable per environment; **no GC is pinned** — ergonomics already picks SerialGC at ≤1 CPU and
+  G1 on a larger host. `-threads`/`-filter_threads` are deliberately *not* set: measured at 136 kB of
+  431 MB on 1 vCPU, where x264 already auto-selects them.
+- **The dashboard WebSocket feed was double JSON-encoded.** `RedisDashboardEventBroadcaster`
+  hand-builds its frame as a `String` and published it through `RedisTemplate<String,Object>`, whose
+  value serializer is `GenericJackson2JsonRedisSerializer` — so `convertAndSend` JSON-quoted and
+  escaped it a second time. The browser's `JSON.parse` produced a *string* and the FE guard dropped
+  it: `CONTENT_STATUS_CHANGE`, `DEVICE_STATUS_CHANGE`, `INCIDENT_CRITICAL` and `INCIDENT_UPDATED`
+  were **all dead in production**; only `SNAPSHOT` survived, because the WebSocket handler serialises
+  that one itself. Fixed at the publisher by injecting the already-existing `StringRedisTemplate`.
+  *(The frontend has a second, latent blocker behind this one — it must ship together with this
+  release or realtime is still dead.)*
+- **A way out, and an alarm.** `POST /api/content/{id}/retranscode` (ADMIN/OPERATOR) claims with the
+  same conditional UPDATE and re-queues; it resets `transcode_attempts` first, because a human asking
+  again is not an automatic retry. 404 on unknown/soft-deleted, 409 (with `message`) when the status
+  is not `UPLOADED`/`FAILED`, the raw object is missing, or another worker won the claim. A new
+  `transcode-backlog` component on `GET /api/health` reports files stuck in `UPLOADED` past
+  `stale-alert-after` (10 min), flipping `overallStatus` to `DEGRADED`; the sweeper logs the same
+  backlog at WARN, which `TelegramAppender` already forwards. **That single metric would have
+  surfaced this incident in minutes instead of waiting for a user complaint.**
+
+**Why the tests did not catch it.** `ContentUploadServiceTest` asserted
+`verify(transcoder).transcodeAsync(42L)` and passed on every run with the bug live in production —
+mock verification proves a call happened, never *when* it happened relative to commit. The new
+`ContentUploadCommitOrderingIntegrationTest` boots the real transaction manager and uses a
+`Transcoder` double that records **whether the row was visible in a fresh `REQUIRES_NEW` transaction
+at dispatch time**; revert the fix and it fails. Likewise the old WS test asserted the
+pre-serialisation `String`, so `DashboardFrameWireFormatTest` now captures the bytes at the Redis
+connection and asserts they parse to a JSON **object**.
 
 ### Synchronized multi-device playback — time layer (v1.0.127)
 
@@ -1478,7 +2743,7 @@ Operators can now see and filter the device list by whether each device currentl
 - **New `DeviceListItem` fields** `activePlaylistId` (null when none) and `activePlaylistName` (never null when the id is set).
 - **Migration `V34`** recreates `device_status_view` (DROP+CREATE — column-changing REPLACE isn't H2/PG-portable) with two derived columns whose subselect mirrors `resolveForDevice` exactly: `deleted_at IS NULL` + `status='CONFIRMED'` + half-open window (`start <= now`, `end > now`) + region/facility/group target match + not in `content_assignment_exclusion`; winner = highest `priority` (REGION<FACILITY<DEVICE_GROUP), tie-broken `id DESC`.
 - **`computed_status` correctness fix (behavioral change):** the pre-V34 view (V15/V16) flagged `NO_CONTENT` using window+target only — it ignored `status='CONFIRMED'` and exclusions, so a device whose only assignment was DRAFT/CANCELLED/expired/excluded was wrongly reported `ONLINE`. V34 makes `computed_status` CONFIRMED- and exclusion-aware, so such devices now correctly report `NO_CONTENT`. `computed_status = NO_CONTENT` is now exactly equivalent to "no active playlist" (for a device with a fresh heartbeat). Consumer **count tests are mock-based** (they stub the repository/service), so no golden numbers needed changing; the new H2 view fidelity test (`DeviceStatusViewActivePlaylistFilterTest`) pins all three in-SQL predicates to agree.
-- New columns are **projection-only** (not sortable). No `U34` rollback (the rollback chain lapsed after U28; `FlywayRollbackTest` only exercises U1/U2). Follow-ups (separate PRs): (1) `GET /api/devices` still lacks the `size<=100` page cap its sibling endpoints enforce; (2) the view's display tie-break (`id DESC` on a same-priority same-target tie) is deterministic, whereas `resolveForDevice`'s `Stream.max(priority)` leaves same-priority ties unspecified — so on such a tie the *displayed* playlist name could differ from the one actually served. This is unreachable in practice (the confirm-time overlap guard rejects two CONFIRMED assignments overlapping on the same target+devices), but a deterministic `id DESC` tie-break should be added to `resolveForDevice` for strict parity.
+- New columns are **projection-only** (not sortable). No `U34` rollback (the rollback chain lapsed after U28; `FlywayRollbackTest` only exercises U1/U2). Follow-ups (separate PRs): (1) `GET /api/devices` still lacks the `size<=100` page cap its sibling endpoints enforce; (2) the view's display tie-break (`id DESC` on a same-priority same-target tie) is deterministic, whereas `resolveForDevice`'s `Stream.max(priority)` leaves same-priority ties unspecified — so on such a tie the *displayed* playlist name could differ from the one actually served. This is unreachable in practice (the confirm-time overlap guard rejects two CONFIRMED assignments overlapping on the same target+devices), but a deterministic `id DESC` tie-break should be added to `resolveForDevice` for strict parity. **(2) resolved in v1.0.142** — both sides now share one total order, `ContentAssignment.PRECEDENCE`, and same-target overlap is deliberate rather than unreachable.
 
 ### Content `checksum` (SHA-256) + legacy `sizeBytes`/`checksum` backfill (v1.0.114)
 
@@ -1531,7 +2796,7 @@ Two fixes to the device heartbeat / content-sync contract:
 
 > **§4 cross-target — deliberately NOT a conflict (design decision, not an omission).** A device covered by both a REGION assignment and a DEVICE_GROUP/FACILITY assignment is *not* a double-book: those have distinct target-type priorities (REGION<FACILITY<DEVICE_GROUP) and `resolveForDevice` deterministically picks the most specific one — the intentional priority-layering feature (pinned by `resolveForDevice_groupTakesPriorityOverRegion`/`facilityOverRegion`). A genuine same-priority double-book requires the same target type, which (since a device has exactly one region/facility/group) means the same target id — already covered by the same-target check. Making cross-target a hard 409 would forbid a valid, common workflow and make the priority resolver dead code. If product wants visibility, that should be a non-blocking preview/warning, never a reject.
 
-> **⚠️ Flagged (product decision): partial-intersection replace.** When `replaceConflicting:true` retires a predecessor that drives *more* devices than the new assignment (predecessor drives [1,2,3], new drives [3]), the **whole** predecessor is retired — devices [1,2] lose it too (they re-resolve to lower-priority/none). There is no partial-device supersede (it would mean adding exclusions to the predecessor). Acceptable for the common forever/whole-region case; flagged for a product call on whether partial supersede or a reject is wanted.
+> **Partial-intersection replace — resolved in v1.0.135 (product call made, implemented).** When `replaceConflicting:true` meets a predecessor that drives *more* devices than the new assignment (predecessor drives [1,2,3], new drives [3]), the predecessor is now **narrowed, not retired**: one `content_assignment_exclusion` row per handed-over device, predecessor stays CONFIRMED on its original window, devices [1,2] keep playing it at an unchanged content version. Only a predecessor the new assignment covers *entirely* is still retired in full. See [Partial-device supersede + sync-group reset on reassignment (v1.0.135)](#partial-device-supersede--sync-group-reset-on-reassignment-v10135).
 
 > **⚠️ Pre-existing follow-ups surfaced by review (NOT introduced here):**
 > - **Confirm-time overlap is a read-then-write TOCTOU.** Two near-simultaneous `POST /…/confirm` on the same target/devices/window can both pass the gate and commit two CONFIRMED rows (no DB unique/EXCLUDE constraint, no row lock, `versionNumber` is not a JPA `@Version`). This race predates this change (the old `rejectTimeOverlap` path had it too) and is unaffected by the device-aware refactor. Proper fix is a serialized critical section per target — e.g. `pg_advisory_xact_lock(targetType,targetId)` at the top of the confirm gate (preserves the device-disjoint-allowed semantics, unlike a target-level `EXCLUDE` constraint). Tracked as a separate concurrency-hardening task.
@@ -2495,6 +3760,41 @@ Live broadcast channel backing **FE-05**, **FE-14**, and **FE-29**. Distinct fro
 }
 ```
 
+```json
+{
+  "type": "CONTENT_STATUS_CHANGE",
+  "contentId": 42, "status": "FAILED",
+  "invalidReason": "RuntimeException: minio down",
+  "at": "2026-05-06T10:31:00Z"
+}
+```
+
+`status` is a `ContentFile.Status` — `TRANSCODING`, `READY`, `FAILED` or `INVALID`. `invalidReason`
+carries the rejection reason on `INVALID` **and the transcode error on `FAILED`** (v1.0.134 — it used
+to be an unconditional `null` on FAILED, so a failed card could not say why); it is `null` for
+`TRANSCODING`/`READY`. The same text is persisted, and the listing/detail DTOs expose it as
+`transcodeLastError`.
+
+**Per-session routing (server-internal).** Every frame is published to Redis wrapped in a routing
+envelope the handler strips before it reaches the socket, so the on-the-wire shapes above are exactly
+what a browser sees:
+
+```json
+{ "_projectId": 7, "_owner": "alice", "payload": { "type": "CONTENT_STATUS_CHANGE", "…": "…" } }
+```
+
+- **ADMIN** captures no project scope at handshake and receives every frame.
+- **OPERATOR** receives a frame whose `_projectId` is in their assigned set, **or** whose `_owner` is
+  their own username.
+
+The `_owner` term exists because content visibility is **owned ∪ granted**, never project-gated, and
+an orphan upload has no project at all — routing content on `_projectId` alone would stop an operator
+from seeing their own upload transcode. Before v1.0.134 content frames were published *unwrapped*,
+which the handler broadcasts byte-identically to every open session: every operator received every
+content id, status and ffmpeg diagnostic. The residual gap is deliberate and small: an operator
+holding an admin **grant** on someone else's content outside their project set learns of a status
+change on the next listing refetch rather than live.
+
 **Authentication at the handshake.**
 
 `DashboardHandshakeInterceptor` extracts the JWT from the `Authorization: Bearer ...` header (or the `?access_token=...` query param fallback for browser clients that can't set headers). It validates via the existing `TokenValidator` and returns:
@@ -2818,7 +4118,7 @@ Poll `GET /api/reports/events/jobs/{jobId}`:
 - **In-memory job store** — single-instance deploy is the baseline. Jobs auto-expire 30 minutes after creation; lookup of an expired or unknown id returns 404.
 - **`@Async` proxy invariant** — `EventReportService` injects itself via `@Lazy` and dispatches to `self.submitAsync(...)`. Calling `submitAsync` directly inside `run` would bypass the AOP proxy and execute synchronously on the request thread; the self-injection is what makes the async dispatch actually async.
 
-The dedicated `reportExecutor` (configured in `AuditAsyncConfig`) is separate from `auditExecutor` (fire-and-forget) and `urgentTranscodeExecutor` (CPU-bound). It uses `AbortPolicy` on overflow so saturation surfaces as a job `FAILED` rather than a silent drop — the polling client always gets a definitive answer.
+The dedicated `reportExecutor` (configured in `AuditAsyncConfig`) is separate from `auditExecutor` (fire-and-forget) and from `TranscodeExecutor` (CPU- and memory-bound video work). It uses `AbortPolicy` on overflow so saturation surfaces as a job `FAILED` rather than a silent drop — the polling client always gets a definitive answer.
 
 ### Org Tree
 
@@ -3153,7 +4453,7 @@ Device-side endpoint for reporting content playback. Accepts either a single JSO
 **Edge cases:**
 
 - **`playedAt` in the future** (beyond a 30s clock-skew tolerance) → entry rejected with reason `played_at is in the future...`. Protects against bad device clocks injecting bogus future events.
-- **`playedAt` older than 90 days** → entry rejected with reason `played_at is older than the 90-day retention window`. Matches the nightly cleanup window — accepting older data would be deleted on the next run anyway.
+- **`playedAt` older than the playback retention window** (`app.retention.playback`, **90 days** by default) → entry rejected with reason `played_at is older than the 90-day retention window`, with the day count taken from the configured value. Read from the same property the nightly cleanup deletes by — accepting older data would be deleted on the next run anyway.
 - **Idempotent dedup**: the DB unique constraint `uq_playback_dedup (device_id, content_file_id, played_at)` ensures duplicates are recorded as `duplicate` (silent), not errors. Devices can safely retry the same batch after a network blip.
 - **Batch size > 500** → 400 `Batch size N exceeds maximum 500`. Client must chunk. Bounds memory and transaction time per request.
 - **Per-batch `ContentFile` cache**: a 500-entry batch with 5 unique content ids hits `content_file` 5 times, not 500.
@@ -3183,7 +4483,7 @@ Aggregate troubleshooting snapshot for the operator console. Roles: `ADMIN` / `O
 }
 ```
 
-`pendingActionCount` comes from a dedicated `COUNT(*)` query — it reflects the true total, not the size of the (capped at 5) `recentActions` list. `lastKnownIp` (V27 migration adds the `device.last_known_ip` column) is captured on each heartbeat from `X-Forwarded-For` (first hop) or `request.getRemoteAddr()` as fallback.
+`pendingActionCount` comes from a dedicated `COUNT(*)` query — it reflects the true total, not the size of the (capped at 5) `recentActions` list. `lastKnownIp` (V27 migration adds the `device.last_known_ip` column) is captured on each heartbeat from `request.getRemoteAddr()`, which Tomcat's `RemoteIpValve` resolves from `X-Forwarded-For` only when the request came through a trusted proxy (v1.0.138, AUTH-04). Values longer than the 45-char column are not stored.
 
 **Edge case: never-heartbeated device returns empty envelope, not error.** A device that's only just been registered (or one that hasn't reported in yet) returns the same envelope with `lastHeartbeatAt: null`, `lastKnownIp: null`, `currentContentVersion: null`, empty `recentEvents` / `recentActions`, and `pendingActionCount: 0`. The operator console renders "no data yet" instead of an error. 404 is reserved for an unknown / soft-deleted device id.
 
@@ -3363,29 +4663,69 @@ Reading **container `format=duration`** (not stream-level frame counts) is the o
 
 **Edge case: Duration = 0 → INVALID.** A successfully transcoded file with an unreadable container duration cannot be played reliably (no seek bar, no scheduling math), so the transcoder marks it `INVALID` with reason `"Could not determine video duration..."` instead of `READY`. The processed bytes are not uploaded to `content-processed`.
 
-**Configurable via `app.video.*`:**
-- `ffmpeg-path` (default `ffmpeg`)
-- `ffprobe-path` (default `ffprobe`)
-- `inspector-enabled` (default `true`)
-- `transcoder-enabled` (default `true` — set `false` in CI without ffmpeg; raw bytes are copied through)
+**Configurable via `app.video.*`** (nothing is required — every key has a host-safe default):
+- `ffmpeg-path` (default `ffmpeg`), `ffprobe-path` (default `ffprobe`)
+- `inspector-enabled` / `transcoder-enabled` (default `true` — set `transcoder-enabled=false` in CI
+  without ffmpeg; raw bytes are copied through)
+- `preset` (default `veryfast`), `crf`, `max-width` (1920), `max-height` (1080), `audio-bitrate`
+- `timeout` (default `PT15M`), `poster-timeout` (default `PT60S`)
+- `transcode.concurrency` (default `0` = plan it from the host), `transcode.max-concurrency`,
+  `transcode.job-memory-mb`, `transcode.reserve-mb`, `transcode.queue-capacity`
+- `sweeper.interval`, `sweeper.lost-dispatch-after`, `sweeper.lease-timeout`,
+  `sweeper.failed-retry-after`, `sweeper.max-attempts`, `sweeper.stale-alert-after`
 
-**Edge Case: Orphaned TRANSCODING jobs on startup**
+**Transcode concurrency adapts to the host** (`TranscodeCapacityPlanner`, v1.0.132). ffmpeg is a
+child of the JVM, so its peak RSS is charged to the same cgroup; the pool width is therefore derived
+at startup as `min(cpus - 1, (container memory - max heap - reserve) / job-memory-mb)`, clamped to
+`[1, max-concurrency]`, and logged. A 1-vCPU / 700 MiB container resolves to **1**; an 8-core / 16 GB
+host resolves to **7** — same image, no rebuild. Set `app.video.transcode.concurrency` to override.
 
-If the JVM is killed mid-transcode, rows are left in `TRANSCODING` state forever otherwise. `OrphanedTranscodeRecoverer` runs on `ApplicationReadyEvent`:
+**Edge Case: a transcode that never started, never finished, or failed**
 
-1. `findByStatusAndDeletedAtIsNull(TRANSCODING)` finds all stuck jobs
-2. For each, in a `REQUIRES_NEW` transaction: reset status to `UPLOADED`, then call `transcoder.transcodeAsync(id)` to requeue
-3. Errors on individual rows are logged and don't block siblings (no rollback cascade)
+Every one of these used to be permanent (see the v1.0.132 release note above). `TranscodeSweeper` runs every
+`app.video.sweeper.interval` (default 2 min) and once on `ApplicationReadyEvent`:
 
-**Edge Case: Orphaned MinIO parts after 24h**
+1. **Lost dispatch** — `UPLOADED` older than `lost-dispatch-after` (5 min)
+2. **Crashed encode** — `TRANSCODING` whose `transcode_started_at` lease is older than
+   `lease-timeout` (20 min). Keyed on the **lease**, never `updated_at`, which does not advance
+   during an encode; on boot the cutoff is "now", since a fresh JVM owns no in-flight work
+3. **Retryable failure** — `FAILED` under `max-attempts` (3) and past the retry cooldown.
+   `INVALID` is never re-driven: the container was rejected, and re-running ffmpeg cannot help
 
-`OrphanedUploadCleaner` registers a server-side **bucket lifecycle policy** at startup:
+Each candidate is **claimed** with a conditional UPDATE (`claimForTranscode`) and dispatched only if
+it affected exactly 1 row, so a sweep racing a live upload cannot double-start an encode. At the
+attempt cap the row is parked in `FAILED` with `transcode_last_error` populated.
+
+**Raw originals expire; nothing else does** (`RawBucketLifecycleInstaller`, v1.0.133)
+
+At startup the app installs a server-side bucket lifecycle rule on `content-raw`:
 
 ```
-AbortIncompleteMultipartUpload after 1 day
+Expiration: 30 days   filter: prefix "raw/"   (app.minio.raw-expiry-days, 0 disables)
 ```
 
-MinIO itself sweeps incomplete multipart uploads older than 24h — no application cron job needed. The `MinioBucketInitializer` ensures `content-raw` exists before the lifecycle is applied; if MinIO is unavailable at startup, the lifecycle install is skipped (logged as non-critical) and the app remains DEGRADED until MinIO returns.
+Raw sources are the only objects that ever get deleted. **`content-processed` and
+`content-thumbnails` are kept forever**, so playback is never affected; the single cost is that
+`POST /api/content/{id}/retranscode` on a file older than the window fails, because its source is
+gone. Nothing deleted raw objects before this, so every ad cost ~90 MB permanently on a volume that
+reached 96% full.
+
+Incomplete multipart uploads are swept by MinIO itself (`stale_uploads_expiry`, 24 h) — no
+application job needed. `MinioBucketInitializer` ensures `content-raw` exists first; if MinIO is
+unavailable at startup the install is deferred (reported `PENDING`, not failed) and retried on the
+next boot.
+
+> **Why this replaced `OrphanedUploadCleaner`.** That class declared
+> `AbortIncompleteMultipartUpload` as its *only* action. MinIO's ILM validator requires at least one
+> of `Expiration`/`Transition`/`NoncurrentVersion*`/`DelMarkerExpiration`, and the server has no
+> abort type in its lifecycle package at all — so the document failed validation and the install lost
+> to `MalformedXML` on **every single boot**, leaving a zero-length lifecycle config and one WARN in
+> the log. Verified against a disposable MinIO on the deployed release
+> (`RELEASE.2025-09-07T16-13-09Z`, `io.minio:minio:8.5.14`): abort-only fails under **both** an empty
+> filter and a `raw/` prefix (so `RuleFilter("")` was not the cause), while expiration + `raw/`
+> installs and reads back as `status=Enabled prefix=raw/ expirationDays=30 abort=null`. A failed
+> install now logs at ERROR **and** shows as `storage-lifecycle` DOWN on `/api/health` — the old WARN
+> scrolled past and trained operators to expect cleanup that did not exist.
 
 ## Frontend Integration Contract
 
@@ -3472,8 +4812,17 @@ CORS allowed origins are bound to the configuration property `app.cors.allowed-o
 
 ## Build & Run
 
+> **`./gradlew build` and `./gradlew test` need a Redis on `localhost:6379`.** Every full-context
+> `@SpringBootTest` in the **infra** module starts a `RedisMessageListenerContainer` during context
+> refresh, and that startup is eager — without a reachable Redis the context fails and the whole
+> `:infra:test` task goes red with `RedisConnectionFailureException`, which looks like a real test
+> failure and is not. Start one first:
+> `docker run -d --rm -p 6379:6379 redis:7-alpine`. CircleCI supplies it as a secondary image
+> (see `.circleci/config.yml`). The **api** module excludes Redis autoconfiguration in its test
+> profile and does not need it.
+
 ```bash
-# Build all modules
+# Build all modules (start Redis first — see the note above)
 ./gradlew build
 
 # Run with dev profile (requires local Redis + MinIO)
@@ -3485,6 +4834,31 @@ CORS allowed origins are bound to the configuration property `app.cors.allowed-o
 # Run full stack (PostgreSQL + Redis + MinIO + app)
 docker compose up --build
 ```
+
+### Health surface — `GET /api/health` (unauthenticated)
+
+Six components; `overallStatus` is `DEGRADED` if any is Down. Each one answers a question that was
+once **unobservable in production** — the service kept serving traffic correctly while something
+behind it was quietly broken.
+
+| Component | Down means | Added |
+|---|---|---|
+| `application` | never — the process is answering | — |
+| `database` | the JDBC connection is unusable (generic reason; detail is logged, never returned) | — |
+| `transcode-backlog` | files stuck in `UPLOADED` past `app.video.sweeper.stale-alert-after` (10 min) — uploads are not being transcoded | v1.0.132 |
+| `disk` | free space below `app.health.disk-warn-free-percent` (15%) on `app.health.data-volume-path` | v1.0.133 |
+| `storage-lifecycle` | the raw-expiry rule is not installed, so nothing is reclaiming storage | v1.0.133 |
+| `storage` | MinIO is unreachable — uploads 503, transcodes fail, `/sync` returns 503. Carries the reason (operation + exception type) and since when | v1.0.144 |
+
+Because the endpoint is unauthenticated, every indicator returns a **generic** reason on probe
+failure and never echoes a connection string, path or driver exception. The Telegram `/health`
+command reports a wider set (Redis, MinIO, devices, incidents, pools, recent errors) and shares
+`app.health.data-volume-path` and `DiskSpace`'s arithmetic with the `disk` component here, so the two
+surfaces cannot disagree. Its MinIO check also **writes its verdict back** into the same flag the
+`storage` component reads (v1.0.144), so the chat and this endpoint cannot disagree either.
+
+`storage` reports DOWN with `not probed yet (startup)` between the web server accepting connections
+and `MinioBucketInitializer` finishing — that window is real, and storage endpoints do 503 in it.
 
 ## API Endpoints
 
@@ -3498,6 +4872,7 @@ docker compose up --build
 | GET    | /api/content                      | List content (filtered)  | Yes  |
 | GET    | /api/content/{id}                 | Content detail           | Yes  |
 | DELETE | /api/content/{id}                 | Soft-delete content      | Yes  |
+| POST   | /api/content/{id}/retranscode     | Re-queue a stuck/failed transcode | Yes  |
 | GET    | /api/schedules                    | List schedules (filtered)| Yes  |
 | GET    | /api/schedules/{id}               | Schedule detail          | Yes  |
 | GET    | /api/playlists                    | List playlists (filtered)| Yes  |
@@ -3521,6 +4896,12 @@ docker compose up --build
 | PUT    | /api/projects/{id}                | Rename project           | Yes  |
 | DELETE | /api/projects/{id}                | Hard-delete project      | Yes  |
 | GET    | /api/devices/{id}/actions         | Operator action history  | Yes  |
+| GET    | /api/devices/{id}/connection      | Live WS liveness (Connect button) | Yes |
+| POST   | /api/devices/{id}/remote          | Start a remote view/control session | Yes |
+| GET    | /api/devices/{id}/remote          | Current remote session (no ticket) | Yes |
+| DELETE | /api/devices/{id}/remote/{sessionId} | Stop a remote session (idempotent) | Yes |
+| POST   | /api/devices/{id}/reregistration-window | Allow one re-registration (ADMIN) | Yes |
+| POST   | /api/devices/{id}/remote/{sessionId}/ack | Device acks a remote session | Device token |
 | GET    | /api/regions                      | List regions             | Yes  |
 | GET    | /api/regions/{id}                 | Region detail            | Yes  |
 | POST   | /api/regions                      | Create region            | Yes  |

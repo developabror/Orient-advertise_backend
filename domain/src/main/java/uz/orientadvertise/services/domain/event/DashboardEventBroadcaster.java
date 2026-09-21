@@ -32,6 +32,9 @@ public interface DashboardEventBroadcaster {
      * (TRANSCODING / READY / FAILED / INVALID). Lets the operator console show transcode
      * progress over the live feed instead of HTTP-polling {@code GET /api/content/{id}}.
      * Distinct from the device-facing {@code URGENT_CONTENT} push.
+     *
+     * <p>Routed like every other event: see {@link ContentStatusPayload} for why a content frame
+     * needs <i>two</i> routing keys where a device frame needs one.
      */
     void contentStatusChanged(ContentStatusPayload payload);
 
@@ -57,9 +60,23 @@ public interface DashboardEventBroadcaster {
             // Server-internal routing only (see IncidentPayload.projectId).
             Long projectId) {}
 
+    /**
+     * @param invalidReason why the file was rejected (INVALID) or why the transcode failed
+     *                      (FAILED); null for TRANSCODING/READY
+     * @param projectId     server-internal routing only (see {@link IncidentPayload#projectId}) —
+     *                      null for orphan content, which has no project to route by
+     * @param uploadedBy    server-internal routing only: the uploader's username. Content
+     *                      visibility is <b>owned ∪ granted</b>, NOT project-based, so routing on
+     *                      {@code projectId} alone would stop an operator from seeing their own
+     *                      upload transcode whenever the file is orphan or sits in a project they
+     *                      are not assigned to — the exact live-feed gap this event exists to
+     *                      close. Never written to the on-the-wire frame.
+     */
     record ContentStatusPayload(
             Long contentId,
             String status,
             String invalidReason,
-            Instant at) {}
+            Instant at,
+            Long projectId,
+            String uploadedBy) {}
 }

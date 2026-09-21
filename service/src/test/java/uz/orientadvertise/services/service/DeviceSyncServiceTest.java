@@ -8,6 +8,7 @@ import java.util.Set;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
+import uz.orientadvertise.services.common.exception.StorageUnavailableException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Device;
@@ -30,6 +31,8 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class DeviceSyncServiceTest {
@@ -344,6 +347,90 @@ class DeviceSyncServiceTest {
         syncService.computeSyncPlan(12L, "v-12", Set.of(120L));
 
         org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).markSyncPending(any());
+    }
+
+    @Test
+    void computeSyncPlan_noWork_clearsAStalePendingMarker() {
+        // The device already holds the expected version and files — its confirm was lost. The
+        // marker left from the earlier plan must go, or SyncTimeoutMonitor escalates a sync that
+        // has in fact completed.
+        Device device = noWorkDevice(15L, 1500L, 150L, "v-15");
+        when(device.getSyncPendingSince()).thenReturn(java.time.Instant.now().minusSeconds(3600));
+
+        syncService.computeSyncPlan(15L, "v-15", Set.of(150L));
+
+        org.mockito.Mockito.verify(device).clearSyncPending();
+        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).markSyncPending(any());
+    }
+
+    @Test
+    void computeSyncPlan_noWork_noPendingMarker_leavesTheDeviceUntouched() {
+        // Negative: clearSyncPending() bumps updatedAt, so with nothing pending it must not be
+        // called at all — otherwise every no-op /sync would write the device row.
+        Device device = noWorkDevice(16L, 1600L, 160L, "v-16");
+        when(device.getSyncPendingSince()).thenReturn(null);
+
+        syncService.computeSyncPlan(16L, "v-16", Set.of(160L));
+
+        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).clearSyncPending();
+    }
+
+    @Test
+    void computeSyncPlan_withWork_keepsThePendingMarker() {
+        // Negative: an in-flight sync that still has work must keep its marker (and its original
+        // syncPendingSince) — only markSyncPending runs.
+        Device device = noWorkDevice(17L, 1700L, 170L, "v-17");
+        when(device.getSyncPendingSince()).thenReturn(java.time.Instant.now().minusSeconds(600));
+
+        syncService.computeSyncPlan(17L, "v-old", Set.of(170L));
+
+        org.mockito.Mockito.verify(device).markSyncPending("v-17");
+        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).clearSyncPending();
+    }
+
+    @Test
+    void noActiveAssignment_clearsAStalePendingMarker() {
+        // The assignment the marker was armed for has lapsed; there is no expected version left
+        // for a confirm to match, so the marker could only ever time out.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(18L);
+        when(device.getSyncPendingSince()).thenReturn(java.time.Instant.now().minusSeconds(3600));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(18L)).thenReturn(Optional.of(device));
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(null);
+
+        syncService.computeSyncPlan(18L, "v-stale", Set.of(50L));
+
+        org.mockito.Mockito.verify(device).clearSyncPending();
+    }
+
+    @Test
+    void noActiveAssignment_noPendingMarker_leavesTheDeviceUntouched() {
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(19L);
+        when(device.getSyncPendingSince()).thenReturn(null);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(19L)).thenReturn(Optional.of(device));
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(null);
+
+        syncService.computeSyncPlan(19L, null, Set.of());
+
+        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).clearSyncPending();
+    }
+
+    /** A device whose assignment expects exactly one READY file ({@code fileId}) at {@code version}. */
+    private Device noWorkDevice(Long deviceId, Long playlistId, Long fileId, String version) {
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(deviceId);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(deviceId)).thenReturn(Optional.of(device));
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(playlistId);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+        ContentFile f = readyFile(fileId, "key/" + fileId + ".mp4");
+        PlaylistItem only = item(0, f, 10);   // build first — never nest a stubbing helper in thenReturn(...)
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(playlistId)).thenReturn(List.of(only));
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn(version);
+        return device;
     }
 
     @Test
@@ -1150,6 +1237,194 @@ class DeviceSyncServiceTest {
         org.mockito.Mockito.verify(overrideRepository, org.mockito.Mockito.never()).deleteBySyncGroupId(any());
         assertEquals(3_000_000_000_000L, plan.anchorEpochMs(), "drifted member falls back to its own base anchor");
         assertEquals(3_000_000_000_000L, plan.activateAt());
+    }
+
+    // =======================================================================================
+    // v1.0.144 — a MinIO OUTAGE is not a per-file fact.
+    //
+    // Both failures look identical through a mock: processedObjectExists answers "no" for the
+    // missing object and throws for the outage. Their correct handling is opposite, and the old
+    // blanket catch treated them the same — so /sync answered HTTP 200 with a SHORT plan, which a
+    // device applies exactly as if it were correct.
+    // =======================================================================================
+
+    @Test
+    void storageOutage_duringExistsCheck_propagates_soSyncReturns503NotAShortPlan() {
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(75L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(75L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(750L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile f = readyFile(751L, "key/751.mp4");
+        // Build every mock into a local BEFORE stubbing — a mock created inside a thenReturn(...)
+        // argument runs its own when(...) while the outer stubbing is open (tasks/lessons.md).
+        PlaylistItem only = item(0, f, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(750L))
+                .thenReturn(List.of(only));
+        when(fileStorageService.processedObjectExists("key/751.mp4"))
+                .thenThrow(new StorageUnavailableException("MinIO storage is currently unavailable"));
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-75");
+
+        // GlobalExceptionHandler maps this to 503, whose documented device behaviour is
+        // "retry later" — the truthful answer while we cannot verify a single object.
+        assertThrows(StorageUnavailableException.class,
+                () -> syncService.computeSyncPlan(75L, null, Set.of()));
+    }
+
+    @Test
+    void storageOutage_onOneFile_failsTheWholeSync_notJustThatFile() {
+        // The pre-fix behaviour returned the other files and dropped this one. With storage
+        // unreachable, EVERY file is equally unverifiable — a partial list is a fiction.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(76L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(76L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(760L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile good = readyFile(761L, "key/good.mp4");
+        ContentFile broken = readyFile(762L, "key/broken.mp4");
+        PlaylistItem goodItem = item(0, good, 10);
+        PlaylistItem brokenItem = item(1, broken, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(760L))
+                .thenReturn(List.of(goodItem, brokenItem));
+        when(fileStorageService.processedObjectExists("key/good.mp4")).thenReturn(true);
+        when(fileStorageService.processedObjectExists("key/broken.mp4"))
+                .thenThrow(new StorageUnavailableException("Object stat failed: connection refused"));
+        when(fileStorageService.presignedProcessedUrl(eq("key/good.mp4"), anyInt()))
+                .thenReturn("https://minio/good");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-76");
+
+        assertThrows(StorageUnavailableException.class,
+                () -> syncService.computeSyncPlan(76L, null, Set.of()));
+    }
+
+    @Test
+    void storageOutage_neverSchedulesTheDevicesHeldFilesForDeletion() {
+        // The dangerous shape of the old behaviour: /sync answers 200 while storage is down. Here
+        // the device holds 801 and 802; 802 has been dropped from the playlist, so a successful
+        // plan WOULD delete it. During an outage no plan may be produced at all — the device must
+        // keep playing what it has and retry, not act on a diff computed from unverifiable state.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(80L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(80L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(800L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile held = readyFile(801L, "key/801.mp4");
+        ContentFile fresh = readyFile(803L, "key/803.mp4");
+        PlaylistItem heldItem = item(0, held, 10);
+        PlaylistItem freshItem = item(1, fresh, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(800L))
+                .thenReturn(List.of(heldItem, freshItem));
+        when(fileStorageService.processedObjectExists("key/803.mp4"))
+                .thenThrow(new StorageUnavailableException("Object stat failed: connection refused"));
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-80");
+
+        // 802 is no longer expected, so a returned plan would list it in filesToDelete.
+        assertThrows(StorageUnavailableException.class,
+                () -> syncService.computeSyncPlan(80L, "v-old", Set.of(801L, 802L)));
+        // No plan, no delete instruction, and the in-flight marker was never armed.
+        verify(device, never()).markSyncPending(anyString());
+    }
+
+    @Test
+    void missingObject_isStillSkipped_notPropagated_soOneBadKeyCannotStopTheFleet() {
+        // The other half of the rule: MinIO answered "I don't have that key". That is a fact about
+        // ONE file, and the rest of the playlist must still ship (today's behaviour, unchanged).
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(77L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(77L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(770L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile good = readyFile(771L, "key/good.mp4");
+        ContentFile gone = readyFile(772L, "key/gone.mp4");
+        PlaylistItem goodItem = item(0, good, 10);
+        PlaylistItem goneItem = item(1, gone, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(770L))
+                .thenReturn(List.of(goodItem, goneItem));
+        when(fileStorageService.processedObjectExists("key/good.mp4")).thenReturn(true);
+        when(fileStorageService.processedObjectExists("key/gone.mp4")).thenReturn(false);
+        when(fileStorageService.presignedProcessedUrl(eq("key/good.mp4"), anyInt()))
+                .thenReturn("https://minio/good");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-77");
+
+        var plan = syncService.computeSyncPlan(77L, null, Set.of());
+
+        assertEquals(1, plan.filesToAdd().size());
+        assertEquals(771L, plan.filesToAdd().get(0).fileId());
+    }
+
+    @Test
+    void resourceNotFoundFromStorage_isSkipped_notPropagated() {
+        // A StorageClient that reports a missing object by throwing (NoSuchKey → 404) must land in
+        // the same bucket as exists()==false, never in the outage bucket.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(78L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(78L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(780L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile good = readyFile(781L, "key/good.mp4");
+        ContentFile gone = readyFile(782L, "key/gone.mp4");
+        PlaylistItem goodItem = item(0, good, 10);
+        PlaylistItem goneItem = item(1, gone, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(780L))
+                .thenReturn(List.of(goodItem, goneItem));
+        when(fileStorageService.processedObjectExists("key/good.mp4")).thenReturn(true);
+        when(fileStorageService.processedObjectExists("key/gone.mp4"))
+                .thenThrow(new ResourceNotFoundException("File", "key/gone.mp4"));
+        when(fileStorageService.presignedProcessedUrl(eq("key/good.mp4"), anyInt()))
+                .thenReturn("https://minio/good");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-78");
+
+        var plan = syncService.computeSyncPlan(78L, null, Set.of());
+
+        assertEquals(1, plan.filesToAdd().size());
+        assertEquals(781L, plan.filesToAdd().get(0).fileId());
+    }
+
+    @Test
+    void playlistView_duringAStorageOutage_alsoFailsRatherThanServingATruncatedPlaylist() {
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(79L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(79L)).thenReturn(Optional.of(device));
+
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(790L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+
+        ContentFile f = readyFile(791L, "key/791.mp4");
+        PlaylistItem only = item(0, f, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(790L))
+                .thenReturn(List.of(only));
+        when(fileStorageService.processedObjectExists("key/791.mp4"))
+                .thenThrow(new StorageUnavailableException("Object stat failed: connection refused"));
+
+        assertThrows(StorageUnavailableException.class, () -> syncService.getPlaylistView(79L));
     }
 
     private static ContentFile readyFile(Long id, String processedKey) {

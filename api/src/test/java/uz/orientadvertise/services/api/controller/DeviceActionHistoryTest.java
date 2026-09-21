@@ -77,6 +77,9 @@ class DeviceActionHistoryTest {
     private uz.orientadvertise.services.service.DeviceRegistrationRateLimiter registrationRateLimiter;
 
     @MockitoBean
+    private uz.orientadvertise.services.domain.content.DevicePushChannel devicePushChannel;
+
+    @MockitoBean
     private TokenValidator tokenValidator;
 
     @MockitoBean

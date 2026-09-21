@@ -1,5 +1,6 @@
 package uz.orientadvertise.services.service;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
@@ -41,15 +42,18 @@ class PlaybackLogServiceTest {
         repository = mock(PlaybackLogRepository.class);
         deviceRepository = mock(DeviceRepository.class);
         contentFileRepository = mock(ContentFileRepository.class);
-        // resolveForDevice defaults to null → no assignment → batch assignment-check is skipped.
-        var assignmentService = mock(ContentAssignmentService.class);
-        var playlistItemRepository = mock(PlaylistItemRepository.class);
-        service = new PlaybackLogService(repository, deviceRepository, contentFileRepository,
-                assignmentService, playlistItemRepository, 30);
+        service = serviceWith(new RetentionProperties());    // playback defaults to 90 days
         device = mock(Device.class);
         when(device.getId()).thenReturn(1L);
         contentFile = mock(ContentFile.class);
         when(contentFile.getId()).thenReturn(10L);
+    }
+
+    /** resolveForDevice defaults to null → no assignment → the batch assignment-check is skipped. */
+    private PlaybackLogService serviceWith(RetentionProperties retention) {
+        return new PlaybackLogService(repository, deviceRepository, contentFileRepository,
+                mock(ContentAssignmentService.class), mock(PlaylistItemRepository.class),
+                retention, 30);
     }
 
     /**
@@ -178,6 +182,53 @@ class PlaybackLogServiceTest {
                         || i.getMethod().getName().equals("saveAll"));
         org.junit.jupiter.api.Assertions.assertFalse(savedAnything,
                 "the playback write path must go through insertIgnoringDuplicate, not save()");
+    }
+
+    // ---------- DATA-01: the rejection bound follows app.retention.playback (v1.0.143) ----------
+
+    @Test
+    void record_olderThanTheDefaultNinetyDayWindow_rejected() {
+        var playedAt = Instant.now().minus(100, ChronoUnit.DAYS);
+
+        var result = service.record(device, contentFile, null, playedAt, 30);
+
+        var rejected = assertInstanceOf(PlaybackLogResult.Rejected.class, result);
+        org.junit.jupiter.api.Assertions.assertTrue(rejected.reason().contains("90-day"),
+                "the message must quote the configured window, was: " + rejected.reason());
+        verifyNoInsertAttempted();
+    }
+
+    /**
+     * The bound is the CONFIGURED playback retention, not a constant — a shortened window must
+     * start rejecting reports the nightly cleanup would delete, and the message must say 30, not
+     * a hard-coded 90.
+     */
+    @Test
+    void record_olderThanAShortenedConfiguredWindow_rejected() {
+        var shortened = new RetentionProperties();
+        shortened.setPlayback(Duration.ofDays(30));
+        var shortWindowService = serviceWith(shortened);
+
+        var result = shortWindowService.record(device, contentFile, null,
+                Instant.now().minus(45, ChronoUnit.DAYS), 30);
+
+        var rejected = assertInstanceOf(PlaybackLogResult.Rejected.class, result);
+        org.junit.jupiter.api.Assertions.assertTrue(rejected.reason().contains("30-day"),
+                "the day count must track the configured window, was: " + rejected.reason());
+        verifyNoInsertAttempted();
+    }
+
+    @Test
+    void record_insideAShortenedConfiguredWindow_accepted() {
+        var shortened = new RetentionProperties();
+        shortened.setPlayback(Duration.ofDays(30));
+        var shortWindowService = serviceWith(shortened);
+        stubInsertReturns(1);
+
+        var result = shortWindowService.record(device, contentFile, null,
+                Instant.now().minus(20, ChronoUnit.DAYS), 30);
+
+        assertInstanceOf(PlaybackLogResult.Created.class, result);
     }
 
     @Test

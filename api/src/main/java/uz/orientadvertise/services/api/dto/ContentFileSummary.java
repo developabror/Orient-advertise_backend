@@ -10,6 +10,12 @@ import uz.orientadvertise.services.service.ContentListService.ContentFileView;
  * {@link ContentFile} — internal storage keys, checksums, and the soft-delete timestamp
  * stay server-side.
  *
+ * <p>{@code invalidReason} carries the terminal explanation for an {@code INVALID} row;
+ * {@code transcodeLastError} carries it for a {@code FAILED} one. They are separate columns and
+ * exactly one is ever populated, so a card renders whichever is non-null. Before v1.0.134 the
+ * FAILED reason was written to the database and exposed nowhere, so a failed card could not say
+ * why it failed.
+ *
  * <p>{@code thumbnailUrl} / {@code thumbnailExpiresAt} are populated for {@code READY}
  * rows that have a stored thumbnail; both are null for transcoding rows, failed rows,
  * and rows where the best-effort poster step did not produce a thumbnail. The 15-minute
@@ -25,6 +31,7 @@ public record ContentFileSummary(
         Integer durationSeconds,
         String status,
         String invalidReason,
+        String transcodeLastError,
         String thumbnailUrl,
         Instant thumbnailExpiresAt,
         Instant createdAt,
@@ -55,6 +62,7 @@ public record ContentFileSummary(
                 file.getDurationSeconds(),
                 file.getStatus() != null ? file.getStatus().name() : null,
                 file.getInvalidReason(),
+                file.getTranscodeLastError(),
                 view.thumbnailUrl(),
                 view.thumbnailExpiresAt(),
                 file.getCreatedAt(),

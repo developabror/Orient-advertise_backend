@@ -19,8 +19,9 @@ import uz.orientadvertise.services.service.DeviceRegistrationService;
  * targetable by content assignment without any extra wiring.
  *
  * <p>Idempotent: serials are deterministic ({@code FAKE-TV-1}, {@code FAKE-TV-2}, …), and
- * the registration service upserts on existing serials, so re-running on every boot leaves
- * the device count stable.
+ * serials that already exist are skipped before calling the registration service (which would
+ * refuse them anyway — re-registration needs an admin window, AUTH-02), so re-running on every
+ * boot leaves the device count stable.
  */
 @Component
 public class FakeDeviceSeeder implements ApplicationRunner {

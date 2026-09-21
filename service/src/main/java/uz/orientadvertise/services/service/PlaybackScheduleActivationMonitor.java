@@ -22,6 +22,11 @@ import uz.orientadvertise.services.domain.repository.PlaybackSyncScheduleReposit
  * stragglers (they join at the live position, never at item 0). This gives ops the "wait-for-all-ready"
  * visibility the design calls for, on the same {@code @Scheduled} shape as {@link SyncTimeoutMonitor}.
  *
+ * <p>Only a PARTIAL rollout (some devices ready, some not) is a WARN — WARN reaches Telegram and this
+ * poll runs every minute. A readiness of {@code 0/N} is reported at INFO: it means no device holds the
+ * version at all, which since v1.0.142 is the ordinary look of an anchor whose assignment is outranked
+ * for the current window by a more recently CONFIRMED one.
+ *
  * <p>Pure read orchestration — every collaborator call self-manages its own transaction, so there is no
  * per-item {@code REQUIRES_NEW} boundary to get wrong. The scan is bounded to the last {@code maxLeadCap}
  * window so it never rescans the full history of anchors.
@@ -82,7 +87,18 @@ public class PlaybackScheduleActivationMonitor {
         if (Instant.now().isBefore(activateAt)) {
             log.info("Cut-over pending [assignment={}, version={}, activateAt={}] readiness {}/{}",
                     row.getAssignmentId(), row.getVersionNumber(), activateAt, ready, total);
+        } else if (ready == 0) {
+            // NOT a straggler situation, and deliberately not WARN: WARN is forwarded to Telegram,
+            // and this poll runs every minute for the whole lead-cap window. "Nobody has this
+            // version" means this anchor is not what the devices are playing — since v1.0.142 an
+            // assignment can be outranked for a window by a more recently CONFIRMED one
+            // (ContentAssignment.PRECEDENCE), and overlapping CONFIRMED rows are now a NORMAL
+            // state, so its anchor legitimately sits at 0/N until (or unless) it wins.
+            log.info("Cut-over anchor inactive [assignment={}, version={}, activateAt={}] readiness 0/{} "
+                            + "— no device holds this version; it is most likely outranked for this window",
+                    row.getAssignmentId(), row.getVersionNumber(), activateAt, total);
         } else if (ready < total) {
+            // A genuine partial rollout: some devices made the cut-over, some did not.
             log.warn("Cut-over live with stragglers [assignment={}, version={}, activateAt={}] readiness {}/{} "
                             + "— laggards join at the live position, never item 0",
                     row.getAssignmentId(), row.getVersionNumber(), activateAt, ready, total);

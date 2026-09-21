@@ -19,6 +19,8 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import uz.orientadvertise.services.infra.storage.MinioHealthStatus;
+import uz.orientadvertise.services.infra.storage.TranscodeExecutor;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.Event;
 import uz.orientadvertise.services.domain.repository.DeviceStatusViewRepository;
@@ -51,8 +53,9 @@ class HealthCommandHandlerTest {
     private ObjectProvider<MinioClient> minioProvider;
     private ObjectProvider<DeviceStatusViewRepository> statusViewRepoProvider;
     private ObjectProvider<IncidentRepository> incidentRepoProvider;
-    private ObjectProvider<ThreadPoolTaskExecutor> urgentProvider;
+    private ObjectProvider<TranscodeExecutor> transcodeProvider;
     private ObjectProvider<ThreadPoolTaskExecutor> auditProvider;
+    private MinioHealthStatus minioHealthStatus;
     private HealthCommandHandler handler;
 
     @BeforeEach
@@ -66,15 +69,16 @@ class HealthCommandHandlerTest {
         minioProvider = mock(ObjectProvider.class);
         statusViewRepoProvider = mock(ObjectProvider.class);
         incidentRepoProvider = mock(ObjectProvider.class);
-        urgentProvider = mock(ObjectProvider.class);
+        transcodeProvider = mock(ObjectProvider.class);
         auditProvider = mock(ObjectProvider.class);
+        minioHealthStatus = new MinioHealthStatus();
 
         // Defaults: every dependency available with a "happy path" stub.
         wireHappyPath();
 
         handler = new HealthCommandHandler(bot, dsProvider, redisProvider,
                 minioProvider, statusViewRepoProvider, incidentRepoProvider,
-                urgentProvider, auditProvider, tempDir.toString());
+                transcodeProvider, auditProvider, minioHealthStatus, tempDir.toString());
         RetainedErrorBuffer.resetForTests();
     }
 
@@ -127,11 +131,23 @@ class HealthCommandHandlerTest {
         when(incRepo.countOpenByPriority()).thenReturn(incRows);
         when(incidentRepoProvider.getIfAvailable()).thenReturn(incRepo);
 
-        // FFmpeg executors: empty queues, no active threads.
-        var urgent = makeExec(0, 0, 20);
-        var audit = makeExec(0, 0, 500);
-        when(urgentProvider.getIfAvailable()).thenReturn(urgent);
-        when(auditProvider.getIfAvailable()).thenReturn(audit);
+        // FFmpeg executors: empty queues, no active threads. Build the mocks BEFORE stubbing —
+        // creating a mock inside a when(...).thenReturn(...) argument trips Mockito's
+        // UnfinishedStubbingException.
+        var transcodeExec = makeTranscodeExec(0, 0, 200, 1);
+        var auditExec = makeExec(0, 0, 500);
+        when(transcodeProvider.getIfAvailable()).thenReturn(transcodeExec);
+        when(auditProvider.getIfAvailable()).thenReturn(auditExec);
+    }
+
+    private static TranscodeExecutor makeTranscodeExec(int queueSize, int active, int capacity,
+                                                         int concurrency) {
+        var exec = mock(TranscodeExecutor.class);
+        when(exec.getQueueDepth()).thenReturn(queueSize);
+        when(exec.getActiveCount()).thenReturn(active);
+        when(exec.getQueueCapacity()).thenReturn(capacity);
+        when(exec.getConcurrency()).thenReturn(concurrency);
+        return exec;
     }
 
     private static ThreadPoolTaskExecutor makeExec(int queueSize, int active, int capacity) {
@@ -236,6 +252,76 @@ class HealthCommandHandlerTest {
         assertEquals(HealthCommandHandler.CheckStatus.DOWN, byName(results, "minio").status());
     }
 
+    @Test
+    void minioProbeSucceeding_healsTheStorageLatch() {
+        // An operator typing /health performs exactly the round-trip the scheduled probe
+        // performs. Reporting "minio UP, 3 bucket(s)" in the chat while the application goes on
+        // refusing uploads because a stale flag says otherwise is an hour of an incident.
+        minioHealthStatus.markDegraded("upload: ConnectException");
+
+        var results = handler.runAllChecks();
+
+        assertEquals(HealthCommandHandler.CheckStatus.UP, byName(results, "minio").status());
+        assertTrue(minioHealthStatus.isAvailable(), "an operator check must heal the latch");
+    }
+
+    @Test
+    void minioProbeFailing_degradesTheStorageFlag_withAReason() {
+        minioHealthStatus.markUp();
+        var minio = mock(MinioClient.class);
+        try {
+            when(minio.listBuckets()).thenThrow(new java.net.ConnectException("Connection refused"));
+        } catch (Exception e) { throw new RuntimeException(e); }
+        when(minioProvider.getIfAvailable()).thenReturn(minio);
+
+        var results = handler.runAllChecks();
+
+        assertEquals(HealthCommandHandler.CheckStatus.DOWN, byName(results, "minio").status());
+        assertFalse(minioHealthStatus.isAvailable());
+        assertTrue(minioHealthStatus.getReason().contains("telegram /health probe"),
+                minioHealthStatus.getReason());
+        assertTrue(minioHealthStatus.getReason().contains("ConnectException"),
+                minioHealthStatus.getReason());
+    }
+
+    @Test
+    void minioAccessDenied_reportsDown_butDoesNotDegradeStorageForTheFleet() {
+        // A healthy MinIO refusing these credentials. Degrading here would 503 every upload and
+        // every device /sync in the fleet because an operator typed a slash command — exactly the
+        // "one request's error becomes a fleet-wide outage" failure v1.0.144 exists to remove.
+        minioHealthStatus.markUp();
+        var err = mock(io.minio.messages.ErrorResponse.class);
+        when(err.code()).thenReturn("AccessDenied");
+        var denied = mock(io.minio.errors.ErrorResponseException.class);
+        when(denied.errorResponse()).thenReturn(err);
+        when(denied.response()).thenReturn(null);
+        var minio = mock(MinioClient.class);
+        try {
+            when(minio.listBuckets()).thenThrow(denied);
+        } catch (Exception e) { throw new RuntimeException(e); }
+        when(minioProvider.getIfAvailable()).thenReturn(minio);
+
+        var results = handler.runAllChecks();
+
+        // The operator still sees the failure in the chat — the check really did fail.
+        assertEquals(HealthCommandHandler.CheckStatus.DOWN, byName(results, "minio").status());
+        assertTrue(minioHealthStatus.isAvailable(),
+                "an S3-level refusal must not take storage down for every device");
+    }
+
+    @Test
+    void minioBeanMissing_doesNotTouchTheStorageFlag() {
+        // "no MinioClient bean" is a wiring fact, not a probe result — it proves nothing about
+        // whether MinIO is reachable, so it must not flip the flag in either direction.
+        minioHealthStatus.markUp();
+        when(minioProvider.getIfAvailable()).thenReturn(null);
+
+        var results = handler.runAllChecks();
+
+        assertEquals(HealthCommandHandler.CheckStatus.DOWN, byName(results, "minio").status());
+        assertTrue(minioHealthStatus.isAvailable());
+    }
+
     // ---------- 2-second per-check timeout ----------
 
     @Test
@@ -327,8 +413,14 @@ class HealthCommandHandlerTest {
         });
         when(incidentRepoProvider.getIfAvailable()).thenReturn(incRepo);
 
-        // FFmpeg "hanging" — getThreadPoolExecutor.getQueue.size() — simulate hang.
-        var hanging = mock(ThreadPoolTaskExecutor.class);
+        // FFmpeg "hanging" — the queue-depth probe blocks — simulate hang.
+        var hangingTranscode = mock(TranscodeExecutor.class);
+        when(hangingTranscode.getQueueDepth()).thenAnswer(inv -> {
+            Thread.sleep(8_000);
+            return 0;
+        });
+        when(hangingTranscode.getQueueCapacity()).thenReturn(200);
+        var hangingAudit = mock(ThreadPoolTaskExecutor.class);
         var underlying = mock(ThreadPoolExecutor.class);
         var queue = mock(java.util.concurrent.BlockingQueue.class);
         when(queue.size()).thenAnswer(inv -> {
@@ -336,10 +428,10 @@ class HealthCommandHandlerTest {
             return 0;
         });
         when(underlying.getQueue()).thenReturn(queue);
-        when(hanging.getThreadPoolExecutor()).thenReturn(underlying);
-        when(hanging.getQueueCapacity()).thenReturn(20);
-        when(urgentProvider.getIfAvailable()).thenReturn(hanging);
-        when(auditProvider.getIfAvailable()).thenReturn(hanging);
+        when(hangingAudit.getThreadPoolExecutor()).thenReturn(underlying);
+        when(hangingAudit.getQueueCapacity()).thenReturn(500);
+        when(transcodeProvider.getIfAvailable()).thenReturn(hangingTranscode);
+        when(auditProvider.getIfAvailable()).thenReturn(hangingAudit);
     }
 
     // ---------- handle() never throws ----------
@@ -384,16 +476,41 @@ class HealthCommandHandlerTest {
 
     @Test
     void ffmpeg_queueNearCapacity_classifiedDegraded() {
-        // 17/20 = 85% > 80% threshold.
-        var nearCap = makeExec(17, 4, 20);
+        // 170/200 = 85% > 80% threshold.
+        var nearCap = makeTranscodeExec(170, 1, 200, 1);
         var fine = makeExec(0, 0, 500);
-        when(urgentProvider.getIfAvailable()).thenReturn(nearCap);
+        when(transcodeProvider.getIfAvailable()).thenReturn(nearCap);
         when(auditProvider.getIfAvailable()).thenReturn(fine);
 
         var result = handler.checkFFmpegQueue();
 
         assertEquals(HealthCommandHandler.CheckStatus.DEGRADED, result.status());
         assertTrue(result.detail().contains("near capacity"));
+    }
+
+    @Test
+    void ffmpeg_reportsPlannedPoolWidth() {
+        // The width is derived from the host at startup, so surfacing it is how an operator
+        // confirms the capacity planner read the machine correctly.
+        var wide = makeTranscodeExec(0, 0, 200, 7);
+        var audit = makeExec(0, 0, 500);
+        when(transcodeProvider.getIfAvailable()).thenReturn(wide);
+        when(auditProvider.getIfAvailable()).thenReturn(audit);
+
+        var result = handler.checkFFmpegQueue();
+
+        assertEquals(HealthCommandHandler.CheckStatus.UP, result.status());
+        assertTrue(result.detail().contains("w7"), "reports planned width: " + result.detail());
+    }
+
+    @Test
+    void ffmpeg_noExecutorsAtAll_classifiedDown() {
+        when(transcodeProvider.getIfAvailable()).thenReturn(null);
+        when(auditProvider.getIfAvailable()).thenReturn(null);
+
+        var result = handler.checkFFmpegQueue();
+
+        assertEquals(HealthCommandHandler.CheckStatus.DOWN, result.status());
     }
 
     // ---------- error window integration ----------

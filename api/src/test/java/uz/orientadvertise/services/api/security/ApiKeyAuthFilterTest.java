@@ -77,6 +77,21 @@ class ApiKeyAuthFilterTest {
     }
 
     @Test
+    void invalidKey_failureLimiterKey_isTheResolvedRemoteAddress_notAClientSuppliedForwardedFor() throws Exception {
+        // AUTH-04: RemoteIpValve resolves forwarding before this filter runs; reading the header
+        // again would let any client rotate its failure bucket.
+        var req = new MockHttpServletRequest();
+        req.setRemoteAddr("203.0.113.9");
+        req.addHeader("X-Forwarded-For", "9.9.9.9");
+        req.addHeader(ApiKeyAuthFilter.HEADER, "bogus-key");
+        when(authService.authenticate("bogus-key")).thenReturn(Optional.empty());
+
+        filter.doFilter(req, new MockHttpServletResponse(), chain);
+
+        verify(failureRateLimiter).allowFailure("203.0.113.9");
+    }
+
+    @Test
     void invalidKey_overFailureLimit_returns429() throws Exception {
         // ext-dev-1: too many failed-auth attempts from one source → 429, not another 401,
         // so the key space can't be brute-forced through the 401 path.

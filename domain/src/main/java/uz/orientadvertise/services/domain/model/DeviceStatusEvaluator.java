@@ -22,14 +22,7 @@ public final class DeviceStatusEvaluator {
      * The 60-second grace window absorbs minor clock skew between server and devices.
      */
     public static Device.Status evaluate(Instant lastHeartbeatAt, boolean hasContent, Instant now) {
-        if (lastHeartbeatAt == null) {
-            return Device.Status.OFFLINE;
-        }
-
-        var age = Duration.between(lastHeartbeatAt, now);
-        var thresholdWithGrace = OFFLINE_THRESHOLD.plus(CLOCK_SKEW_GRACE);
-
-        if (age.compareTo(thresholdWithGrace) > 0) {
+        if (isOffline(lastHeartbeatAt, now)) {
             return Device.Status.OFFLINE;
         }
 
@@ -38,5 +31,15 @@ public final class DeviceStatusEvaluator {
         }
 
         return Device.Status.ONLINE;
+    }
+
+    /**
+     * The OFFLINE rule on its own: no heartbeat, or one older than 15 min + 60 s grace. The same
+     * cut-off {@code device_status_view} uses ({@code INTERVAL '16' MINUTE}), so every status
+     * surface agrees on whether a device is showing as offline.
+     */
+    public static boolean isOffline(Instant lastHeartbeatAt, Instant now) {
+        return lastHeartbeatAt == null
+                || Duration.between(lastHeartbeatAt, now).compareTo(OFFLINE_THRESHOLD.plus(CLOCK_SKEW_GRACE)) > 0;
     }
 }

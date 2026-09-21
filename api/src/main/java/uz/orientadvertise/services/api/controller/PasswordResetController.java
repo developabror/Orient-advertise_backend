@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import uz.orientadvertise.services.api.security.ClientIp;
 import uz.orientadvertise.services.service.PasswordResetRateLimiter;
 import uz.orientadvertise.services.service.PasswordService;
 
@@ -56,7 +57,7 @@ public class PasswordResetController {
     @PostMapping("/forgot-password")
     public ResponseEntity<Void> forgotPassword(@Valid @RequestBody ForgotPasswordRequest request,
                                                HttpServletRequest httpRequest) {
-        passwordService.requestReset(request.email(), clientIp(httpRequest));
+        passwordService.requestReset(request.email(), ClientIp.of(httpRequest));
         return ResponseEntity.accepted().build();
     }
 
@@ -70,7 +71,7 @@ public class PasswordResetController {
     @PostMapping("/reset-password")
     public ResponseEntity<Void> resetPassword(@Valid @RequestBody ResetPasswordRequest request,
                                               HttpServletRequest httpRequest) {
-        rateLimiter.checkResetAllowed(clientIp(httpRequest));
+        rateLimiter.checkResetAllowed(ClientIp.of(httpRequest));
         passwordService.resetPassword(request.token(), request.newPassword(), request.confirmPassword());
         return ResponseEntity.noContent().build();
     }
@@ -88,18 +89,10 @@ public class PasswordResetController {
     @GetMapping("/reset-password")
     public ResponseEntity<ValidateTokenResponse> validateToken(@RequestParam String token,
                                                                HttpServletRequest httpRequest) {
-        rateLimiter.checkResetAllowed(clientIp(httpRequest));
+        rateLimiter.checkResetAllowed(ClientIp.of(httpRequest));
         return ResponseEntity.ok(new ValidateTokenResponse(passwordService.isResetTokenValid(token)));
     }
 
-    /** Best-effort client IP — first X-Forwarded-For hop when present, else the socket address. */
-    private static String clientIp(HttpServletRequest request) {
-        String xff = request.getHeader("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) {
-            return xff.split(",")[0].trim();
-        }
-        return request.getRemoteAddr();
-    }
 
     public record ForgotPasswordRequest(@NotBlank @Email String email) {}
 

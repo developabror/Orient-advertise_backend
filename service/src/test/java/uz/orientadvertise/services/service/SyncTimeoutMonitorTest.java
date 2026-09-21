@@ -13,6 +13,7 @@ import uz.orientadvertise.services.domain.model.Event;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -30,15 +31,21 @@ class SyncTimeoutMonitorTest {
     void setUp() throws Exception {
         deviceRepository = mock(DeviceRepository.class);
         incidentService = mock(IncidentService.class);
-        monitor = new SyncTimeoutMonitor(deviceRepository, incidentService);
+        monitor = new SyncTimeoutMonitor(deviceRepository, incidentService, null);
         Field f = SyncTimeoutMonitor.class.getDeclaredField("syncTimeoutMinutes");
         f.setAccessible(true);
         f.setLong(monitor, 30L);
+        // Self-reference for the @Transactional(REQUIRES_NEW) escalate indirection. The unit
+        // test points it at the same instance — that the proxy IS used (so clearSyncPending()
+        // is actually written) is what DeviceMonitorTransactionIntegrationTest proves.
+        Field selfField = SyncTimeoutMonitor.class.getDeclaredField("self");
+        selfField.setAccessible(true);
+        selfField.set(monitor, monitor);
     }
 
     @Test
     void scan_noStuckDevices_doesNothing() {
-        when(deviceRepository.findBySyncPendingSinceLessThan(any())).thenReturn(List.of());
+        when(deviceRepository.findBySyncPendingSinceLessThanAndDeletedAtIsNull(any())).thenReturn(List.of());
 
         monitor.scanForStuckSyncs();
 
@@ -68,8 +75,9 @@ class SyncTimeoutMonitorTest {
     @Test
     void escalate_deletedDevice_doesNotCreateIncident() {
         // A device soft-deleted mid-sync still carries syncPendingSince (softDelete does not
-        // clear it) and so still appears in findBySyncPendingSinceLessThan. The isDeleted()
-        // guard must stop it from minting a SYNC_TIMEOUT incident for a ghost device.
+        // clear it). The scan query skips deleted devices, but one deleted between the scan and
+        // escalate() still arrives here — the isDeleted() guard must stop it from minting a
+        // SYNC_TIMEOUT incident for a ghost device.
         Device device = mock(Device.class);
         when(device.isDeleted()).thenReturn(true);
         when(device.getSyncPendingSince()).thenReturn(Instant.parse("2026-05-06T00:00:00Z"));
@@ -103,7 +111,7 @@ class SyncTimeoutMonitorTest {
         Device bad = mock(Device.class);
         when(bad.getId()).thenReturn(61L);
 
-        when(deviceRepository.findBySyncPendingSinceLessThan(any())).thenReturn(List.of(bad, good));
+        when(deviceRepository.findBySyncPendingSinceLessThanAndDeletedAtIsNull(any())).thenReturn(List.of(bad, good));
         // bad device's escalate() will throw because findById returns empty → null device path
         when(deviceRepository.findById(61L)).thenThrow(new RuntimeException("db unavailable"));
         when(deviceRepository.findById(60L)).thenReturn(Optional.of(good));
@@ -112,5 +120,18 @@ class SyncTimeoutMonitorTest {
 
         // good still got escalated despite bad blowing up
         verify(incidentService, times(1)).processEvent(any());
+    }
+
+    @Test
+    void scan_queriesWithTheConfiguredTimeout() {
+        when(deviceRepository.findBySyncPendingSinceLessThanAndDeletedAtIsNull(any())).thenReturn(List.of());
+
+        monitor.scanForStuckSyncs();
+
+        ArgumentCaptor<Instant> threshold = ArgumentCaptor.forClass(Instant.class);
+        verify(deviceRepository).findBySyncPendingSinceLessThanAndDeletedAtIsNull(threshold.capture());
+        var expected = Instant.now().minus(java.time.Duration.ofMinutes(30));
+        assertTrue(java.time.Duration.between(threshold.getValue(), expected).abs().getSeconds() < 5,
+                "threshold must be now - 30 min, was " + threshold.getValue());
     }
 }

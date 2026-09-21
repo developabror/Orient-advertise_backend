@@ -24,7 +24,7 @@ import uz.orientadvertise.services.domain.storage.StorageClient;
  * its true size and SHA-256, leaving the object, its key, presigned URLs, and content-version
  * hash untouched (so devices don't need to re-download).
  *
- * <p>Mirrors {@link OrphanedTranscodeRecoverer}: runs on {@link ApplicationReadyEvent} (after the
+ * <p>Runs on {@link ApplicationReadyEvent} (after the
  * app is serving traffic, so it never blocks readiness), is fault-tolerant per file, and is
  * idempotent — the query only matches files with a null checksum, so once backfilled they drop
  * out and subsequent boots are no-ops. Gated by {@code app.content.reconcile-on-startup} so ops
@@ -94,7 +94,7 @@ public class ContentMetadataReconciler {
 
     /**
      * Reconciles one file in its own transaction (REQUIRES_NEW, mirroring
-     * {@link OrphanedTranscodeRecoverer#resetAndRequeue}), so a failure on one file never rolls
+     * the per-row transcode recovery in {@code TranscodeSweeper}), so a failure on one file never rolls
      * back others. Re-checks the null-checksum precondition to stay correct if the row changed
      * since the batch query.
      */

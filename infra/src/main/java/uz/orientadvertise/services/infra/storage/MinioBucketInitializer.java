@@ -38,10 +38,12 @@ public class MinioBucketInitializer implements ApplicationRunner {
                 }
             }
             healthStatus.markUp();
-            log.info("MinIO storage is available — status: UP");
         } catch (Exception e) {
-            healthStatus.markDegraded();
-            log.warn("MinIO unavailable at startup — storage endpoints will be DEGRADED: {}", e.getMessage());
+            // markDegraded logs only on a TRANSITION and the status already starts DEGRADED, so
+            // this WARN is the one that actually reports a failed boot — keep it.
+            healthStatus.markDegraded("startup bucket check: " + e.getClass().getSimpleName());
+            log.warn("MinIO unavailable at startup — storage endpoints will be DEGRADED until "
+                    + "MinioHealthProbe succeeds: {}", e.getMessage());
         }
     }
 }

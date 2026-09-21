@@ -3,7 +3,6 @@ package uz.orientadvertise.services.domain.repository;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -12,12 +11,43 @@ import uz.orientadvertise.services.domain.model.Incident;
 
 public interface IncidentRepository extends JpaRepository<Incident, Long> {
 
+    /**
+     * Whether any open incident exists for the pair. "One open incident per pair" is enforced
+     * only in the service layer (H2 has no partial unique index), so duplicates can exist
+     * (LOGIC-16); an exists check cannot throw on them. There is deliberately no single-result
+     * {@code Optional} lookup for the pair — it threw on duplicates.
+     */
+    @Query("SELECT CASE WHEN COUNT(i) > 0 THEN true ELSE false END FROM Incident i " +
+           "WHERE i.device.id = :deviceId AND i.eventType = :eventType " +
+           "AND i.status <> 'RESOLVED'")
+    boolean existsOpenByDeviceAndEventType(
+            @Param("deviceId") Long deviceId,
+            @Param("eventType") String eventType);
+
+    /**
+     * Every open incident for {@code (deviceId, eventType)} — usually zero or one, but duplicates
+     * can exist (see {@link #existsOpenByDeviceAndEventType}). An auto-resolve walks the whole list
+     * so duplicates heal; {@code processEvent} picks the oldest.
+     */
     @Query("SELECT i FROM Incident i " +
            "WHERE i.device.id = :deviceId AND i.eventType = :eventType " +
            "AND i.status <> 'RESOLVED'")
-    Optional<Incident> findOpenByDeviceAndEventType(
+    List<Incident> findAllOpenByDeviceAndEventType(
             @Param("deviceId") Long deviceId,
             @Param("eventType") String eventType);
+
+    /**
+     * Ids of devices that still have an open {@code eventType} incident although their last
+     * heartbeat is newer than {@code threshold} — recoveries the heartbeat path did not close.
+     * Scalar ids on purpose: the caller runs outside a transaction and {@code Incident.device}
+     * is LAZY.
+     */
+    @Query("SELECT DISTINCT i.device.id FROM Incident i " +
+           "WHERE i.eventType = :eventType AND i.status <> 'RESOLVED' " +
+           "AND i.device.lastHeartbeatAt > :threshold")
+    List<Long> findDeviceIdsWithOpenIncidentAndHeartbeatAfter(
+            @Param("eventType") String eventType,
+            @Param("threshold") Instant threshold);
 
     List<Incident> findByDeviceIdOrderByUpdatedAtDesc(Long deviceId);
 

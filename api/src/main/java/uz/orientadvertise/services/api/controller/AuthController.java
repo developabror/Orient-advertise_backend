@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import uz.orientadvertise.services.api.security.ClientIp;
 import uz.orientadvertise.services.api.advice.GlobalExceptionHandler;
 import uz.orientadvertise.services.api.security.RefreshTokenCookie;
 import uz.orientadvertise.services.common.exception.AuthenticationException;
@@ -69,7 +70,7 @@ public class AuthController {
     public ResponseEntity<AccessTokenResponse> login(
             @Valid @org.springframework.web.bind.annotation.RequestBody LoginRequest request,
             HttpServletRequest httpRequest) {
-        String clientIp = clientIp(httpRequest);
+        String clientIp = ClientIp.of(httpRequest);
         // 429 if the source IP is over its attempt budget or the account is locked.
         loginRateLimiter.checkAllowed(clientIp, request.username());
         AuthToken token;
@@ -85,14 +86,6 @@ public class AuthController {
                 .body(new AccessTokenResponse(token.accessToken()));
     }
 
-    /** Best-effort client IP — first X-Forwarded-For hop when present, else the socket address. */
-    private static String clientIp(HttpServletRequest request) {
-        String xff = request.getHeader("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) {
-            return xff.split(",")[0].trim();
-        }
-        return request.getRemoteAddr();
-    }
 
     @Operation(
             summary = "Rotate the refresh cookie and mint a fresh access token",
@@ -116,7 +109,7 @@ public class AuthController {
     public ResponseEntity<AccessTokenResponse> refresh(
             @CookieValue(name = RefreshTokenCookie.NAME, required = false) String refreshToken,
             HttpServletRequest httpRequest) {
-        loginRateLimiter.checkRefreshAllowed(clientIp(httpRequest));
+        loginRateLimiter.checkRefreshAllowed(ClientIp.of(httpRequest));
         if (refreshToken == null || refreshToken.isBlank()) {
             throw new AuthenticationException("Missing refresh cookie");
         }

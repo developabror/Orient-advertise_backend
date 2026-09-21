@@ -70,6 +70,23 @@ public class ContentFile {
     @Column(name = "uploaded_by", length = 100)
     private String uploadedBy;
 
+    /**
+     * Lease stamp: when the current transcode attempt was claimed / (re)started. The transcode
+     * sweeper detects a crashed encode by lease AGE — deliberately not by {@code updatedAt}, which
+     * does not advance during the run and would make a slow-but-healthy encode look abandoned.
+     * Null until the row is first claimed.
+     */
+    @Column(name = "transcode_started_at")
+    private Instant transcodeStartedAt;
+
+    /** Number of transcode attempts claimed so far. Caps the automatic retry loop on a poison file. */
+    @Column(name = "transcode_attempts", nullable = false)
+    private int transcodeAttempts;
+
+    /** Last transcode failure reason (truncated to the column width); cleared on success. */
+    @Column(name = "transcode_last_error", length = 500)
+    private String transcodeLastError;
+
     protected ContentFile() {
     }
 
@@ -130,8 +147,12 @@ public class ContentFile {
 
     public void markInvalid(String reason) {
         this.status = Status.INVALID;
-        this.invalidReason = reason != null && reason.length() > 500 ? reason.substring(0, 500) : reason;
+        this.invalidReason = truncate(reason, 500);
         this.updatedAt = Instant.now();
+    }
+
+    private static String truncate(String value, int max) {
+        return value != null && value.length() > max ? value.substring(0, max) : value;
     }
 
     public Instant getCreatedAt() { return createdAt; }
@@ -142,6 +163,32 @@ public class ContentFile {
     /** Username that uploaded this file; null for legacy/system rows. Drives per-operator ownership. */
     public String getUploadedBy() { return uploadedBy; }
     public void setUploadedBy(String uploadedBy) { this.uploadedBy = uploadedBy; }
+
+    /**
+     * Transcode lease/accounting accessors. These fields are written in production by the bulk
+     * {@code @Modifying} statements on {@code ContentFileRepository} (claim, lease refresh, terminal
+     * state) so each write is a single atomic, self-committing statement callable from a
+     * non-transactional pool thread. The setters exist for construction in tests and for the rare
+     * managed-entity path; production code should prefer the repository statements so the
+     * compare-and-set guard is not lost.
+     */
+    public Instant getTranscodeStartedAt() { return transcodeStartedAt; }
+    public void setTranscodeStartedAt(Instant transcodeStartedAt) {
+        this.transcodeStartedAt = transcodeStartedAt;
+        this.updatedAt = Instant.now();
+    }
+
+    public int getTranscodeAttempts() { return transcodeAttempts; }
+    public void setTranscodeAttempts(int transcodeAttempts) {
+        this.transcodeAttempts = transcodeAttempts;
+        this.updatedAt = Instant.now();
+    }
+
+    public String getTranscodeLastError() { return transcodeLastError; }
+    public void setTranscodeLastError(String transcodeLastError) {
+        this.transcodeLastError = truncate(transcodeLastError, 500);
+        this.updatedAt = Instant.now();
+    }
 
     public void softDelete() {
         this.deletedAt = Instant.now();

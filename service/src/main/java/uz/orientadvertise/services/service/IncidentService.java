@@ -1,6 +1,7 @@
 package uz.orientadvertise.services.service;
 
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 
 import org.slf4j.Logger;
@@ -44,14 +45,17 @@ public class IncidentService {
      * Edge case: one open incident per device per event type — no duplicates.
      * If an open incident already exists for this device + event type, update it
      * (increment occurrence count, update last_event, escalate priority if higher).
-     * Otherwise, create a new incident.
+     * Otherwise, create a new incident. The rule is service-enforced only (no partial unique
+     * index), so duplicates can already exist (LOGIC-16): the OLDEST open one (lowest id) takes
+     * the occurrence rather than the lookup throwing and losing the event.
      */
     @Transactional
     public IncidentResult processEvent(Event event) {
         var saved = eventRepository.save(event);
 
-        var existing = incidentRepository.findOpenByDeviceAndEventType(
-                event.getDevice().getId(), event.getEventType());
+        var existing = incidentRepository.findAllOpenByDeviceAndEventType(
+                        event.getDevice().getId(), event.getEventType()).stream()
+                .min(Comparator.comparing(Incident::getId, Comparator.nullsLast(Comparator.naturalOrder())));
 
         if (existing.isPresent()) {
             var incident = existing.get();
@@ -180,30 +184,29 @@ public class IncidentService {
     }
 
     /**
-     * Auto-close an open incident for {@code (deviceId, eventType)} when the underlying
+     * Auto-close the open incidents for {@code (deviceId, eventType)} when the underlying
      * condition has cleared (heartbeat returned, version match restored, etc).
      *
-     * <p>Edge case: must not override a manually-resolved incident. The method is a no-op
-     * if no open incident is found OR if the incident is already in {@link Incident.Status#RESOLVED}
-     * — manual resolutions stay sealed. Returns {@code true} only when this call actually
-     * transitioned the incident.
+     * <p>Edge case: must not override a manually-resolved incident. Only incidents whose status
+     * is not RESOLVED are loaded, so a manual resolve committed before this query stays sealed
+     * and the call is a no-op. A manual resolve committing <em>concurrently</em> is NOT detected:
+     * without optimistic locking ({@code @Version}, LOGIC-07) the two writes are last-writer-wins
+     * and {@code resolved_by} ends up as whichever committed second. Every open incident for the
+     * pair is closed, so a duplicate (the one-open-per-pair rule is service-enforced only) heals
+     * instead of making the lookup throw. Returns {@code true} when this call transitioned at
+     * least one.
      */
     @Transactional
     public boolean autoResolveOnRecovery(Long deviceId, String eventType) {
-        var existing = incidentRepository.findOpenByDeviceAndEventType(deviceId, eventType);
-        if (existing.isEmpty()) {
-            return false;
+        boolean resolvedAny = false;
+        for (var incident : incidentRepository.findAllOpenByDeviceAndEventType(deviceId, eventType)) {
+            incident.resolve(Incident.SYSTEM_RESOLVER);
+            log.info("Auto-resolved incident on recovery [id={}, device={}, type={}]",
+                    incident.getId(), deviceId, eventType);
+            broadcastUpdated(incident, Incident.SYSTEM_RESOLVER);
+            resolvedAny = true;
         }
-        var incident = existing.get();
-        if (incident.isResolved()) {
-            // Race: someone manually resolved between our query and decision.
-            return false;
-        }
-        incident.resolve(Incident.SYSTEM_RESOLVER);
-        log.info("Auto-resolved incident on recovery [id={}, device={}, type={}]",
-                incident.getId(), deviceId, eventType);
-        broadcastUpdated(incident, Incident.SYSTEM_RESOLVER);
-        return true;
+        return resolvedAny;
     }
 
     @Transactional(readOnly = true)

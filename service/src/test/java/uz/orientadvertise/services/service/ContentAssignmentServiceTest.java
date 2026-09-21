@@ -20,6 +20,7 @@ import uz.orientadvertise.services.domain.model.Facility;
 import uz.orientadvertise.services.domain.model.Playlist;
 import uz.orientadvertise.services.domain.model.Project;
 import uz.orientadvertise.services.domain.model.Region;
+import uz.orientadvertise.services.domain.model.SyncGroup;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.service.exception.AssignmentTimeOverlapException;
 import uz.orientadvertise.services.service.OperatorScopeResolver.ScopedProjects;
@@ -517,6 +518,10 @@ class ContentAssignmentServiceTest {
         assertEquals(1, ex.getConflicts().size());
         assertEquals(List.of(10L), ex.getConflicts().get(0).conflictingDeviceIds(),
                 "only the intersecting device id is reported");
+        // The candidate drives [10,20]; only 10 changes hands ⇒ device 20 keeps the old playlist,
+        // so Replace NARROWS the candidate rather than retiring it. The FE renders that count.
+        assertEquals(1, ex.getConflicts().get(0).remainingDeviceCount(),
+                "one of the candidate's devices keeps playing it if the operator replaces");
         assertEquals(ContentAssignment.Status.DRAFT, newDraft.getStatus());
     }
 
@@ -570,7 +575,11 @@ class ContentAssignmentServiceTest {
     void confirm_replaceConflicting_supersedesOnlyIntersecting() {
         // Region [10,20,30,40]. candidateA excludes [30,40] → covers [10,20] (intersects new's [10]).
         // candidateB excludes [10,20] → covers [30,40] (disjoint from new). New covers [10].
-        // replace must retire ONLY candidateA; candidateB untouched.
+        // replace must supersede ONLY candidateA; candidateB untouched.
+        //
+        // candidateA is only PARTIALLY covered (handover=[10], remainder=[20]), so since v1.0.135
+        // it is NARROWED — one exclusion for device 10 — instead of soft-deleted: device 20 must
+        // keep playing it.
         var playlist = new Playlist(new Project("P", null), "PL", null);
         var newDraft = new ContentAssignment(playlist, TargetType.REGION, 1L, now, nextWeek,
                 ContentAssignment.Status.DRAFT);
@@ -593,9 +602,25 @@ class ContentAssignmentServiceTest {
 
         service.confirmWithExclusions(1L, List.of(20L, 30L, 40L), null, true);
 
-        assertTrue(candidateA.isDeleted(), "intersecting candidate A is superseded");
+        assertFalse(candidateA.isDeleted(),
+                "partially-covered candidate A is narrowed, NOT retired — device 20 keeps playing it");
+        assertEquals(ContentAssignment.Status.CONFIRMED, candidateA.getStatus(),
+                "a narrowed predecessor stays CONFIRMED");
         assertFalse(candidateB.isDeleted(), "device-disjoint candidate B is left untouched");
         assertEquals(ContentAssignment.Status.CONFIRMED, newDraft.getStatus());
+
+        // The narrowing writes exactly one exclusion ON CANDIDATE A — for the handed-over device 10.
+        // (The confirm separately writes the new assignment's own exclusions for [20,30,40].)
+        var exclCaptor = ArgumentCaptor.forClass(ContentAssignmentExclusion.class);
+        verify(exclusionRepository, atLeast(1)).save(exclCaptor.capture());
+        var narrowing = exclCaptor.getAllValues().stream()
+                .filter(e -> e.getAssignment() == candidateA)
+                .toList();
+        assertEquals(1, narrowing.size(), "candidate A gains exactly one exclusion");
+        assertEquals(10L, narrowing.get(0).getDevice().getId(),
+                "only the handed-over device is excluded from candidate A");
+        assertTrue(exclCaptor.getAllValues().stream().noneMatch(e -> e.getAssignment() == candidateB),
+                "device-disjoint candidate B gains no exclusion");
 
         // Supersede must emit an AssignmentCancelledEvent for ONLY the superseded predecessor (A),
         // so its former audience re-resolves (~1s). (The confirm also publishes a Confirmed event.)
@@ -607,6 +632,8 @@ class ContentAssignmentServiceTest {
                 .toList();
         assertEquals(1, cancelled.size(), "exactly one predecessor superseded → one cancel event");
         assertEquals(100L, cancelled.get(0).assignmentId(), "cancel event names the superseded candidate A");
+        assertEquals(List.of(10L), cancelled.get(0).deviceIds(),
+                "cancel event carries ONLY the handed-over device, not candidate A's whole target");
     }
 
     @Test
@@ -1298,5 +1325,881 @@ class ContentAssignmentServiceTest {
 
         assertEquals(0, result.totalDevices());
         assertTrue(result.devices().isEmpty());
+    }
+
+    // ===== v1.0.135 Item 1: partial-device supersede =====
+    //
+    // Bug 1, as reported by an operator: "reassigning a playlist to SOME devices sets the playlist
+    // of the UNCHECKED devices to null." Root cause was supersede() retiring a conflicting
+    // predecessor in full even when the new assignment only took over part of its device set.
+
+    /** A REAL Device (id + region set) so resolveForDevice's matchesDevice can see its region. */
+    private Device deviceInRegion(Long id, Long regionId) {
+        var region = mock(Region.class);
+        when(region.getId()).thenReturn(regionId);
+        var d = new Device(region, null, "SN-" + id, "Device-" + id);
+        try {
+            Field f = Device.class.getDeclaredField("id");
+            f.setAccessible(true);
+            f.set(d, id);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+        return d;
+    }
+
+    /** Same, already placed in a sales point (sync group). */
+    private Device syncGroupMember(Long id, Long regionId) {
+        var d = deviceInRegion(id, regionId);
+        d.setSyncGroup(mock(SyncGroup.class));
+        return d;
+    }
+
+    private Playlist playlistWithId(Long id) {
+        var p = mock(Playlist.class);
+        when(p.getId()).thenReturn(id);
+        return p;
+    }
+
+    /** The exclusions saved against one specific assignment (the confirm saves its own too). */
+    private List<ContentAssignmentExclusion> savedExclusionsOn(ContentAssignment assignment) {
+        var captor = ArgumentCaptor.forClass(ContentAssignmentExclusion.class);
+        verify(exclusionRepository, atLeast(0)).save(captor.capture());
+        return captor.getAllValues().stream()
+                .filter(e -> e.getAssignment() == assignment)
+                .toList();
+    }
+
+    private List<AssignmentCancelledEvent> publishedCancellations() {
+        var captor = ArgumentCaptor.forClass(Object.class);
+        verify(eventPublisher, atLeast(0)).publishEvent(captor.capture());
+        return captor.getAllValues().stream()
+                .filter(e -> e instanceof AssignmentCancelledEvent)
+                .map(e -> (AssignmentCancelledEvent) e)
+                .toList();
+    }
+
+    @Test
+    void confirm_replaceConflicting_partialIntersection_narrowsPredecessor_keepsRemainder() {
+        // THE OPERATOR'S BUG, verbatim: region "Toshkent" = [1,2,3] all driven by predecessor P
+        // (playlist "Korzinka promo"). The operator reassigns playlist "Yangi reklama" to device 1
+        // ONLY and clicks Replace. Devices 2 and 3 must keep playing "Korzinka promo" — before
+        // v1.0.135 they lost all content and were told to purge their files.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.plus(1, ChronoUnit.HOURS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        var predecessorEnd = predecessor.getEndTime();
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L), deviceWithId(3L)));
+        when(deviceRepository.findAllById(List.of(2L, 3L))).thenReturn(List.of(
+                deviceWithId(2L), deviceWithId(3L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(2L, 3L), null, true);
+
+        assertFalse(predecessor.isDeleted(), "partially-covered predecessor must NOT be retired");
+        assertEquals(ContentAssignment.Status.CONFIRMED, predecessor.getStatus(),
+                "a narrowed predecessor stays CONFIRMED and keeps driving devices 2 and 3");
+        assertEquals(predecessorEnd, predecessor.getEndTime(), "its window is untouched");
+
+        var narrowing = savedExclusionsOn(predecessor);
+        assertEquals(1, narrowing.size(), "exactly one exclusion — the handed-over device");
+        assertEquals(1L, narrowing.get(0).getDevice().getId());
+        assertTrue(narrowing.get(0).getReason().contains("superseded"),
+                "the exclusion is greppable in audit: " + narrowing.get(0).getReason());
+    }
+
+    @Test
+    void confirm_replaceConflicting_fullCoverage_stillRetiresPredecessor() {
+        // remainder empty ⇒ nothing is left behind ⇒ retire as before (future ⇒ soft-delete).
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.plus(1, ChronoUnit.HOURS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L), deviceWithId(3L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertTrue(predecessor.isDeleted(), "a fully-covered predecessor is still soft-deleted");
+        assertEquals(0, savedExclusionsOn(predecessor).size(), "no narrowing when nothing remains");
+        assertEquals(List.of(1L, 2L, 3L), publishedCancellations().get(0).deviceIds());
+    }
+
+    @Test
+    void confirm_replaceConflicting_runningPredecessor_partialIntersection_notTruncated() {
+        // A RUNNING predecessor with a non-empty remainder must be narrowed, never truncated —
+        // truncating would cut content off the remainder devices at the new assignment's start.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(2L), null, true);
+
+        assertFalse(predecessor.isDeleted());
+        assertEquals(forever, predecessor.getEndTime(),
+                "running predecessor with a remainder keeps its end time — no truncation");
+        assertEquals(1, savedExclusionsOn(predecessor).size());
+    }
+
+    @Test
+    void confirm_replaceConflicting_partialIntersection_cancelEventNamesOnlyHandover() {
+        // The cancel push must name the handed-over devices only. Before v1.0.135 supersede()
+        // resolved the predecessor's WHOLE target (and ignored its own exclusions), pushing
+        // SYNC_CONTENT to devices whose content did not change at all.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L), deviceWithId(3L), deviceWithId(4L)));
+        when(deviceRepository.findAllById(List.of(3L, 4L))).thenReturn(List.of(
+                deviceWithId(3L), deviceWithId(4L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(3L, 4L), null, true);
+
+        var cancelled = publishedCancellations();
+        assertEquals(1, cancelled.size());
+        assertEquals(100L, cancelled.get(0).assignmentId());
+        assertEquals(List.of(1L, 2L), cancelled.get(0).deviceIds(),
+                "only the handed-over devices — not the predecessor's whole target [1,2,3,4]");
+    }
+
+    @Test
+    void confirm_replaceConflicting_predecessorWithOwnExclusions_handoverExcludesThem() {
+        // Region [1,2,3]. Predecessor already excludes device 3 ⇒ it drives [1,2]. The new
+        // assignment covers [1,3]. handover = [1,2] ∩ [1,3] = [1] ONLY — device 3 must not get a
+        // second exclusion row on the predecessor (UNIQUE(assignment_id, device_id) would reject it).
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L), deviceWithId(3L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of(3L));
+
+        service.confirmWithExclusions(1L, List.of(2L), null, true);
+
+        var narrowing = savedExclusionsOn(predecessor);
+        assertEquals(1, narrowing.size(), "device 3 is already excluded — no duplicate row");
+        assertEquals(1L, narrowing.get(0).getDevice().getId());
+        assertFalse(predecessor.isDeleted(), "device 2 remains ⇒ narrowed, not retired");
+        assertEquals(List.of(1L), publishedCancellations().get(0).deviceIds());
+    }
+
+    // ===== v1.0.135 Item 2: clear the sync group on reassignment =====
+    //
+    // Bug 2, as reported: "after changing a device's playlist it still remembers its old sync
+    // group." A sync group is a sales point — one split member makes resolveCoherence report
+    // "members resolve different content" and 409s /sync-groups/{id}/jump for everyone else.
+
+    @Test
+    void confirm_reassignedDevice_clearsSyncGroup() {
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var member = syncGroupMember(1L, 1L);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of());
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(member));
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertNull(member.getSyncGroup(),
+                "playlist 1 → playlist 2 is a real reassignment ⇒ the sales point membership is stale");
+    }
+
+    @Test
+    void confirm_excludedDevice_keepsSyncGroup() {
+        // "Unchecked devices must not be touched", applied to Bug 2.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var reassigned = syncGroupMember(1L, 1L);
+        var untouched = syncGroupMember(2L, 1L);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+        when(exclusionRepository.findByDeviceId(any())).thenReturn(List.of());
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(reassigned, untouched));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(untouched));
+
+        service.confirmWithExclusions(1L, List.of(2L), null, true);
+
+        assertNull(reassigned.getSyncGroup(), "the reassigned device leaves its sales point");
+        assertNotNull(untouched.getSyncGroup(),
+                "an EXCLUDED device keeps playing the old playlist ⇒ keeps its sales point");
+    }
+
+    @Test
+    void confirm_deviceShadowedByHigherPriorityAssignment_keepsSyncGroup() {
+        // THE TEST THAT MAKES THE NAIVE RULE FAIL. The device is inside the new REGION assignment's
+        // effective set, but a DEVICE_GROUP booking (priority 3 > 1) still wins in resolveForDevice,
+        // so its playlist does NOT change. "Clear the whole effective set" would silently break a
+        // working sales point here.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var member = syncGroupMember(1L, 1L);
+        var group = mock(DeviceGroup.class);
+        when(group.getId()).thenReturn(5L);
+        member.setDeviceGroup(group);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var groupBooking = new ContentAssignment(playlistWithId(9L), TargetType.DEVICE_GROUP, 5L,
+                now, forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(groupBooking, 200L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        // Cross-target is deliberately NOT an overlap conflict — the priority resolver layers them.
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of());
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(groupBooking));
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(member));
+
+        service.confirmWithExclusions(1L, List.of(), null, false);
+
+        assertNotNull(member.getSyncGroup(),
+                "shadowed by a more specific booking ⇒ playlist unchanged ⇒ sales point intact");
+    }
+
+    @Test
+    void confirm_samePlaylistReconfirmed_keepsSyncGroup() {
+        // Re-booking the SAME playlist (e.g. a window extension) changes nothing for the device.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var member = syncGroupMember(1L, 1L);
+        var samePlaylist = playlistWithId(7L);
+        var newDraft = new ContentAssignment(samePlaylist, TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(7L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of());
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(member));
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertNotNull(member.getSyncGroup(),
+                "same playlist before and after ⇒ nothing changed ⇒ sales point intact");
+    }
+
+    @Test
+    void confirm_deviceWithNoPreviousContent_clearsSyncGroup() {
+        // before == null: the device GAINS content, so whatever the group was playing, it is now
+        // on different content from any member that did not get this assignment.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var member = syncGroupMember(1L, 1L);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        setId(newDraft, 1L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(any(), anyLong(), any(), any(), eq(1L)))
+                .thenReturn(List.of());
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of());
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(member));
+
+        service.confirmWithExclusions(1L, List.of(), null, false);
+
+        assertNull(member.getSyncGroup(), "no previous content ⇒ the resolved playlist changed");
+    }
+
+    @Test
+    void confirmWithIncludedDevices_clearsSyncGroupForIncludedOnly() {
+        // The inclusion-list API shape inherits the behaviour through the delegation to
+        // confirmWithExclusions — the derived-exclusion devices must stay untouched.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var included = syncGroupMember(1L, 1L);
+        var derivedExcluded = syncGroupMember(2L, 1L);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        setId(newDraft, 1L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(any(), anyLong(), any(), any(), eq(1L)))
+                .thenReturn(List.of());
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of());
+        when(exclusionRepository.findByDeviceId(any())).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(included, derivedExcluded));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(derivedExcluded));
+
+        service.confirmWithIncludedDevices(1L, List.of(1L), "subset", false);
+
+        assertNull(included.getSyncGroup(), "the included device is reassigned ⇒ detached");
+        assertNotNull(derivedExcluded.getSyncGroup(), "the complement is untouched");
+    }
+
+    @Test
+    void confirm_syncGroupClear_isNotCappedByPushBudget() throws Exception {
+        // NEGATIVE: pushOnConfirmCap is a PUSH budget, never a correctness bound. Every reassigned
+        // member must be detached even when the event payload is truncated.
+        Field cap = ContentAssignmentService.class.getDeclaredField("pushOnConfirmCap");
+        cap.setAccessible(true);
+        cap.setInt(service, 2);
+
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var members = IntStream.rangeClosed(1, 5)
+                .mapToObj(i -> syncGroupMember((long) i, 1L))
+                .toList();
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        setId(newDraft, 1L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(any(), anyLong(), any(), any(), eq(1L)))
+                .thenReturn(List.of());
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of());
+        when(exclusionRepository.findByDeviceId(any())).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.copyOf(members));
+
+        service.confirmWithExclusions(1L, List.of(), null, false);
+
+        for (var member : members) {
+            assertNull(member.getSyncGroup(),
+                    "device " + member.getId() + " must be detached regardless of the push cap");
+        }
+        var captor = ArgumentCaptor.forClass(AssignmentConfirmedEvent.class);
+        verify(eventPublisher).publishEvent(captor.capture());
+        assertEquals(2, captor.getValue().deviceIds().size(), "the PUSH payload is still capped at 2");
+    }
+
+    // ===== v1.0.135 Item 3: name the remainder in the 409 =====
+
+    @Test
+    void confirm_overlapFullyCovered_remainingDeviceCountIsZero() {
+        // The new assignment covers the candidate entirely ⇒ Replace retires it ⇒ nothing is left
+        // behind ⇒ the FE must not claim any device keeps the old playlist.
+        var playlist = new Playlist(new Project("P", null), "PL", null);
+        var newDraft = new ContentAssignment(playlist, TargetType.REGION, 1L, now, nextWeek,
+                ContentAssignment.Status.DRAFT);
+        var candidate = new ContentAssignment(playlist, TargetType.REGION, 1L, now, nextWeek,
+                ContentAssignment.Status.CONFIRMED);
+        setId(candidate, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(candidate));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(10L), deviceWithId(20L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        var ex = assertThrows(AssignmentTimeOverlapException.class, () ->
+                service.confirmWithExclusions(1L, List.of(), null, false));
+
+        assertEquals(List.of(10L, 20L), ex.getConflicts().get(0).conflictingDeviceIds());
+        assertEquals(0, ex.getConflicts().get(0).remainingDeviceCount(),
+                "fully covered ⇒ no device keeps the old playlist");
+    }
+
+    // ===== v1.0.142 (LOGIC-05): Replace overrides only its OWN window =====
+    //
+    // Reported: a 1-week campaign confirmed over a "forever" (year-2100) booking with Replace
+    // killed the booking outright. When the campaign ended, resolveForDevice returned null, the
+    // screens went blank and /sync purged the files. The fix: supersede only touches a predecessor
+    // the new window actually outlasts; otherwise both rows stay CONFIRMED and
+    // ContentAssignment.PRECEDENCE decides who plays when.
+
+    /** A CONFIRMED predecessor with a controlled confirmedAt, so precedence is deterministic. */
+    private ContentAssignment confirmedAt(ContentAssignment draft, Instant when) {
+        try {
+            draft.confirm();
+            Field f = ContentAssignment.class.getDeclaredField("confirmedAt");
+            f.setAccessible(true);
+            f.set(draft, when);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+        return draft;
+    }
+
+    @Test
+    void confirm_replaceConflicting_shorterNewWindow_leavesPredecessorCompletelyUntouched() {
+        // THE BUG: a 1-week campaign over a forever booking. The predecessor must survive with its
+        // window, its status AND no exclusion rows — an exclusion is permanent, so it would stop
+        // the booking resuming when the campaign ends.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, nextWeek,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(deviceWithId(10L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertFalse(predecessor.isDeleted(), "a predecessor the new window does not outlast is NOT retired");
+        assertEquals(ContentAssignment.Status.CONFIRMED, predecessor.getStatus());
+        assertEquals(forever, predecessor.getEndTime(), "its window must not be truncated");
+        assertEquals(0, savedExclusionsOn(predecessor).size(),
+                "NO exclusion rows — they are permanent and would stop it resuming");
+        assertEquals(ContentAssignment.Status.CONFIRMED, newDraft.getStatus());
+    }
+
+    @Test
+    void confirm_replaceConflicting_shorterNewWindow_stillPushesTheHandoverDevices() {
+        // The predecessor's row survives, but the devices still change content NOW — the cancel
+        // push must still name them or they wait up to a full heartbeat.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, nextWeek,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(10L), deviceWithId(20L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        var cancelled = publishedCancellations();
+        assertEquals(1, cancelled.size());
+        assertEquals(100L, cancelled.get(0).assignmentId());
+        assertEquals(List.of(10L, 20L), cancelled.get(0).deviceIds());
+    }
+
+    @Test
+    void confirm_replaceConflicting_shorterNewWindow_partialDevices_writesNoExclusionsEither() {
+        // Devices [1,2], the campaign takes device 1 only. Pre-v1.0.142 this wrote a PERMANENT
+        // exclusion for device 1 on the predecessor — device 1 would never get the booking back.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, nextWeek,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(2L), null, true);
+
+        assertEquals(0, savedExclusionsOn(predecessor).size(),
+                "device 1 must get the booking back when the campaign ends");
+        assertEquals(forever, predecessor.getEndTime());
+        assertFalse(predecessor.isDeleted());
+    }
+
+    @Test
+    void confirm_replaceConflicting_foreverOverForever_stillRetiresThePredecessor() {
+        // Both windows carry the SAME year-2100 sentinel, so the gate must be newEnd >= predEnd.
+        // With a strict '>' this predecessor would survive forever alongside the new one.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L,
+                now.plus(1, ChronoUnit.HOURS), forever, ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(deviceWithId(10L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertEquals(now.plus(1, ChronoUnit.HOURS), predecessor.getEndTime(),
+                "forever-over-forever retires the old row (truncated at the cutover)");
+        assertFalse(predecessor.isDeleted(), "it is running, so history keeps the head");
+    }
+
+    @Test
+    void confirm_replaceConflicting_futurePredecessor_headNotCovered_isTruncatedNotDeleted() {
+        // The predecessor is scheduled but has NOT started; the new window opens AFTER it does and
+        // runs past its end. Pre-v1.0.142 the runningNow guard soft-deleted it, erasing a booking
+        // that was due to play for a whole day first.
+        var predStart = now.plus(1, ChronoUnit.DAYS);
+        var predEnd = now.plus(10, ChronoUnit.DAYS);
+        var newStart = now.plus(2, ChronoUnit.DAYS);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, newStart,
+                now.plus(20, ChronoUnit.DAYS), ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                predStart, predEnd, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(deviceWithId(10L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertFalse(predecessor.isDeleted(), "a future predecessor whose head survives is NOT deleted");
+        assertEquals(newStart, predecessor.getEndTime(), "truncated to the cutover — the head is kept");
+        assertEquals(predStart, predecessor.getStartTime(), "and it still starts when it was booked to");
+    }
+
+    @Test
+    void resolveForDevice_outOfOrderIds_mostRecentlyConfirmedWins() {
+        // The predecessor has the HIGHER id (it was drafted later) but was CONFIRMED EARLIER. Under
+        // the old "priority DESC, id DESC" tie-break it would beat the campaign for the campaign's
+        // whole window. Precedence orders on confirmedAt first, so the campaign wins.
+        var device = deviceInRegion(10L, 1L);
+        var campaign = confirmedAt(new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now);
+        var predecessor = confirmedAt(new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), tomorrow, ContentAssignment.Status.DRAFT),
+                now.minus(1, ChronoUnit.DAYS));
+        setId(campaign, 5L);
+        setId(predecessor, 900L);
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor, campaign));
+        when(exclusionRepository.findByDeviceId(10L)).thenReturn(List.of());
+
+        var winner = service.resolveForDevice(device, now);
+
+        assertNotNull(winner);
+        assertEquals(5L, winner.getId(),
+                "the most recently CONFIRMED assignment wins, whatever the ids say");
+    }
+
+    @Test
+    void resolveForDevice_campaignCancelledMidWindow_predecessorResolvesAgain() {
+        // The whole point of leaving the predecessor CONFIRMED: cancel the campaign and the old
+        // content comes straight back, with no re-assignment.
+        var device = deviceInRegion(10L, 1L);
+        var campaign = confirmedAt(new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now);
+        var predecessor = confirmedAt(new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), Instant.parse("2100-01-01T00:00:00Z"),
+                ContentAssignment.Status.DRAFT), now.minus(1, ChronoUnit.DAYS));
+        setId(campaign, 5L);
+        setId(predecessor, 100L);
+        when(exclusionRepository.findByDeviceId(10L)).thenReturn(List.of());
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(campaign, predecessor));
+        assertEquals(5L, service.resolveForDevice(device, now).getId(), "campaign wins while it runs");
+
+        // Cancelling it soft-deletes the row, so findActiveAtTime stops returning it.
+        when(assignmentRepository.findById(5L)).thenReturn(Optional.of(campaign));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(deviceWithId(10L)));
+        service.softDelete(5L);
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+
+        var afterCancel = service.resolveForDevice(device, now);
+        assertNotNull(afterCancel, "the predecessor must still be resolvable — it was never retired");
+        assertEquals(100L, afterCancel.getId());
+        assertTrue(campaign.isDeleted());
+    }
+
+    @Test
+    void precedence_isATotalOrder_matchingTheSqlTieBreak() {
+        // Java and SQL must agree on EVERY pair, so no two distinct rows may compare equal.
+        // Null confirmedAt falls back to createdAt (the views' COALESCE); a null id sorts last.
+        var early = confirmedAt(new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now.minus(1, ChronoUnit.DAYS));
+        var late = confirmedAt(new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now);
+        setId(early, 9L);
+        setId(late, 2L);
+        var group = new ContentAssignment(playlistWithId(3L), TargetType.DEVICE_GROUP, 1L,
+                now, nextWeek, ContentAssignment.Status.CONFIRMED);
+        setId(group, 1L);
+
+        assertTrue(ContentAssignment.PRECEDENCE.compare(late, early) > 0, "later confirm wins a tie");
+        assertTrue(ContentAssignment.PRECEDENCE.compare(group, late) > 0, "priority still wins first");
+        assertEquals(0, ContentAssignment.PRECEDENCE.compare(early, early), "reflexive");
+
+        // Same priority AND same confirmedAt ⇒ the id breaks it, so the order is total.
+        var twinA = confirmedAt(new ContentAssignment(playlistWithId(4L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now);
+        var twinB = confirmedAt(new ContentAssignment(playlistWithId(5L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now);
+        setId(twinA, 10L);
+        setId(twinB, 11L);
+        assertTrue(ContentAssignment.PRECEDENCE.compare(twinB, twinA) > 0, "higher id wins the last tie");
+
+        // Unsaved entity (no id) — the comparator must not NPE, and it must lose to a saved twin.
+        var unsaved = confirmedAt(new ContentAssignment(playlistWithId(6L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.DRAFT), now);
+        assertTrue(ContentAssignment.PRECEDENCE.compare(unsaved, twinA) < 0, "a null id sorts last");
+
+        // A never-confirmed row falls back to createdAt, which is non-null on every real row.
+        var neverConfirmed = new ContentAssignment(playlistWithId(7L), TargetType.REGION, 1L,
+                now, nextWeek, ContentAssignment.Status.CONFIRMED);
+        assertNull(neverConfirmed.getConfirmedAt());
+        assertEquals(neverConfirmed.getCreatedAt(), neverConfirmed.effectiveConfirmedAt(),
+                "COALESCE(confirmed_at, created_at), in Java");
+    }
+
+    // ===== v1.0.142 review follow-ups =====
+
+    @Test
+    void confirm_replaceConflicting_futureWindow_partialDevices_writesNoExclusionYet() {
+        // THE REVIEW BUG. P drives region [A=1, B=2] now→2100. On "Mar 5" the operator confirms C
+        // for device A only, starting "Mar 10" and running to 2100. reachesPredecessorEnd is true
+        // (2100 == 2100) and B remains, so the narrowing branch used to write exclusion(P, A)
+        // IMMEDIATELY — and an exclusion takes effect the moment it exists, so A resolved nothing
+        // from Mar 5 to Mar 10: five days of a blank screen and a purged cache.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var march10 = now.plus(5, ChronoUnit.DAYS);
+        var deviceA = deviceInRegion(1L, 1L);
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, march10, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = confirmedAt(new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.DRAFT),
+                now.minus(1, ChronoUnit.DAYS));
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(2L), null, true);
+
+        assertEquals(0, savedExclusionsOn(predecessor).size(),
+                "an exclusion written today would blank device A until the window opens");
+        assertFalse(predecessor.isDeleted());
+        assertEquals(forever, predecessor.getEndTime(), "and nothing else is touched either");
+
+        // …and the hand-over still happens, on time, by precedence alone.
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+        assertEquals(100L, service.resolveForDevice(deviceA, now).getId(),
+                "before the window opens, device A keeps the predecessor");
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor, newDraft));
+        assertEquals(1L, service.resolveForDevice(deviceA, march10.plus(1, ChronoUnit.HOURS)).getId(),
+                "once the window opens, the more recently CONFIRMED campaign wins");
+    }
+
+    @Test
+    void confirm_replaceConflicting_windowOpensNow_partialDevices_stillNarrows() {
+        // The negative of the test above: when the new window really does cover the predecessor's
+        // remaining life, the v1.0.135 narrowing must still happen — the gate must not disable it.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var newDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(newDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(newDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(1L, List.of(2L), null, true);
+
+        var narrowing = savedExclusionsOn(predecessor);
+        assertEquals(1, narrowing.size(), "the takeover starts now ⇒ narrow as before");
+        assertEquals(1L, narrowing.get(0).getDevice().getId());
+    }
+
+    @Test
+    void softDelete_releasesTheNarrowingsItCaused_andTheHandoverDeviceResolvesThePredecessorAgain() {
+        // Exclusions are permanent. Replace-on-some-devices, then cancel the campaign, and the
+        // handed-over device used to stay excluded from a still-CONFIRMED, still-running
+        // predecessor — dark forever, with no operator-visible cause.
+        //
+        // The exclusion mock is backed by a real list whose delete filter is the JPQL's
+        // (`reason = :reason`), so the assertion runs through production code end to end.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var store = new java.util.ArrayList<ContentAssignmentExclusion>();
+        when(exclusionRepository.save(any(ContentAssignmentExclusion.class))).thenAnswer(inv -> {
+            store.add(inv.getArgument(0));
+            return inv.getArgument(0);
+        });
+        when(exclusionRepository.deleteByReason(any())).thenAnswer(inv -> {
+            String reason = inv.getArgument(0);
+            int before = store.size();
+            store.removeIf(e -> reason.equals(e.getReason()));
+            return before - store.size();
+        });
+        when(exclusionRepository.findByDeviceId(1L)).thenAnswer(inv -> store.stream()
+                .filter(e -> e.getDevice() != null && Long.valueOf(1L).equals(e.getDevice().getId()))
+                .toList());
+
+        var deviceA = deviceInRegion(1L, 1L);
+        var campaign = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = confirmedAt(new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.DRAFT),
+                now.minus(1, ChronoUnit.DAYS));
+        setId(campaign, 5L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(5L)).thenReturn(Optional.of(campaign));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(5L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(deviceA, deviceWithId(2L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        // Partial replace: device A is handed over, device 2 keeps the predecessor.
+        service.confirmWithExclusions(5L, List.of(2L), null, true);
+        var narrowing = savedExclusionsOn(predecessor);
+        assertEquals(1, narrowing.size());
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(campaign, predecessor));
+        assertEquals(5L, service.resolveForDevice(deviceA, now).getId(), "A is on the campaign");
+
+        // Cancel the campaign.
+        service.softDelete(5L);
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+
+        var afterCancel = service.resolveForDevice(deviceA, now);
+        assertNotNull(afterCancel, "cancelling the campaign must not leave A excluded from everything");
+        assertEquals(100L, afterCancel.getId(), "A resolves the predecessor again");
+        assertTrue(store.stream().noneMatch(e -> e.getAssignment() == predecessor),
+                "the narrowing row on the predecessor is gone");
+        // The campaign's OWN exclusion (device 2, a different reason) is untouched — it belongs to
+        // a soft-deleted assignment that resolution never returns, and sweeping it would be a
+        // different change with a different blast radius.
+        assertTrue(store.stream().anyMatch(e -> e.getAssignment() == campaign),
+                "only the narrowing is released, not every exclusion in sight");
+    }
+
+    @Test
+    void softDelete_deletesExclusionsByExactlyTheReasonSupersedeWrote() {
+        // The reason string is the only link between the narrowing and the assignment that caused
+        // it (an exclusion's FK points at the assignment it NARROWS). Pin the two production values
+        // against each other — no quoted copy of the format string in this test — so a change to
+        // the format on one side and not the other goes red.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var campaign = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L, now, forever,
+                ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(campaign, 5L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(5L)).thenReturn(Optional.of(campaign));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(5L)))
+                .thenReturn(List.of(predecessor));
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(
+                deviceWithId(1L), deviceWithId(2L)));
+        when(deviceRepository.findAllById(List.of(2L))).thenReturn(List.of(deviceWithId(2L)));
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+
+        service.confirmWithExclusions(5L, List.of(2L), null, true);
+        String writtenReason = savedExclusionsOn(predecessor).get(0).getReason();
+
+        service.softDelete(5L);
+
+        var reasonCaptor = ArgumentCaptor.forClass(String.class);
+        verify(exclusionRepository).deleteByReason(reasonCaptor.capture());
+        assertEquals(writtenReason, reasonCaptor.getValue(),
+                "cancel must delete exactly the rows supersede stamped for THIS assignment");
+    }
+
+    @Test
+    void softDelete_draft_doesNotDeleteAnyExclusion_butStillTargetsItsOwnKey() {
+        // A cancelled assignment that never superseded anything must not sweep anyone else's rows:
+        // the key carries its own id, so the delete matches nothing.
+        var draft = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L, now, tomorrow,
+                ContentAssignment.Status.DRAFT);
+        setId(draft, 7L);
+        when(assignmentRepository.findById(7L)).thenReturn(Optional.of(draft));
+        when(exclusionRepository.deleteByReason(any())).thenReturn(0);
+
+        service.softDelete(7L);
+
+        var reasonCaptor = ArgumentCaptor.forClass(String.class);
+        verify(exclusionRepository).deleteByReason(reasonCaptor.capture());
+        assertTrue(reasonCaptor.getValue().contains("7"),
+                "the delete key names the cancelled assignment: " + reasonCaptor.getValue());
+        assertTrue(draft.isDeleted());
+    }
+
+    @Test
+    void confirm_futureDatedAssignment_doesNotDetachSyncGroupMembers() {
+        // resolvedBefore is sampled at NOW, so for a campaign that opens next week the "did the
+        // playlist change?" comparison answers a question about a change that has not happened.
+        // Detaching is irreversible, and the member keeps playing the group's content all week,
+        // so a confirm that changes nothing today must not break a working sales point today.
+        var forever = Instant.parse("2100-01-01T00:00:00Z");
+        var member = syncGroupMember(1L, 1L);
+        var nextWeekDraft = new ContentAssignment(playlistWithId(2L), TargetType.REGION, 1L,
+                now.plus(7, ChronoUnit.DAYS), forever, ContentAssignment.Status.DRAFT);
+        var predecessor = new ContentAssignment(playlistWithId(1L), TargetType.REGION, 1L,
+                now.minus(1, ChronoUnit.DAYS), forever, ContentAssignment.Status.CONFIRMED);
+        setId(nextWeekDraft, 1L);
+        setId(predecessor, 100L);
+        when(assignmentRepository.findById(1L)).thenReturn(Optional.of(nextWeekDraft));
+        when(assignmentRepository.findOverlappingExcluding(eq(TargetType.REGION), eq(1L), any(), any(), eq(1L)))
+                .thenReturn(List.of(predecessor));
+        when(assignmentRepository.findActiveAtTime(any())).thenReturn(List.of(predecessor));
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of());
+        when(exclusionRepository.findDeviceIdsByAssignmentId(100L)).thenReturn(List.of());
+        when(deviceRepository.findByRegionIdAndDeletedAtIsNull(1L)).thenReturn(List.of(member));
+
+        service.confirmWithExclusions(1L, List.of(), null, true);
+
+        assertNotNull(member.getSyncGroup(),
+                "the member still plays the sales point's content all week — membership survives");
+        assertEquals(ContentAssignment.Status.CONFIRMED, nextWeekDraft.getStatus(),
+                "the confirm itself still succeeds");
     }
 }

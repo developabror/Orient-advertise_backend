@@ -6,6 +6,7 @@ import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -34,6 +35,15 @@ import uz.orientadvertise.services.domain.repository.IncidentRepository;
  * this, every 5-minute pass would re-fire and {@link IncidentService#processEvent}
  * would bump the existing incident's occurrence counter forever — even after the device
  * has recovered (between the time the condition cleared and the next scan).
+ *
+ * <p>Recovery sweep: after escalating, the scan closes every open {@code DEVICE_OFFLINE}
+ * incident whose device has beaten again since the threshold. The heartbeat closes these
+ * itself; the sweep catches any it missed (a failed resolve, incidents opened before v1.0.140).
+ *
+ * <p>{@link #escalate} is called through {@code self}, the transactional proxy. A plain
+ * {@code this.escalate(...)} bypasses the proxy, so {@code REQUIRES_NEW} is silently ignored:
+ * the device comes back detached and every LAZY navigation on it — the critical-incident
+ * broadcast's project lookup included — throws {@code LazyInitializationException}.
  */
 @Service
 public class DeviceHealthMonitor implements DeviceHealthChecker {
@@ -50,17 +60,20 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
     private final IncidentService incidentService;
     private final DashboardService dashboardService;
     private final DashboardEventBroadcaster dashboardBroadcaster;
+    private final DeviceHealthMonitor self;
 
     public DeviceHealthMonitor(DeviceRepository deviceRepository,
                                 IncidentRepository incidentRepository,
                                 IncidentService incidentService,
                                 DashboardService dashboardService,
-                                DashboardEventBroadcaster dashboardBroadcaster) {
+                                DashboardEventBroadcaster dashboardBroadcaster,
+                                @Lazy DeviceHealthMonitor self) {
         this.deviceRepository = deviceRepository;
         this.incidentRepository = incidentRepository;
         this.incidentService = incidentService;
         this.dashboardService = dashboardService;
         this.dashboardBroadcaster = dashboardBroadcaster;
+        this.self = self;
     }
 
     @Override
@@ -76,20 +89,20 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
         int offlineSkipped = 0;
         for (Device d : staleHeartbeats) {
             try {
-                if (escalate(d.getId(), EVENT_OFFLINE, Event.Priority.CRITICAL,
-                        offlinePayload(d, heartbeatThreshold), now)) {
+                var outcome = self.escalate(d.getId(), EVENT_OFFLINE, Event.Priority.CRITICAL,
+                        offlinePayload(d, heartbeatThreshold), now);
+                if (outcome.escalated()) {
                     offlineEmitted++;
                     // Derive-only model: the scan never writes device.status. Broadcast the
                     // OFFLINE transition so the live dashboard reflects a silent device without
                     // waiting for a heartbeat — which, by definition, isn't coming. Best-effort,
                     // mirroring DeviceHeartbeatService.emitStatusChangeEvent: a broadcast failure
-                    // must not abort the scan.
+                    // must not abort the scan. `d` is detached here, so the project comes from
+                    // the escalation's transaction, never from d.getRegion().
                     try {
                         dashboardBroadcaster.deviceStatusChanged(new DeviceStatusPayload(
                                 d.getId(), d.getStatus() != null ? d.getStatus().name() : null,
-                                Device.Status.OFFLINE.name(), now,
-                                d.getRegion() != null && d.getRegion().getProject() != null
-                                        ? d.getRegion().getProject().getId() : null));
+                                Device.Status.OFFLINE.name(), now, outcome.projectId()));
                     } catch (Exception be) {
                         log.warn("Dashboard offline-broadcast failed [device={}]: {}",
                                 d.getId(), be.getMessage());
@@ -107,8 +120,8 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
         int mismatchSkipped = 0;
         for (Device d : staleMismatches) {
             try {
-                if (escalate(d.getId(), EVENT_CONTENT_MISMATCH, Event.Priority.MEDIUM,
-                        mismatchPayload(d), now)) {
+                if (self.escalate(d.getId(), EVENT_CONTENT_MISMATCH, Event.Priority.MEDIUM,
+                        mismatchPayload(d), now).escalated()) {
                     mismatchEmitted++;
                 } else {
                     mismatchSkipped++;
@@ -119,14 +132,16 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
             }
         }
 
-        log.info("Health check: offline +{} (skipped {}); mismatch +{} (skipped {})",
-                offlineEmitted, offlineSkipped, mismatchEmitted, mismatchSkipped);
+        int offlineRecovered = resolveRecoveredOffline(heartbeatThreshold);
+
+        log.info("Health check: offline +{} (skipped {}, recovered {}); mismatch +{} (skipped {})",
+                offlineEmitted, offlineSkipped, offlineRecovered, mismatchEmitted, mismatchSkipped);
 
         // Dashboard summary (FE-11/FE-12) is cached for 30s. The counts derive from
         // device_status_view (live — computed from heartbeat age at query time), so the only
         // staleness is the cache itself; evict here so the next read reflects devices that
-        // just crossed offline rather than waiting up to 30s for TTL expiry.
-        if (offlineEmitted + mismatchEmitted > 0) {
+        // just crossed offline (or whose incident just closed) rather than waiting up to 30s.
+        if (offlineEmitted + mismatchEmitted + offlineRecovered > 0) {
             dashboardService.invalidate();
         }
 
@@ -134,29 +149,68 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
     }
 
     /**
+     * Recovery sweep: close the open {@code DEVICE_OFFLINE} incidents of devices whose last
+     * heartbeat is newer than {@code heartbeatThreshold} — the same instant the escalation
+     * compared against, so "stale" and "recovered" can never overlap. Only device ids are
+     * read (never Incident entities: their device is LAZY and this runs outside a
+     * transaction); each resolve runs in its own transaction on {@link IncidentService}.
+     * Best-effort: a failure is logged and the health check still returns.
+     */
+    private int resolveRecoveredOffline(Instant heartbeatThreshold) {
+        int recovered = 0;
+        try {
+            for (Long deviceId : incidentRepository.findDeviceIdsWithOpenIncidentAndHeartbeatAfter(
+                    EVENT_OFFLINE, heartbeatThreshold)) {
+                try {
+                    if (incidentService.autoResolveOnRecovery(deviceId, EVENT_OFFLINE)) {
+                        recovered++;
+                    }
+                } catch (Exception e) {
+                    log.warn("Health-check recovery sweep failed for device {}: {}", deviceId, e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Health-check recovery sweep failed: {}", e.getMessage());
+        }
+        return recovered;
+    }
+
+    /**
      * Per-device escalation, isolated in its own transaction so a single failure doesn't
-     * abort the rest of the scan. Returns {@code true} if a new event was emitted,
+     * abort the rest of the scan. Must be called through {@code self} — see the class doc.
+     * {@link EscalationOutcome#escalated()} is {@code true} if a new event was emitted,
      * {@code false} if the device was skipped because an open incident already exists OR
      * the condition resolved between the candidate fetch and decision time.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public boolean escalate(Long deviceId, String eventType, Event.Priority priority,
-                             String payload, Instant now) {
+    public EscalationOutcome escalate(Long deviceId, String eventType, Event.Priority priority,
+                                      String payload, Instant now) {
         var device = deviceRepository.findById(deviceId).orElse(null);
         if (device == null || device.isDeleted()) {
-            return false;
+            return EscalationOutcome.SKIPPED;
         }
         if (!stillMatches(device, eventType, now)) {
             // Recovery between fetch and now — don't open an incident.
-            return false;
+            return EscalationOutcome.SKIPPED;
         }
-        if (incidentRepository.findOpenByDeviceAndEventType(deviceId, eventType).isPresent()) {
-            // Existing open incident — don't bump occurrence on every 5-min tick.
-            return false;
+        if (incidentRepository.existsOpenByDeviceAndEventType(deviceId, eventType)) {
+            // Existing open incident — don't bump occurrence on every 5-min tick. An exists check,
+            // not the single-result lookup: that one throws on duplicate open incidents (LOGIC-16).
+            return EscalationOutcome.SKIPPED;
         }
         var event = new Event(device, eventType, priority, payload, now);
         incidentService.processEvent(event);
-        return true;
+        // Read while the device is still managed; the caller only holds a detached copy.
+        var project = device.getRegion() != null ? device.getRegion().getProject() : null;
+        return new EscalationOutcome(true, project != null ? project.getId() : null);
+    }
+
+    /**
+     * Result of {@link #escalate}. {@code projectId} is the device's project (the dashboard
+     * routing key), read inside the escalation's transaction; {@code null} when skipped.
+     */
+    public record EscalationOutcome(boolean escalated, Long projectId) {
+        static final EscalationOutcome SKIPPED = new EscalationOutcome(false, null);
     }
 
     /**

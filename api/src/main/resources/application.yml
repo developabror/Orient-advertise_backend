@@ -1,6 +1,16 @@
 spring:
   application:
     name: Orient-advertise-backend
+  task:
+    scheduling:
+      # Spring's default @Scheduled pool is ONE thread, shared by every @Scheduled method in the
+      # application — the Telegram log forwarder, SyncTimeoutMonitor, TranscodeSweeper, the MinIO
+      # health probe and the rest. One job that blocks on I/O stalls all of them, and the job most
+      # likely to block is the one that runs during an outage. Three threads so a hung probe cannot
+      # silence the alerting that is supposed to report the outage. Each job's own fixedDelay still
+      # serialises that job against itself.
+      pool:
+        size: 3
   jpa:
     hibernate:
       ddl-auto: validate
@@ -58,6 +68,34 @@ app:
     refresh-cookie-samesite: ${REFRESH_COOKIE_SAMESITE:Strict}
   playback:
     max-clock-skew-seconds: 30
+  # Nightly retention cleanup (RetentionCleanupService, 02:00 Asia/Karachi). Each table drains
+  # against its OWN window — one shared 90 days let the cheapest table set the price for the
+  # most expensive one.
+  #   audit is deliberately the shortest: NOTHING reads audit_log (no API, no UI), every row holds
+  #     a whole HTTP request AND response body, and since v1.0.143 AuditFilter no longer audits
+  #     device-agent traffic at all — what remains is a short forensic tail of operator/admin writes.
+  #   playback is proof-of-play (billing, StatsController) — do not shorten it to save disk.
+  #     PlaybackLogService also REFUSES a report older than this same value.
+  # UNITS AND VALIDATION: a bare number here means DAYS for the three windows and MINUTES for
+  # max-run-duration (Boot's own default would be milliseconds — APP_RETENTION_PLAYBACK=90 meaning
+  # 90 ms would delete every proof-of-play row on the first run). Each window must be >= 1 day, the
+  # budget >= 1 minute and the counts > 0: a bad value FAILS STARTUP, naming the property, rather
+  # than running at 02:00 against the production tables.
+  retention:
+    audit: ${APP_RETENTION_AUDIT:P14D}
+    playback: ${APP_RETENTION_PLAYBACK:P90D}
+    event: ${APP_RETENTION_EVENT:P90D}
+    batch-size: ${APP_RETENTION_BATCH_SIZE:1000}
+    # Wall-clock budget for the WHOLE run (all three tables). A table that runs out of budget logs
+    # what it deleted at INFO and the next night continues from there.
+    max-run-duration: ${APP_RETENTION_MAX_RUN_DURATION:PT15M}
+    # Safety stop only — batches per table per run, high on purpose. The old fixed cap of 100
+    # batches was a hidden ceiling: past ~26 always-on devices playback_log grew faster than a
+    # night could delete, so it could never shrink again.
+    max-batches-per-run: ${APP_RETENTION_MAX_BATCHES_PER_RUN:5000}
+    # Refuse to run outside 01:00-04:00 Asia/Karachi, even when triggered by hand. Turn off in
+    # non-prod environments where the job is exercised on demand.
+    guard-window: ${APP_RETENTION_GUARD_WINDOW:true}
   sync:
     # Cap on the device-id set published to AssignmentConfirmedSyncPushListener
     # when an assignment is confirmed. Targets larger than this fall back to the
@@ -76,6 +114,11 @@ app:
     # Unlike a version cut-over (activation-min-lead) a jump needs NO download — every member already
     # holds the content — so the lead only covers push delivery + clock-offset convergence, hence PT5S.
     jump-min-lead: ${APP_SYNC_JUMP_MIN_LEAD:PT5S}
+  schedule:
+    # LOGIC-04: dayparting schedules (DAILY/WEEKLY/MONTHLY windows) are stored but NOT applied to what
+    # devices play yet, and the UI no longer offers them. Evaluating them every minute did nothing but
+    # scan the table, so the job is off. Turn on only together with the real dayparting feature.
+    evaluation-enabled: ${APP_SCHEDULE_EVALUATION_ENABLED:false}
   device:
     # Region id used when a TV-Box self-registers without knowing its placement.
     # Defaults to -1, the "Unassigned" sentinel seeded by V13__device_registration.
@@ -84,12 +127,79 @@ app:
     # APP_DEVICE_DEFAULT_REGION_ID only when pointing at a real region id that
     # already exists in the target database.
     default-region-id: ${APP_DEVICE_DEFAULT_REGION_ID:-1}
+    # AUTH-02: how long an admin's "Allow re-registration" stays open for one device. An
+    # already-registered serial is refused (409) outside such a window.
+    reregistration-window: ${APP_DEVICE_REREGISTRATION_WINDOW:PT1H}
   content:
     # On startup, backfill size+checksum for legacy READY files that predate checksum
     # recording (transcoded before the metadata was captured). Idempotent and self-completing
     # — only matches files with a null checksum, streams each stored object once to derive its
     # true size + SHA-256, never re-transcodes. Set false to disable (e.g. very large libraries).
     reconcile-on-startup: ${APP_CONTENT_RECONCILE_ON_STARTUP:true}
+  # Video ingest pipeline. NOTHING here is required — every key has a default that is safe on a
+  # small box. They exist so the SAME image adapts to whatever host it lands on, rather than being
+  # tuned to one machine and needing a rebuild to lift the ceiling.
+  video:
+    ffmpeg-path: ${APP_VIDEO_FFMPEG_PATH:ffmpeg}
+    transcoder-enabled: ${APP_VIDEO_TRANSCODER_ENABLED:true}
+    # Encoder knobs. The preset is the single biggest lever on memory: measured on one 13 s 1080p25
+    # input, `medium` peaks at 438 MiB RSS in 44.9 s while `veryfast` peaks at 218 MiB in 14.3 s —
+    # and that allocation is x264's lookahead buffers, i.e. per-FRAME, so a 3 MB clip and a 50 MB
+    # clip cost the same. ffmpeg is a child of the JVM, so the RSS is charged to the same cgroup.
+    # `veryfast` is the default because it is safe everywhere; a host with memory to spare can set
+    # `medium` (or raise max-height) from the environment.
+    # NOT configurable on purpose: -threads / -filter_threads. On 1 vCPU x264 already picks
+    # threads=1 lookahead_threads=1, and setting them explicitly moved peak RSS by 136 kB of 431 MB.
+    preset: ${APP_VIDEO_PRESET:veryfast}
+    crf: ${APP_VIDEO_CRF:23}
+    max-width: ${APP_VIDEO_MAX_WIDTH:1920}
+    max-height: ${APP_VIDEO_MAX_HEIGHT:1080}
+    audio-bitrate: ${APP_VIDEO_AUDIO_BITRATE:128k}
+    # Hard ceilings on a single ffmpeg invocation. The transcode ceiling is genuinely reachable at
+    # ~6x realtime on a small box, so a timed-out encode lands in FAILED — which the sweeper retries
+    # up to the attempt cap. Keep sweeper.lease-timeout comfortably ABOVE this value.
+    timeout: ${APP_VIDEO_TIMEOUT:PT15M}
+    poster-timeout: ${APP_VIDEO_POSTER_TIMEOUT:PT60S}
+    transcode:
+      # How many encodes may run at once. 0 = plan it from the host: min(cpus-1, memory budget /
+      # job-memory-mb), clamped to [1, max-concurrency]. On a 1-vCPU / 700 MiB container that
+      # resolves to 1 (two concurrent encodes there are a guaranteed OOM kill, and oom_badness picks
+      # the JVM over ffmpeg — you lose the backend, not the encode); on an 8-core / 16 GB host it
+      # resolves to 7. Set a positive value to override the planner outright.
+      concurrency: ${APP_VIDEO_TRANSCODE_CONCURRENCY:0}
+      max-concurrency: ${APP_VIDEO_TRANSCODE_MAX_CONCURRENCY:8}
+      # Memory budgeted per encode; must exceed the measured peak for `preset` with headroom.
+      # Raise it if you raise the preset.
+      job-memory-mb: ${APP_VIDEO_TRANSCODE_JOB_MEMORY_MB:320}
+      # Non-heap JVM overhead held back from the encode budget (metaspace, code cache, stacks).
+      reserve-mb: ${APP_VIDEO_TRANSCODE_RESERVE_MB:256}
+      queue-capacity: ${APP_VIDEO_TRANSCODE_QUEUE_CAPACITY:200}
+      shutdown-grace-seconds: ${APP_VIDEO_TRANSCODE_SHUTDOWN_GRACE_SECONDS:30}
+    sweeper:
+      # Safety net that re-drives files whose transcode never started, never finished, or failed.
+      interval: ${APP_VIDEO_SWEEPER_INTERVAL:PT2M}
+      initial-delay: ${APP_VIDEO_SWEEPER_INITIAL_DELAY:PT1M}
+      # UPLOADED for longer than this ⇒ the dispatch was lost.
+      lost-dispatch-after: ${APP_VIDEO_SWEEPER_LOST_DISPATCH_AFTER:PT5M}
+      # TRANSCODING with a lease older than this ⇒ the encode crashed. MUST exceed app.video.timeout
+      # plus both MinIO transfers, or a healthy long encode gets reclaimed underneath itself.
+      lease-timeout: ${APP_VIDEO_SWEEPER_LEASE_TIMEOUT:PT20M}
+      failed-retry-after: ${APP_VIDEO_SWEEPER_FAILED_RETRY_AFTER:PT15M}
+      # Total claims per file before it is parked in FAILED for a human. A poison file must not loop.
+      max-attempts: ${APP_VIDEO_SWEEPER_MAX_ATTEMPTS:3}
+      # Backlog age that counts as stuck. Drives BOTH the WARN log (forwarded to Telegram) and the
+      # transcode-backlog component on /api/health, so the two can never disagree.
+      stale-alert-after: ${APP_VIDEO_SWEEPER_STALE_ALERT_AFTER:PT10M}
+  # Async pool sizing. core == max everywhere: a ThreadPoolTaskExecutor only grows past core once
+  # the queue REFUSES a task, so with a deep queue a larger max is unreachable until the queue is
+  # nearly full — a limit that reads like a safety valve but is really a cliff.
+  async:
+    audit:
+      size: ${APP_ASYNC_AUDIT_SIZE:2}
+      queue-capacity: ${APP_ASYNC_AUDIT_QUEUE_CAPACITY:500}
+    report:
+      size: ${APP_ASYNC_REPORT_SIZE:2}
+      queue-capacity: ${APP_ASYNC_REPORT_QUEUE_CAPACITY:20}
   minio:
     # Backend ↔ MinIO endpoint. In docker-compose this is the in-network hostname
     # (http://minio:9000); on a bare dev box it's http://localhost:9000.
@@ -116,7 +226,42 @@ app:
     # Stays in sync with FileStorageService.thumbnailBucket — overridable per env if
     # the bucket name differs (e.g. multi-tenant deployment).
     thumbnail-bucket: ${MINIO_THUMBNAIL_BUCKET:content-thumbnails}
-    orphan-cleanup-after-hours: 24
+    # Raw originals under `raw/` are deleted by MinIO this many days after upload. 0 disables it.
+    # NOTHING deleted these before v1.0.133, so every ad cost its source bytes permanently on a
+    # single volume shared with Postgres, the container overlay and /swap.img. The processed MP4 and
+    # the poster are NEVER expired — playback is unaffected. The one cost: once a file's source is
+    # gone, POST /api/content/{id}/retranscode on it can no longer succeed.
+    raw-expiry-days: ${MINIO_RAW_EXPIRY_DAYS:30}
+    # How fast a MinIO outage heals. MinioHealthProbe re-probes ONLY while storage is degraded
+    # (zero MinIO calls while it is healthy) and clears the flag on the first successful round
+    # trip. Before v1.0.144 nothing ever cleared it: one blip 503'd uploads, failed transcodes
+    # and truncated every device's /sync plan until the application was restarted by hand.
+    # ISO-8601 duration. A bare number is MILLISECONDS to both readers of this key (this binding
+    # and the @Scheduled that drives the probe) — write PT30S, not 30.
+    recheck-interval: ${APP_MINIO_RECHECK_INTERVAL:PT30S}
+  # Remote view/control (operator "Connect" to a TV-Box). SHIPS DARK: with enabled=false,
+  # POST /api/devices/{id}/remote returns 503 and the heartbeat never emits desiredRemoteSession,
+  # so the wire is byte-identical to the pre-feature contract. Enable per environment once a
+  # relay is deployed.
+  #
+  # THE BACKEND CARRIES NO MEDIA. The device and the operator browser meet on the relay; this
+  # service only mints the rendezvous and hands each side a signed, role-scoped ticket.
+  #
+  # relay.signing-secret is the shared HMAC secret with the relay: >=32 bytes, env-only, never
+  # logged. There is deliberately NO inline default — RemoteSessionTicketService fails startup
+  # if it is missing or short while enabled=true (same discipline as app.jwt.secret).
+  remote:
+    enabled: ${APP_REMOTE_ENABLED:false}
+    session-ttl: ${APP_REMOTE_SESSION_TTL:PT30M}
+    # Encoder hints pushed to the device. max-width is further clamped down to whatever the
+    # device itself reported it can do (capability is reported, not assumed).
+    max-width: ${APP_REMOTE_MAX_WIDTH:1280}
+    max-fps: ${APP_REMOTE_MAX_FPS:15}
+    bit-rate: ${APP_REMOTE_BIT_RATE:2000000}
+    relay:
+      agent-url: ${APP_REMOTE_RELAY_AGENT_URL:wss://relay.example.uz/agent}
+      viewer-url: ${APP_REMOTE_RELAY_VIEWER_URL:wss://relay.example.uz/viewer}
+      signing-secret: ${REMOTE_RELAY_SIGNING_SECRET:}
   error:
     include-stacktrace: false
   # Password-management email (Gmail SMTP). Disabled by default — when off, a No-Op sender is
@@ -143,10 +288,16 @@ app:
   # FakeDeviceSeeder inserts N pre-registered Android TV devices on boot so the
   # operator can exercise content-assignment flows without a real TV-Box. The
   # seeder is idempotent: serials use a deterministic prefix and existing rows
-  # are left untouched.
+  # are left untouched. It also keeps the dev logins (admin/password, …) active;
+  # with it OFF the app refuses to start while any of them is active (AUTH-01).
   seed:
     enabled: ${APP_SEED_ENABLED:false}
     device-count: ${APP_SEED_DEVICE_COUNT:5}
+  # First ADMIN for environments without seed data. Used only when no active ADMIN
+  # exists; both must be set together, password ≥ 12 chars. Remove after first login.
+  bootstrap-admin:
+    username: ${APP_BOOTSTRAP_ADMIN_USERNAME:}
+    password: ${APP_BOOTSTRAP_ADMIN_PASSWORD:}
   cors:
     # Allowed FE origins for HTTP CORS preflights. Default lists the FE dev servers
     # (Vite default + CRA default). Production overrides via application-prod.yml or
@@ -167,6 +318,14 @@ spring.servlet.multipart:
 
 server:
   port: 8080
+  # AUTH-04: let Tomcat's RemoteIpValve resolve the client IP (the key for every per-IP rate limit).
+  # X-Forwarded-For / -Proto are honoured ONLY when the direct peer is a trusted proxy —
+  # server.tomcat.remoteip.internal-proxies, by default loopback, RFC 1918, link-local, 100.64/10 and
+  # IPv6 loopback/link-local/ULA, which covers Caddy → Docker — and the header is read right to left, so an entry a client prepends is ignored.
+  # To narrow the trusted set, set SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES (in the container env, not
+  # just .env) to a regex matching only the compose network gateway. Never set it to
+  # an EMPTY value: that trusts no proxy, so every client shares the proxy's IP and one rate bucket.
+  forward-headers-strategy: native
 
 management:
   endpoints:

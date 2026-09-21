@@ -152,17 +152,19 @@ public class DashboardWebSocketHandler extends TextWebSocketHandler implements D
     }
 
     /**
-     * Fan out a dashboard frame. Device/incident frames arrive wrapped in the routing envelope
-     * {@code {"_projectId":<num|null>,"payload":<frame>}}: we read {@code _projectId}, send ONLY
-     * the inner {@code payload} (the {@code _projectId} is stripped — never on the wire), and
-     * filter per session — ADMIN (no captured set) gets every frame; an OPERATOR gets it only when
-     * the frame's project is in their set. Unwrapped frames (e.g. CONTENT_STATUS_CHANGE) broadcast
-     * to every session unchanged.
+     * Fan out a dashboard frame. Frames arrive wrapped in the routing envelope
+     * {@code {"_projectId":<num|null>,"_owner":<string|null>,"payload":<frame>}}: we read the two
+     * routing keys, send ONLY the inner {@code payload} (the routing keys are stripped — never on
+     * the wire), and filter per session. ADMIN (no captured project set) gets every frame; an
+     * OPERATOR gets it when the frame's project is in their set <i>or</i> the frame names them as
+     * its owner. An unwrapped frame is still broadcast to every session — that path now exists only
+     * for a publisher that predates the envelope.
      */
     @Override
     public void push(String json) {
         boolean scoped = false;
         Long projectId = null;
+        String owner = null;
         String frame = json;
         try {
             var node = objectMapper.readTree(json);
@@ -170,7 +172,9 @@ public class DashboardWebSocketHandler extends TextWebSocketHandler implements D
                 scoped = true;
                 var pid = node.get("_projectId");
                 projectId = pid.isNull() ? null : pid.asLong();
-                frame = objectMapper.writeValueAsString(node.get("payload"));   // strip _projectId
+                var ownerNode = node.get("_owner");   // absent on pre-envelope publishers
+                owner = (ownerNode == null || ownerNode.isNull()) ? null : ownerNode.asText();
+                frame = objectMapper.writeValueAsString(node.get("payload"));   // strip routing keys
             }
         } catch (Exception e) {
             // Not an envelope (or malformed) — treat as a raw broadcast frame.
@@ -181,7 +185,7 @@ public class DashboardWebSocketHandler extends TextWebSocketHandler implements D
         int failed = 0;
         for (var session : sessions.values()) {
             if (!session.isOpen()) continue;
-            if (scoped && !sessionAllows(session, projectId)) continue;
+            if (scoped && !sessionAllows(session, projectId, owner)) continue;
             try {
                 // Spring's raw WebSocketSession is not thread-safe on send — multiple
                 // pub/sub threads can land here concurrently, so synchronize per-session.
@@ -199,12 +203,23 @@ public class DashboardWebSocketHandler extends TextWebSocketHandler implements D
         }
     }
 
-    /** ADMIN (no captured set) sees every scoped frame; an OPERATOR only those in their project set. */
+    /**
+     * ADMIN (no captured set) sees every scoped frame. An OPERATOR sees a frame in one of their
+     * projects, or one that names them as its owner.
+     *
+     * <p>The owner term is what makes content frames work at all: an operator's content is
+     * <b>owned ∪ granted</b>, never project-gated, and an orphan upload has no project to route by,
+     * so project-only routing would silently drop the operator's own transcode updates.
+     */
     @SuppressWarnings("unchecked")
-    private static boolean sessionAllows(WebSocketSession session, Long projectId) {
+    private static boolean sessionAllows(WebSocketSession session, Long projectId, String owner) {
         Object attr = session.getAttributes().get(DashboardHandshakeInterceptor.ATTR_PROJECT_IDS);
         if (!(attr instanceof Set)) {
             return true;   // ADMIN / unrestricted
+        }
+        if (owner != null
+                && owner.equals(session.getAttributes().get(DashboardHandshakeInterceptor.ATTR_USERNAME))) {
+            return true;
         }
         Set<Long> projects = (Set<Long>) attr;
         return projectId != null && projects.contains(projectId);
