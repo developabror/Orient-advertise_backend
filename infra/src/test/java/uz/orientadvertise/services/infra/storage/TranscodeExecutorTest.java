@@ -175,4 +175,14 @@ class TranscodeExecutorTest {
         executor.shutdown();
         assertTrue(ran.await(5, TimeUnit.SECONDS), "queued work must run before shutdown completes");
     }
+
+    @Test
+    void submitAfterShutdown_reportsTheDrop() {
+        // The rejection handler used to only log, so submit() said "accepted" for a task that was
+        // thrown away — and the caller kept the file marked as held, hiding it from the sweeper.
+        var executor = singleWidth(50);
+        executor.shutdown();
+
+        assertFalse(executor.submit(() -> { }, TranscodeExecutor.PRIORITY_NORMAL, "transcode id=9"));
+    }
 }

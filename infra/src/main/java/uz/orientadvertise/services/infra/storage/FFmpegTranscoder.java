@@ -12,7 +12,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
@@ -90,6 +92,16 @@ public class FFmpegTranscoder implements Transcoder {
     private final VideoInspector videoInspector;
     private final DashboardEventBroadcaster dashboardBroadcaster;
     private final TranscodeExecutor transcodeExecutor;
+    /**
+     * Files this process holds a task for (LOGIC-08), split by phase. The sweeper leaves every held
+     * file alone. A dispatch of a file that is already <em>queued</em> adds nothing; one whose task
+     * is already <em>running</em> is queued normally — it can only be a legitimate re-dispatch after
+     * that task wrote its terminal state (e.g. an operator retranscode landing before the task's
+     * cleanup), and the start guard turns any other duplicate into a no-op.
+     */
+    private final Set<Long> queued = ConcurrentHashMap.newKeySet();
+    /** Running tasks per file — a count, because that re-dispatch can briefly overlap the old task. */
+    private final ConcurrentHashMap<Long, Integer> running = new ConcurrentHashMap<>();
 
     @Value("${app.video.ffmpeg-path:ffmpeg}")
     private String ffmpegPath;
@@ -168,9 +180,53 @@ public class FFmpegTranscoder implements Transcoder {
         enqueue(contentFileId, TranscodeExecutor.PRIORITY_NORMAL);
     }
 
+    @Override
+    public boolean isPending(Long contentFileId) {
+        return queued.contains(contentFileId) || running.containsKey(contentFileId);
+    }
+
+    @Override
+    public Set<Long> heldIds() {
+        var held = new java.util.HashSet<Long>(queued);
+        held.addAll(running.keySet());
+        return held;
+    }
+
     private void enqueue(Long contentFileId, int priority) {
-        transcodeExecutor.submit(() -> runPipeline(contentFileId), priority,
-                "transcode id=" + contentFileId);
+        if (!queued.add(contentFileId)) {
+            log.debug("Transcode already queued here [id={}] — not queuing a duplicate", contentFileId);
+            return;
+        }
+        boolean accepted = false;
+        try {
+            accepted = transcodeExecutor.submit(() -> runHeld(contentFileId), priority,
+                    "transcode id=" + contentFileId);
+        } finally {
+            if (!accepted) {
+                // Rejected (or submit threw): nothing holds it now, so the sweeper sees the claimed
+                // row as lost and re-queues it.
+                queued.remove(contentFileId);
+            }
+        }
+    }
+
+    /**
+     * The queued task. Marked running before it leaves the queued set, so it is never briefly
+     * unheld; always released, so a failure can never leave a file held forever — which would hide
+     * it from the sweeper for good.
+     */
+    private void runHeld(Long contentFileId) {
+        running.merge(contentFileId, 1, Integer::sum);
+        queued.remove(contentFileId);
+        try {
+            runPipeline(contentFileId);
+        } catch (RuntimeException e) {
+            // Without this the exception dies on the pool thread's stderr, invisible to the log
+            // pipeline and Telegram. The row stays claimed; the sweeper re-queues it.
+            log.error("Transcode task failed [id={}]: {}", contentFileId, describe(e), e);
+        } finally {
+            running.computeIfPresent(contentFileId, (id, tasks) -> tasks > 1 ? tasks - 1 : null);
+        }
     }
 
     void runPipeline(Long contentFileId) {
@@ -184,13 +240,13 @@ public class FFmpegTranscoder implements Transcoder {
             return;
         }
 
-        // Start guard + lease refresh, in one committed statement. A 0 here means nobody holds the
-        // claim any more (already terminal, superseded, or soft-deleted since we read it), so a
-        // duplicate dispatch costs nothing.
+        // Start guard: take the lease and count the attempt, in one committed statement. A 0 here
+        // means the encode was already started by another task (a duplicate queue entry, possibly
+        // in another process) or nobody holds the claim any more (terminal, soft-deleted), so a
+        // duplicate dispatch costs nothing and can never become a second concurrent encode.
         if (contentFileRepository.beginTranscode(contentFileId, Instant.now()) != 1) {
-            log.info("Transcode skipped [id={}] — row is not claimed (status={}); "
-                    + "another worker owns it or it already reached a terminal state",
-                    contentFileId, file.getStatus());
+            log.info("Transcode skipped [id={}] — already started elsewhere or no longer claimed "
+                    + "(status={})", contentFileId, file.getStatus());
             return;
         }
 

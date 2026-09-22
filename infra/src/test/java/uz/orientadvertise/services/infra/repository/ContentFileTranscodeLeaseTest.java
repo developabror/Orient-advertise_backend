@@ -94,8 +94,10 @@ class ContentFileTranscodeLeaseTest {
 
         var reloaded = repository.findById(file.getId()).orElseThrow();
         assertEquals(ContentFile.Status.TRANSCODING, reloaded.getStatus());
-        assertEquals(now, reloaded.getTranscodeStartedAt());
-        assertEquals(1, reloaded.getTranscodeAttempts());
+        // LOGIC-08: a claim queues the job; it is not running, so no lease and no attempt yet.
+        assertEquals(now, reloaded.getTranscodeQueuedAt());
+        assertNull(reloaded.getTranscodeStartedAt());
+        assertEquals(0, reloaded.getTranscodeAttempts());
     }
 
     @Test
@@ -134,8 +136,8 @@ class ContentFileTranscodeLeaseTest {
         } finally {
             pool.shutdownNow();
         }
-        assertEquals(1, repository.findById(file.getId()).orElseThrow().getTranscodeAttempts(),
-                "the losing claim must not have incremented the attempt counter");
+        assertEquals(0, repository.findById(file.getId()).orElseThrow().getTranscodeAttempts(),
+                "claims never count attempts — only an encode that starts does");
     }
 
     @Test
@@ -146,10 +148,33 @@ class ContentFileTranscodeLeaseTest {
         assertEquals(0, repository.claimForTranscode(file.getId(), ContentFile.Status.UPLOADED, now));
     }
 
+    // ---------- V52 backfill ----------
+
+    @Test
+    void v52_resetsRowsClaimedUnderTheOldRules_toQueuedWithAFreshBudget() {
+        var flyway = Flyway.configure().dataSource(dataSource).locations("classpath:db/migration")
+                .cleanDisabled(false);
+        flyway.load().clean();
+        flyway.target("51").load().migrate();
+        exec("INSERT INTO content_file (id, name, content_type, size_bytes, storage_key, status, "
+                + "transcode_attempts, transcode_started_at) VALUES (9001, 'old.mp4', 'video/mp4', 1, "
+                + "'raw/old', 'TRANSCODING', 3, ?)", java.sql.Timestamp.from(now));
+        exec("INSERT INTO content_file (id, name, content_type, size_bytes, storage_key, status, "
+                + "transcode_attempts) VALUES (9002, 'failed.mp4', 'video/mp4', 1, 'raw/f', 'FAILED', 3)");
+
+        flyway.target("latest").load().migrate();
+
+        var claimed = repository.findById(9001L).orElseThrow();
+        assertEquals(0, claimed.getTranscodeAttempts(), "old claims are not encodes");
+        assertNull(claimed.getTranscodeStartedAt(), "a claim time is not a start");
+        assertEquals(3, repository.findById(9002L).orElseThrow().getTranscodeAttempts(),
+                "FAILED rows are left for an operator to retranscode");
+    }
+
     // ---------- the start guard ----------
 
     @Test
-    void beginTranscode_refreshesTheLeaseOnlyWhileClaimed() {
+    void beginTranscode_takesTheLeaseAndCountsTheAttempt_onlyForTheFirstStarter() {
         var file = newUploadedFile();
         assertEquals(0, repository.beginTranscode(file.getId(), now),
                 "an unclaimed row must not start a pipeline");
@@ -158,9 +183,13 @@ class ContentFileTranscodeLeaseTest {
         Instant later = now.plus(3, ChronoUnit.MINUTES);
         assertEquals(1, repository.beginTranscode(file.getId(), later));
 
-        assertEquals(later, repository.findById(file.getId()).orElseThrow().getTranscodeStartedAt());
-        assertEquals(1, repository.findById(file.getId()).orElseThrow().getTranscodeAttempts(),
-                "starting the pipeline must not double-count the attempt");
+        var started = repository.findById(file.getId()).orElseThrow();
+        assertEquals(later, started.getTranscodeStartedAt());
+        assertEquals(1, started.getTranscodeAttempts(), "the encode that starts is the attempt");
+
+        // A duplicate queue entry reaching the start guard must not become a second encode.
+        assertEquals(0, repository.beginTranscode(file.getId(), later.plus(1, ChronoUnit.MINUTES)));
+        assertEquals(1, repository.findById(file.getId()).orElseThrow().getTranscodeAttempts());
     }
 
     // ---------- terminal writes ----------
@@ -240,24 +269,106 @@ class ContentFileTranscodeLeaseTest {
         assertTrue(!ids.contains(deleted.getId()), "soft-deleted rows are never re-driven");
     }
 
+    /** Claimed and started: the state of a row whose encode is running. */
+    private ContentFile startedFile(Instant startedAt) {
+        var file = newUploadedFile();
+        repository.claimForTranscode(file.getId(), ContentFile.Status.UPLOADED, now);
+        repository.beginTranscode(file.getId(), now);
+        backdate(file.getId(), "transcode_started_at", startedAt);
+        return file;
+    }
+
+    /** Claimed, never started: a job waiting in the queue (or a lost queue entry). */
+    private ContentFile queuedFile(Instant queuedAt) {
+        var file = newUploadedFile();
+        repository.claimForTranscode(file.getId(), ContentFile.Status.UPLOADED, now);
+        backdate(file.getId(), "transcode_queued_at", queuedAt);
+        return file;
+    }
+
+    private final Instant leaseCutoff = now.minus(20, ChronoUnit.MINUTES);
+    private final Instant queueCutoff = now.minus(5, ChronoUnit.MINUTES);
+
     @Test
-    void expiredLeaseCandidates_ignoreAHealthyInFlightEncode() {
+    void stalledCandidates_areExpiredEncodesAndOldQueueEntries_neverAHealthyEncode() {
         // The anti-double-dispatch guarantee, proven at the SQL level: a row leased one minute ago
         // must be invisible to a 20-minute cutoff, no matter how long ffmpeg has been running.
-        var running = newUploadedFile();
-        repository.claimForTranscode(running.getId(), ContentFile.Status.UPLOADED, now);
-        backdate(running.getId(), "transcode_started_at", now.minus(1, ChronoUnit.MINUTES));
+        var running = startedFile(now.minus(1, ChronoUnit.MINUTES));
+        var crashed = startedFile(now.minus(45, ChronoUnit.MINUTES));
+        var justQueued = queuedFile(now.minus(1, ChronoUnit.MINUTES));
+        var longQueued = queuedFile(now.minus(90, ChronoUnit.MINUTES));
+        var legacy = queuedFile(now);
+        exec("UPDATE content_file SET transcode_queued_at = NULL WHERE id = ?", legacy.getId());
 
-        var crashed = newUploadedFile();
-        repository.claimForTranscode(crashed.getId(), ContentFile.Status.UPLOADED, now);
-        backdate(crashed.getId(), "transcode_started_at", now.minus(45, ChronoUnit.MINUTES));
+        var ids = repository.findStalledTranscodeCandidates(leaseCutoff, queueCutoff, java.util.Set.of(),
+                        PageRequest.of(0, 50))
+                .stream().map(ContentFile::getId).toList();
 
-        var candidates = repository.findExpiredLeaseCandidates(
-                now.minus(20, ChronoUnit.MINUTES), PageRequest.of(0, 50));
-
-        var ids = candidates.stream().map(ContentFile::getId).toList();
         assertTrue(ids.contains(crashed.getId()), "an expired lease means the encode died");
         assertTrue(!ids.contains(running.getId()), "a fresh lease must never be reclaimed");
+        assertTrue(!ids.contains(justQueued.getId()), "a job queued a minute ago is in flight, not lost");
+        // Old queue entries ARE candidates — the sweeper then asks the transcoder whether it still
+        // holds them; the lease no longer decides anything for a job that never started (LOGIC-08).
+        assertTrue(ids.contains(longQueued.getId()));
+        assertTrue(ids.contains(legacy.getId()), "a claimed row with no queue stamp is in no queue");
+    }
+
+    @Test
+    void stalledCandidates_excludeFilesStillHeldByThisProcess() {
+        // Held files are waiting or working, not lost. Leaving them in would let a long queue fill
+        // the 50-row page and keep genuinely lost rows out of every sweep.
+        var heldQueued = queuedFile(now.minus(90, ChronoUnit.MINUTES));
+        var heldRunning = startedFile(now.minus(45, ChronoUnit.MINUTES));
+        var lost = queuedFile(now.minus(90, ChronoUnit.MINUTES));
+
+        var ids = repository.findStalledTranscodeCandidates(leaseCutoff, queueCutoff,
+                        java.util.Set.of(heldQueued.getId(), heldRunning.getId()), PageRequest.of(0, 50))
+                .stream().map(ContentFile::getId).toList();
+
+        assertEquals(java.util.List.of(lost.getId()), ids);
+    }
+
+    @Test
+    void countEncodesPastLease_countsOnlyStartedEncodesOlderThanTheLease() {
+        startedFile(now.minus(45, ChronoUnit.MINUTES));     // past the lease
+        startedFile(now.minus(1, ChronoUnit.MINUTES));      // healthy
+        queuedFile(now.minus(90, ChronoUnit.MINUTES));      // waiting, never started — not an encode
+
+        assertEquals(1, repository.countEncodesPastLease(leaseCutoff));
+    }
+
+    @Test
+    void requeue_restampsTheQueue_clearsTheLease_andNeverCountsAnAttempt() {
+        var crashed = startedFile(now.minus(45, ChronoUnit.MINUTES));
+        var longQueued = queuedFile(now.minus(90, ChronoUnit.MINUTES));
+        Instant later = now.plus(1, ChronoUnit.MINUTES);
+
+        assertEquals(1, repository.requeueStalledTranscode(crashed.getId(), leaseCutoff, queueCutoff, later));
+        assertEquals(1, repository.requeueStalledTranscode(longQueued.getId(), leaseCutoff, queueCutoff, later));
+
+        var requeued = repository.findById(crashed.getId()).orElseThrow();
+        assertEquals(ContentFile.Status.TRANSCODING, requeued.getStatus());
+        assertEquals(later, requeued.getTranscodeQueuedAt());
+        assertNull(requeued.getTranscodeStartedAt(), "back in the queue: the next start takes the lease");
+        assertEquals(1, requeued.getTranscodeAttempts(), "the crashed encode counted; the requeue does not");
+        assertEquals(0, repository.findById(longQueued.getId()).orElseThrow().getTranscodeAttempts());
+    }
+
+    @Test
+    void requeue_isACompareAndSetOnTheStalledPredicate() {
+        // A healthy encode, and a queued job that started between the sweeper's read and its write,
+        // must both make the requeue lose — resetting either would let a second encode start.
+        var running = startedFile(now.minus(1, ChronoUnit.MINUTES));
+        assertEquals(0, repository.requeueStalledTranscode(running.getId(), leaseCutoff, queueCutoff, now));
+
+        var queued = queuedFile(now.minus(90, ChronoUnit.MINUTES));
+        assertEquals(1, repository.beginTranscode(queued.getId(), now));
+        assertEquals(0, repository.requeueStalledTranscode(queued.getId(), leaseCutoff, queueCutoff, now));
+        assertEquals(now, repository.findById(queued.getId()).orElseThrow().getTranscodeStartedAt());
+
+        var uploaded = newUploadedFile();
+        assertEquals(0, repository.requeueStalledTranscode(uploaded.getId(), leaseCutoff, queueCutoff, now),
+                "only TRANSCODING rows can be requeued");
     }
 
     @Test

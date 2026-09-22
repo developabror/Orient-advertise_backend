@@ -71,15 +71,27 @@ public class ContentFile {
     private String uploadedBy;
 
     /**
-     * Lease stamp: when the current transcode attempt was claimed / (re)started. The transcode
-     * sweeper detects a crashed encode by lease AGE — deliberately not by {@code updatedAt}, which
-     * does not advance during the run and would make a slow-but-healthy encode look abandoned.
-     * Null until the row is first claimed.
+     * When the row was last claimed and handed to the transcode queue (V52). While
+     * {@link #transcodeStartedAt} is null the job is only waiting, and the sweeper leaves it alone
+     * for as long as this process still has it queued.
+     */
+    @Column(name = "transcode_queued_at")
+    private Instant transcodeQueuedAt;
+
+    /**
+     * Lease stamp: when the current encode actually <b>started</b>; null while the claimed job is
+     * still waiting in the queue (LOGIC-08 — stamping it at claim time made a long queue wait look
+     * like a crash). The transcode sweeper detects a crashed encode by lease AGE — deliberately not
+     * by {@code updatedAt}, which does not advance during the run and would make a
+     * slow-but-healthy encode look abandoned.
      */
     @Column(name = "transcode_started_at")
     private Instant transcodeStartedAt;
 
-    /** Number of transcode attempts claimed so far. Caps the automatic retry loop on a poison file. */
+    /**
+     * Number of encodes actually started (not claims — a re-queued job that never ran costs
+     * nothing). Caps the automatic retry loop on a poison file.
+     */
     @Column(name = "transcode_attempts", nullable = false)
     private int transcodeAttempts;
 
@@ -172,6 +184,8 @@ public class ContentFile {
      * managed-entity path; production code should prefer the repository statements so the
      * compare-and-set guard is not lost.
      */
+    public Instant getTranscodeQueuedAt() { return transcodeQueuedAt; }
+
     public Instant getTranscodeStartedAt() { return transcodeStartedAt; }
     public void setTranscodeStartedAt(Instant transcodeStartedAt) {
         this.transcodeStartedAt = transcodeStartedAt;

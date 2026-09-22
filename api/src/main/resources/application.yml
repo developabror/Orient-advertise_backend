@@ -181,11 +181,14 @@ app:
       initial-delay: ${APP_VIDEO_SWEEPER_INITIAL_DELAY:PT1M}
       # UPLOADED for longer than this ⇒ the dispatch was lost.
       lost-dispatch-after: ${APP_VIDEO_SWEEPER_LOST_DISPATCH_AFTER:PT5M}
-      # TRANSCODING with a lease older than this ⇒ the encode crashed. MUST exceed app.video.timeout
-      # plus both MinIO transfers, or a healthy long encode gets reclaimed underneath itself.
+      # An encode that STARTED longer ago than this and is no longer held by this process ⇒ it
+      # crashed (one still running here past it is reported as possibly hung, never reclaimed).
+      # MUST exceed app.video.timeout plus both MinIO transfers. Waiting in the queue does not count.
+      # The same value marks an encode as past its lease on /api/health.
       lease-timeout: ${APP_VIDEO_SWEEPER_LEASE_TIMEOUT:PT20M}
       failed-retry-after: ${APP_VIDEO_SWEEPER_FAILED_RETRY_AFTER:PT15M}
-      # Total claims per file before it is parked in FAILED for a human. A poison file must not loop.
+      # Encodes STARTED per file before it is parked in FAILED for a human (waiting in the queue or
+      # being re-queued costs nothing). A poison file must not loop.
       max-attempts: ${APP_VIDEO_SWEEPER_MAX_ATTEMPTS:3}
       # Backlog age that counts as stuck. Drives BOTH the WARN log (forwarded to Telegram) and the
       # transcode-backlog component on /api/health, so the two can never disagree.

@@ -23,6 +23,7 @@ import static org.mockito.Mockito.when;
 class TranscodeBacklogHealthIndicatorTest {
 
     private static final Duration STALE_AFTER = Duration.ofMinutes(10);
+    private static final Duration LEASE = Duration.ofMinutes(20);
 
     private ContentFileRepository repository;
     private TranscodeBacklogHealthIndicator indicator;
@@ -30,7 +31,7 @@ class TranscodeBacklogHealthIndicatorTest {
     @BeforeEach
     void setUp() {
         repository = mock(ContentFileRepository.class);
-        indicator = new TranscodeBacklogHealthIndicator(repository, STALE_AFTER);
+        indicator = new TranscodeBacklogHealthIndicator(repository, STALE_AFTER, LEASE);
     }
 
     @Test
@@ -53,6 +54,21 @@ class TranscodeBacklogHealthIndicatorTest {
         if (status.status() instanceof HealthStatus.Status.Down(var reason)) {
             assertTrue(reason.contains("2 content file(s)"), reason);
             assertTrue(reason.contains("UPLOADED"), reason);
+        }
+    }
+
+    @Test
+    void encodeRunningPastItsLease_reportsDown() {
+        // LOGIC-08 follow-up: the sweeper never reclaims a file this process still holds, so a hung
+        // encode must surface here instead of silently blocking the queue behind it.
+        when(repository.countStaleUploaded(any(Instant.class))).thenReturn(0L);
+        when(repository.countEncodesPastLease(any(Instant.class))).thenReturn(1L);
+
+        var status = indicator.check();
+
+        assertInstanceOf(HealthStatus.Status.Down.class, status.status());
+        if (status.status() instanceof HealthStatus.Status.Down(var reason)) {
+            assertTrue(reason.contains("1 encode(s) running for more than PT20M"), reason);
         }
     }
 

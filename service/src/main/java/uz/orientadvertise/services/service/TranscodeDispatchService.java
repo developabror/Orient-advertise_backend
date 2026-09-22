@@ -60,4 +60,30 @@ public class TranscodeDispatchService {
         }
         return true;
     }
+
+    /**
+     * Re-queue a stalled {@code TRANSCODING} row — an encode whose lease expired, or a claimed job
+     * that never started and is no longer held anywhere. The requeue is a compare-and-set on the
+     * sweeper's own predicate, so a task that started in the meantime is left alone.
+     *
+     * @return {@code true} if the row was re-queued and dispatched
+     */
+    public boolean requeue(Long contentFileId, Instant leaseCutoff, Instant queueCutoff) {
+        if (contentFileRepository.requeueStalledTranscode(contentFileId, leaseCutoff, queueCutoff, Instant.now()) != 1) {
+            log.debug("Transcode requeue lost [id={}] — it started, finished or moved on", contentFileId);
+            return false;
+        }
+        transcoder.transcodeAsync(contentFileId);
+        return true;
+    }
+
+    /** Whether this process still holds a task for the file, queued or running. */
+    public boolean isPending(Long contentFileId) {
+        return transcoder.isPending(contentFileId);
+    }
+
+    /** Snapshot of the files this process holds a task for, queued or running. */
+    public java.util.Set<Long> heldIds() {
+        return transcoder.heldIds();
+    }
 }

@@ -34,4 +34,14 @@ public interface Transcoder {
      * ffmpeg could), so on a host whose planned concurrency is 1, "urgent" means "next", not "now".
      */
     void transcodeAsyncUrgent(Long contentFileId);
+
+    /**
+     * Whether this process still holds a task for the file — queued or running. The sweeper asks
+     * before re-driving a claimed row: a job that is merely waiting behind other encodes is not lost,
+     * however long it waits (LOGIC-08). A second dispatch of a file already held here is a no-op.
+     */
+    boolean isPending(Long contentFileId);
+
+    /** Snapshot of every file this process holds a task for, queued or running. */
+    java.util.Set<Long> heldIds();
 }

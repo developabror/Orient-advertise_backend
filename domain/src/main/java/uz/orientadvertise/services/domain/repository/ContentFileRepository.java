@@ -142,7 +142,9 @@ public interface ContentFileRepository extends JpaRepository<ContentFile, Long> 
 
     /**
      * Atomically claim a row for transcoding: compare-and-set {@code status} from {@code expected}
-     * to {@code TRANSCODING}, stamp the lease and increment the attempt counter.
+     * to {@code TRANSCODING} and stamp {@code transcodeQueuedAt}. The lease
+     * ({@code transcodeStartedAt}) stays null and no attempt is counted until the encode really
+     * begins ({@link #beginTranscode}) — a job waiting in the queue is not running (LOGIC-08).
      *
      * <p><b>This is the only legitimate way to start a transcode.</b> Claiming rather than merely
      * selecting is what makes double-dispatch impossible without a distributed lock: of N callers
@@ -156,8 +158,8 @@ public interface ContentFileRepository extends JpaRepository<ContentFile, Long> 
     @Query("""
             UPDATE ContentFile c
                SET c.status = :claimed,
-                   c.transcodeStartedAt = :now,
-                   c.transcodeAttempts = c.transcodeAttempts + 1,
+                   c.transcodeQueuedAt = :now,
+                   c.transcodeStartedAt = NULL,
                    c.updatedAt = :now
              WHERE c.id = :id
                AND c.status = :expected
@@ -174,23 +176,24 @@ public interface ContentFileRepository extends JpaRepository<ContentFile, Long> 
     }
 
     /**
-     * Re-stamp the lease at the moment the pipeline actually starts, and act as the pipeline's
-     * start guard.
+     * The pipeline's start guard: take the lease and count the attempt at the moment the encode
+     * actually starts.
      *
-     * <p>Two jobs in one statement. (a) A claimed job may sit in the executor queue behind other
-     * encodes for longer than the lease window; refreshing here stops the sweeper from mistaking a
-     * merely-queued job for a crashed one. (b) A return of 0 means the row is no longer claimed by
-     * anyone — already terminal, soft-deleted or superseded — so a duplicate dispatch degrades to a
-     * harmless no-op instead of a second encode.
+     * <p>Only a claimed job that has <b>not started yet</b> ({@code transcodeStartedAt IS NULL}) gets
+     * through. A return of 0 means someone else already started it — a duplicate queue entry — or
+     * the row is no longer claimed at all (terminal, soft-deleted), so a duplicate dispatch
+     * degrades to a harmless no-op instead of a second, concurrent encode of the same file.
      */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     @Query("""
             UPDATE ContentFile c
                SET c.transcodeStartedAt = :now,
+                   c.transcodeAttempts = c.transcodeAttempts + 1,
                    c.updatedAt = :now
              WHERE c.id = :id
                AND c.status = :transcoding
+               AND c.transcodeStartedAt IS NULL
                AND c.deletedAt IS NULL
             """)
     int beginTranscode(@Param("id") Long id,
@@ -200,6 +203,39 @@ public interface ContentFileRepository extends JpaRepository<ContentFile, Long> 
     /** @see #beginTranscode(Long, ContentFile.Status, Instant) */
     default int beginTranscode(Long id, Instant now) {
         return beginTranscode(id, ContentFile.Status.TRANSCODING, now);
+    }
+
+    /**
+     * Put a stalled {@code TRANSCODING} row back in the queue: an encode whose lease expired
+     * ({@code transcodeStartedAt < leaseCutoff}), or a queued job that never started and was queued
+     * before {@code queueCutoff} — both as seen by
+     * {@link #findStalledTranscodeCandidates}. The predicate is re-checked inside the UPDATE, so a
+     * task that began between the sweeper's read and this write makes it return 0 rather than
+     * resetting a live encode. No attempt is counted here; {@link #beginTranscode} counts it.
+     */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Query("""
+            UPDATE ContentFile c
+               SET c.transcodeQueuedAt = :now,
+                   c.transcodeStartedAt = NULL,
+                   c.updatedAt = :now
+             WHERE c.id = :id
+               AND c.status = :transcoding
+               AND c.deletedAt IS NULL
+               AND ((c.transcodeStartedAt IS NOT NULL AND c.transcodeStartedAt < :leaseCutoff)
+                 OR (c.transcodeStartedAt IS NULL
+                     AND (c.transcodeQueuedAt IS NULL OR c.transcodeQueuedAt < :queueCutoff)))
+            """)
+    int requeueStalledTranscode(@Param("id") Long id,
+                                @Param("transcoding") ContentFile.Status transcoding,
+                                @Param("leaseCutoff") Instant leaseCutoff,
+                                @Param("queueCutoff") Instant queueCutoff,
+                                @Param("now") Instant now);
+
+    /** @see #requeueStalledTranscode(Long, ContentFile.Status, Instant, Instant, Instant) */
+    default int requeueStalledTranscode(Long id, Instant leaseCutoff, Instant queueCutoff, Instant now) {
+        return requeueStalledTranscode(id, ContentFile.Status.TRANSCODING, leaseCutoff, queueCutoff, now);
     }
 
     /**
@@ -352,25 +388,65 @@ public interface ContentFileRepository extends JpaRepository<ContentFile, Long> 
     }
 
     /**
-     * Case 2 — <b>crashed encode</b>. Rows claimed into TRANSCODING whose lease has expired: the
-     * process was killed mid-ffmpeg, or the task was lost after the claim committed. Keyed on the
-     * lease, never on {@code updatedAt} — which does not advance during an encode, so an
-     * updatedAt-keyed sweeper would re-dispatch a legitimately slow transcode.
+     * Case 2 — <b>stalled transcode</b>. Rows in {@code TRANSCODING} that may have lost their
+     * worker:
+     * <ul>
+     *   <li>an encode that <b>started</b> and whose lease expired — the process was killed
+     *       mid-ffmpeg. Keyed on the lease, never on {@code updatedAt}, which does not advance
+     *       during an encode, so an updatedAt-keyed sweeper would re-dispatch a slow transcode;</li>
+     *   <li>a job that was claimed but <b>never started</b>, queued before {@code queueCutoff} — its
+     *       queue entry may be gone (rejected, process restarted). The lease never applies to it
+     *       (LOGIC-08).</li>
+     * </ul>
+     * Rows in {@code heldIds} — the files this process still has queued or running — are excluded:
+     * they are waiting or working, not lost, and leaving them in would let a long queue fill the
+     * page and keep genuinely lost rows from being seen.
+     *
+     * @param heldIds never empty: pass a sentinel such as {@code -1L} when nothing is held, since an
+     *                empty {@code NOT IN} list is not portable SQL
      */
     @Query("""
             SELECT c FROM ContentFile c
              WHERE c.status = :transcoding
                AND c.deletedAt IS NULL
-               AND (c.transcodeStartedAt IS NULL OR c.transcodeStartedAt < :leaseCutoff)
+               AND c.id NOT IN :heldIds
+               AND ((c.transcodeStartedAt IS NOT NULL AND c.transcodeStartedAt < :leaseCutoff)
+                 OR (c.transcodeStartedAt IS NULL
+                     AND (c.transcodeQueuedAt IS NULL OR c.transcodeQueuedAt < :queueCutoff)))
              ORDER BY c.id
             """)
-    List<ContentFile> findExpiredLeaseCandidates(@Param("transcoding") ContentFile.Status transcoding,
-                                                  @Param("leaseCutoff") Instant leaseCutoff,
-                                                  Pageable pageable);
+    List<ContentFile> findStalledTranscodeCandidates(@Param("transcoding") ContentFile.Status transcoding,
+                                                      @Param("leaseCutoff") Instant leaseCutoff,
+                                                      @Param("queueCutoff") Instant queueCutoff,
+                                                      @Param("heldIds") java.util.Collection<Long> heldIds,
+                                                      Pageable pageable);
 
-    /** @see #findExpiredLeaseCandidates */
-    default List<ContentFile> findExpiredLeaseCandidates(Instant leaseCutoff, Pageable pageable) {
-        return findExpiredLeaseCandidates(ContentFile.Status.TRANSCODING, leaseCutoff, pageable);
+    /** @see #findStalledTranscodeCandidates */
+    default List<ContentFile> findStalledTranscodeCandidates(Instant leaseCutoff, Instant queueCutoff,
+                                                              java.util.Collection<Long> heldIds,
+                                                              Pageable pageable) {
+        var excluded = heldIds.isEmpty() ? List.of(-1L) : heldIds;
+        return findStalledTranscodeCandidates(ContentFile.Status.TRANSCODING, leaseCutoff, queueCutoff,
+                excluded, pageable);
+    }
+
+    /**
+     * Encodes that started before {@code leaseCutoff} and are still {@code TRANSCODING}. After a
+     * sweep has re-queued the crashed ones, what is left is running in this process past its lease —
+     * a hung ffmpeg or ffprobe holding a pool slot. The health check and the sweeper's alarm read it.
+     */
+    @Query("""
+            SELECT COUNT(c) FROM ContentFile c
+             WHERE c.status = :transcoding
+               AND c.deletedAt IS NULL
+               AND c.transcodeStartedAt < :leaseCutoff
+            """)
+    long countEncodesPastLease(@Param("transcoding") ContentFile.Status transcoding,
+                               @Param("leaseCutoff") Instant leaseCutoff);
+
+    /** @see #countEncodesPastLease */
+    default long countEncodesPastLease(Instant leaseCutoff) {
+        return countEncodesPastLease(ContentFile.Status.TRANSCODING, leaseCutoff);
     }
 
     /**

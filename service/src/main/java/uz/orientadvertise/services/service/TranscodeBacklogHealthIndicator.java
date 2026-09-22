@@ -26,6 +26,10 @@ import uz.orientadvertise.services.domain.repository.ContentFileRepository;
  * perfectly well, it is the content pipeline that is not — and DEGRADED is exactly that
  * distinction.
  *
+ * <p>It also reports encodes still running past the sweeper's lease (v1.0.147). The sweeper never
+ * reclaims a file this process holds, so a hung ffmpeg/ffprobe would otherwise block every job queued
+ * behind it without a sound.
+ *
  * <p>A probe failure is itself reported DOWN rather than thrown: this endpoint is unauthenticated
  * and must never leak a JDBC error, and must never 500.
  */
@@ -37,6 +41,7 @@ public class TranscodeBacklogHealthIndicator {
 
     private final ContentFileRepository contentFileRepository;
     private final Duration staleAfter;
+    private final Duration leaseTimeout;
 
     /**
      * @param staleAfter same property the sweeper alerts on, so the health surface and the log/
@@ -44,18 +49,28 @@ public class TranscodeBacklogHealthIndicator {
      */
     public TranscodeBacklogHealthIndicator(
             ContentFileRepository contentFileRepository,
-            @Value("${app.video.sweeper.stale-alert-after:PT10M}") Duration staleAfter) {
+            @Value("${app.video.sweeper.stale-alert-after:PT10M}") Duration staleAfter,
+            @Value("${app.video.sweeper.lease-timeout:PT20M}") Duration leaseTimeout) {
         this.contentFileRepository = contentFileRepository;
         this.staleAfter = staleAfter;
+        this.leaseTimeout = leaseTimeout;
     }
 
     public HealthStatus check() {
         try {
-            long stuck = contentFileRepository.countStaleUploaded(Instant.now().minus(staleAfter));
-            var status = stuck == 0
+            Instant now = Instant.now();
+            long stuck = contentFileRepository.countStaleUploaded(now.minus(staleAfter));
+            long pastLease = contentFileRepository.countEncodesPastLease(now.minus(leaseTimeout));
+            var problems = new java.util.ArrayList<String>();
+            if (stuck > 0) {
+                problems.add("%d content file(s) stuck in UPLOADED for more than %s".formatted(stuck, staleAfter));
+            }
+            if (pastLease > 0) {
+                problems.add("%d encode(s) running for more than %s".formatted(pastLease, leaseTimeout));
+            }
+            var status = problems.isEmpty()
                     ? new HealthStatus.Status.Up()
-                    : new HealthStatus.Status.Down(
-                            "%d content file(s) stuck in UPLOADED for more than %s".formatted(stuck, staleAfter));
+                    : new HealthStatus.Status.Down(String.join("; ", problems));
             return new HealthStatus(COMPONENT, status, DateUtils.nowIso());
         } catch (Exception e) {
             log.warn("Transcode backlog health check failed: {}", e.getMessage());

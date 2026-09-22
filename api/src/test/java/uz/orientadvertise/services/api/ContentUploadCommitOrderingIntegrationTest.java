@@ -24,6 +24,8 @@ import uz.orientadvertise.services.domain.storage.StorageClient;
 import uz.orientadvertise.services.service.ContentUploadService;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -88,6 +90,17 @@ class ContentUploadCommitOrderingIntegrationTest {
         @Override
         public void transcodeAsyncUrgent(Long contentFileId) {
             record(contentFileId, true);
+        }
+
+        /** Records, never runs — so it holds nothing a sweeper would need to wait for. */
+        @Override
+        public boolean isPending(Long contentFileId) {
+            return false;
+        }
+
+        @Override
+        public java.util.Set<Long> heldIds() {
+            return java.util.Set.of();
         }
     }
 
@@ -167,7 +180,10 @@ class ContentUploadCommitOrderingIntegrationTest {
         var stored = contentFileRepository.findById(result.fileId()).orElseThrow();
         assertEquals(ContentFile.Status.TRANSCODING, stored.getStatus(),
                 "the after-commit listener claims the row, so TRANSCODING is committed and visible");
-        assertEquals(1, stored.getTranscodeAttempts());
+        // Claimed and queued, not started (LOGIC-08): the attempt is counted when the encode begins.
+        assertNotNull(stored.getTranscodeQueuedAt());
+        assertNull(stored.getTranscodeStartedAt());
+        assertEquals(0, stored.getTranscodeAttempts());
     }
 
     @Test

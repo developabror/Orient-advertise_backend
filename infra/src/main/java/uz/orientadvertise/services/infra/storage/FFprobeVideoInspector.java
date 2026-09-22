@@ -8,6 +8,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
@@ -26,6 +31,58 @@ public class FFprobeVideoInspector implements VideoInspector {
 
     @Value("${app.video.inspector-enabled:true}")
     private boolean enabled;
+
+    @Value("${app.video.ffprobe-timeout:PT30S}")
+    private Duration timeout = Duration.ofSeconds(30);
+
+    /** Output readers. Virtual threads: they only ever block on a pipe. */
+    private static final ExecutorService DRAINS = Executors.newVirtualThreadPerTaskExecutor();
+
+    /** Retained per stream; the rest is read and discarded so the pipe never fills. */
+    private static final int MAX_CAPTURE_CHARS = 16_384;
+
+    record ProbeOutput(int exitCode, String stdout, String stderr) {}
+
+    /**
+     * Run ffprobe with both output streams read on their own threads, so the timeout is real.
+     *
+     * <p>This used to read stdout to the end, then stderr, then {@code waitFor(30s)}. Reading to the
+     * end blocks for as long as ffprobe runs, so the 30-second timeout could never fire and a hung
+     * ffprobe held the transcode worker forever; and a corrupt file that makes ffprobe write more
+     * than a pipe's worth of errors deadlocked it, because stderr was only read after stdout closed.
+     * On a single-width pool one such upload stalled every transcode behind it.
+     *
+     * @return the output, or {@code null} if ffprobe did not finish within the timeout (it is killed)
+     */
+    ProbeOutput runProbe(List<String> command) throws IOException, InterruptedException {
+        var process = new ProcessBuilder(command).start();
+        Future<String> stdout = DRAINS.submit(() -> readCapped(process.getInputStream()));
+        Future<String> stderr = DRAINS.submit(() -> readCapped(process.getErrorStream()));
+        if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+            process.destroyForcibly();
+            return null;
+        }
+        try {
+            // The process has exited, so both pipes are at EOF; the bound only guards a leaked pipe.
+            return new ProbeOutput(process.exitValue(),
+                    stdout.get(5, TimeUnit.SECONDS), stderr.get(5, TimeUnit.SECONDS));
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            throw new IOException("Could not read ffprobe output", e);
+        }
+    }
+
+    private static String readCapped(InputStream in) throws IOException {
+        try (var reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            var sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (sb.length() < MAX_CAPTURE_CHARS) {
+                    sb.append(line).append('\n');
+                }
+            }
+            return sb.toString();
+        }
+    }
 
     @Override
     public InspectionResult inspect(InputStream data) {
@@ -55,26 +112,20 @@ public class FFprobeVideoInspector implements VideoInspector {
 
     private InspectionResult runFfprobe(Path file) {
         try {
-            var pb = new ProcessBuilder(
+            var output = runProbe(List.of(
                     ffprobePath,
                     "-v", "error",
                     "-show_entries", "stream=codec_type,codec_name:format=format_name",
                     "-show_entries", "stream_tags=encryption",
                     "-of", "default=noprint_wrappers=1",
-                    file.toString());
-            pb.redirectErrorStream(false);
-            var process = pb.start();
-
-            var stdout = readAll(process.getInputStream());
-            var stderr = readAll(process.getErrorStream());
-
-            boolean finished = process.waitFor(30, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                return InspectionResult.invalid("FFprobe timed out after 30s");
+                    file.toString()));
+            if (output == null) {
+                return InspectionResult.invalid("FFprobe timed out after " + timeout.toSeconds() + "s");
             }
+            var stdout = output.stdout();
+            var stderr = output.stderr();
 
-            if (process.exitValue() != 0) {
+            if (output.exitCode() != 0) {
                 return InspectionResult.invalid("FFprobe failed: " + truncate(stderr));
             }
 
@@ -133,25 +184,19 @@ public class FFprobeVideoInspector implements VideoInspector {
      */
     private int runFfprobeDuration(Path file) {
         try {
-            var pb = new ProcessBuilder(
+            var output = runProbe(List.of(
                     ffprobePath,
                     "-v", "error",
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1",
-                    file.toString());
-            pb.redirectErrorStream(false);
-            var process = pb.start();
-
-            var stdout = readAll(process.getInputStream()).trim();
-
-            boolean finished = process.waitFor(30, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                log.warn("FFprobe duration extraction timed out");
+                    file.toString()));
+            if (output == null) {
+                log.warn("FFprobe duration extraction timed out after {}s", timeout.toSeconds());
                 return 0;
             }
+            var stdout = output.stdout().trim();
 
-            if (process.exitValue() != 0 || stdout.isEmpty() || "N/A".equalsIgnoreCase(stdout)) {
+            if (output.exitCode() != 0 || stdout.isEmpty() || "N/A".equalsIgnoreCase(stdout)) {
                 return 0;
             }
 
@@ -168,17 +213,6 @@ public class FFprobeVideoInspector implements VideoInspector {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return 0;
-        }
-    }
-
-    private static String readAll(InputStream in) throws IOException {
-        try (var reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-            var sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line).append('\n');
-            }
-            return sb.toString();
         }
     }
 

@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.146`
+`1.0.147`
 
 ## Architecture
 
@@ -444,7 +444,7 @@ All errors use a **uniform response format** with a `correlationId` for tracing:
 
 Schema is managed exclusively by Flyway versioned migrations. **No `ddl-auto: update` in production** — only `validate` (dev) or `none` (prod).
 
-- Migrations: `infra/src/main/resources/db/migration/V*.sql` (plus Java migrations in `infra/src/main/java/db/migration/`) — **head is `V51__playlist_position_unique_checked_per_statement` (Java)**
+- Migrations: `infra/src/main/resources/db/migration/V*.sql` (plus Java migrations in `infra/src/main/java/db/migration/`) — **head is `V52__content_file_transcode_queued_at.sql`**
 - Rollbacks: `infra/src/test/resources/db/rollback/U*.sql`
 - Migration failure **halts application startup** (Flyway default + Spring Boot propagation)
 - **Every new migration must bump `EXPECTED_MIGRATIONS` in `FlywayMigrationTest`** — it pins both
@@ -1302,6 +1302,71 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### A transcode waiting in the queue is no longer failed as "crashed" (v1.0.147)
+
+> **LOGIC-08.** The claim stamped the lease (`transcode_started_at`), so a job's 20-minute lease
+> started ticking while it merely waited in the queue. Upload several long videos to a single-width
+> pool and the later ones waited past the lease: each sweep re-claimed them (one attempt each) and
+> queued a duplicate, and after three rounds they were marked FAILED — "Abandoned after 3 transcode
+> attempt(s)" — without ever having been encoded, and not retried. Separately, the start guard
+> only checked the status, so on a pool wider than one a duplicate queue entry could start a
+> second, concurrent encode of the same file.
+
+**What changed**
+
+- **Queued and started are separate** (`V52`). The claim stamps the new `transcode_queued_at` and
+  leaves `transcode_started_at` null; the lease is taken only when the encode actually starts.
+- **The start guard admits one task.** `beginTranscode` succeeds only while `transcode_started_at`
+  is null, so of any duplicate queue entries exactly one runs; the rest are logged no-ops.
+- **Attempts count encodes that started**, not claims. Three real crashes still end the retry
+  loop; waiting or being re-queued costs nothing.
+- **The sweeper asks before it re-drives.** The transcoder tracks the files it holds (queued or
+  running); a `TRANSCODING` row still held is skipped however old it is — including an encode
+  running past its lease. A row no longer held (rejected by a full queue, lost in a restart, or its
+  task died before starting) is re-queued after the usual 5-minute grace, through a
+  compare-and-set on the sweeper's own predicate (`requeueStalledTranscode`), so a task that
+  started in the meantime is never reset.
+- **No duplicate queue entries.** Dispatching a file that is already queued here is a no-op. One
+  whose task is still *running* is queued normally: that can only be a legitimate re-dispatch after
+  the task wrote its terminal state (an operator retranscode landing before the task's cleanup).
+- **Held files are excluded from the stalled-row query itself**, so a long queue cannot fill the
+  sweeper's 50-row page and starve genuinely lost rows.
+
+**Because a held file is never reclaimed, a hung encode must not be silent:**
+
+- **ffprobe's timeout is real now.** `FFprobeVideoInspector` read stdout to the end before
+  `waitFor(30s)`, so the timeout could never fire, and read stderr only afterwards, so a corrupt file
+  that floods stderr deadlocked it. Both streams are now drained on virtual threads, the wait is
+  bounded (`app.video.ffprobe-timeout`, default 30 s) and the process is killed on timeout. On a
+  single-width pool one such upload used to stall every transcode behind it.
+- **An encode still running past its lease** is an ERROR on every sweep (forwarded to Telegram) and
+  turns the `transcode-backlog` health component DOWN (`countEncodesPastLease`).
+- **A task failure is logged** (ERROR, through the log pipeline) instead of dying on the pool
+  thread's stderr, and a file is always released from the held set — even if `submit` itself throws
+  or the pool is shutting down (the executor's rejection handler now throws, so `submit` reports
+  the drop).
+
+**Deploy note (V52 backfill).** Rows already `TRANSCODING` at deploy were claimed under the old
+rules (attempts counted claims; `transcode_started_at` is a claim time), so V52 resets them to
+"queued, never started" with a fresh budget and the boot sweep re-queues them. `FAILED` rows are
+left alone: a pre-v1.0.147 "Abandoned after 3 transcode attempt(s)" may be a queue-wait victim or a
+real poison file. If uploads failed that way after a bulk upload, use **Retranscode** on them.
+
+The lease and the boot-time recovery are otherwise unchanged; with several application instances
+the start guard, not the in-process check, is what keeps an encode single.
+
+**Tests:** `TranscodeQueueWaitIntegrationTest` (new, real schema + real sweeper: the review's
+scenario — a job waiting through four lease periods is never re-claimed, abandoned or duplicated,
+then starts once; a lost queue entry is re-queued without costing an attempt),
+`ContentFileTranscodeLeaseTest` (claim/start semantics, the one-starter guard, the requeue CAS, the
+stalled-candidate predicate with held files excluded, the past-lease count, the V52 backfill),
+`TranscodeSweeperTest` (+7), `FFmpegTranscoderTest` (+6: no duplicate queue entries; released after
+success, after a logged failure, when `submit` throws and on rejection; a re-dispatch during the old
+task's cleanup is queued), `FFprobeVideoInspectorTest` (new: a hung ffprobe times out, a stderr flood
+does not deadlock — scripted stand-ins, each time-boxed), `TranscodeExecutorTest` (+1),
+`TranscodeBacklogHealthIndicatorTest` (+1), `TranscodeDispatchServiceTest` (+3). Mutation-checked:
+restoring the old start guard, the old sweeper behaviour or the old ffprobe reading each fails them.
 
 ### Pre-release fixes: event retention, deleted devices, playlist shifts, schedules, exports, passwords (v1.0.146)
 

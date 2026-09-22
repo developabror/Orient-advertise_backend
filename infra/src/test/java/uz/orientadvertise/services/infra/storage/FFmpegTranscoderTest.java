@@ -28,6 +28,7 @@ import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.storage.StorageClient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -433,6 +434,104 @@ class FFmpegTranscoderTest {
                         && e.getFormattedMessage().contains("Thumbnail generation failed"));
         assertTrue(warnFound,
                 "Expected a WARN about thumbnail failure; captured: " + captured.list);
+    }
+
+    // ---------- LOGIC-08: what this process holds ----------
+
+    private Runnable capturedTask() {
+        var task = org.mockito.ArgumentCaptor.forClass(Runnable.class);
+        verify(transcodeExecutor, org.mockito.Mockito.atLeastOnce()).submit(task.capture(), anyInt(), anyString());
+        return task.getValue();
+    }
+
+    @Test
+    void aFileAlreadyHeldHere_isNotQueuedTwice() {
+        when(transcodeExecutor.submit(any(), anyInt(), anyString())).thenReturn(true);
+
+        transcoder.transcodeAsync(7L);
+        transcoder.transcodeAsync(7L);          // e.g. a sweeper requeue while it still waits
+        transcoder.transcodeAsyncUrgent(7L);
+
+        verify(transcodeExecutor, org.mockito.Mockito.times(1)).submit(any(), anyInt(), anyString());
+        assertTrue(transcoder.isPending(7L));
+        assertFalse(transcoder.isPending(8L));
+    }
+
+    @Test
+    void finishedTask_releasesTheFile_soItCanBeQueuedAgain() {
+        when(transcodeExecutor.submit(any(), anyInt(), anyString())).thenReturn(true);
+        when(contentFileRepository.findByIdAndDeletedAtIsNull(7L)).thenReturn(java.util.Optional.empty());
+
+        transcoder.transcodeAsync(7L);
+        capturedTask().run();
+
+        assertFalse(transcoder.isPending(7L));
+        transcoder.transcodeAsync(7L);
+        verify(transcodeExecutor, org.mockito.Mockito.times(2)).submit(any(), anyInt(), anyString());
+    }
+
+    @Test
+    void taskThatThrows_isLoggedAndStillReleasesTheFile() {
+        var captured = attachAppender(FFmpegTranscoder.class);
+        when(transcodeExecutor.submit(any(), anyInt(), anyString())).thenReturn(true);
+        when(contentFileRepository.findByIdAndDeletedAtIsNull(7L)).thenThrow(new IllegalStateException("db down"));
+
+        transcoder.transcodeAsync(7L);
+        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> capturedTask().run());
+
+        assertFalse(transcoder.isPending(7L), "otherwise the sweeper would never re-queue it");
+        // Through the log pipeline (and Telegram), not lost on the pool thread's stderr.
+        assertTrue(captured.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR
+                && e.getFormattedMessage().contains("Transcode task failed [id=7]")));
+    }
+
+    @Test
+    void submitThatThrows_releasesTheFile() {
+        when(transcodeExecutor.submit(any(), anyInt(), anyString())).thenThrow(new OutOfMemoryError("no thread"));
+
+        org.junit.jupiter.api.Assertions.assertThrows(OutOfMemoryError.class, () -> transcoder.transcodeAsync(7L));
+
+        assertFalse(transcoder.isPending(7L));
+    }
+
+    @Test
+    void redispatchWhileTheOldTaskIsStillRunning_isQueued_andTheFileStaysHeldUntilBothEnd() throws Exception {
+        // An operator retranscode can win the claim after the old task wrote FAILED but before its
+        // cleanup ran. That dispatch is legitimate and must not be swallowed as a "duplicate".
+        when(transcodeExecutor.submit(any(), anyInt(), anyString())).thenReturn(true);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var inPipeline = new java.util.concurrent.CountDownLatch(1);
+        when(contentFileRepository.findByIdAndDeletedAtIsNull(7L)).thenAnswer(inv -> {
+            inPipeline.countDown();
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            return java.util.Optional.empty();
+        });
+
+        transcoder.transcodeAsync(7L);
+        var first = capturedTask();
+        var worker = new Thread(first);
+        worker.start();
+        inPipeline.await(5, java.util.concurrent.TimeUnit.SECONDS);   // first task is now running
+
+        transcoder.transcodeAsyncUrgent(7L);
+        verify(transcodeExecutor, org.mockito.Mockito.times(2)).submit(any(), anyInt(), anyString());
+        assertEquals(java.util.Set.of(7L), transcoder.heldIds());
+
+        release.countDown();
+        worker.join(5_000);
+        assertTrue(transcoder.isPending(7L), "the re-dispatched task is still queued");
+        capturedTask().run();
+        assertFalse(transcoder.isPending(7L));
+        assertEquals(java.util.Set.of(), transcoder.heldIds());
+    }
+
+    @Test
+    void rejectedByAFullQueue_isNotHeld_soTheSweeperRequeuesIt() {
+        when(transcodeExecutor.submit(any(), anyInt(), anyString())).thenReturn(false);
+
+        transcoder.transcodeAsync(7L);
+
+        assertFalse(transcoder.isPending(7L));
     }
 
     private static ListAppender<ILoggingEvent> attachAppender(Class<?> target) {

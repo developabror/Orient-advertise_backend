@@ -37,9 +37,9 @@ import org.springframework.stereotype.Component;
  * increasing sequence number breaks ties, so ordering is strict FIFO within a priority band and
  * starvation is impossible for a fixed number of urgent jobs.
  *
- * <p>Rejection is <b>loud</b>: the queue is bounded, and an overflow logs at ERROR. The row keeps
- * its claim's lease, so {@code TranscodeSweeper} re-drives it once the lease expires — a dropped
- * task is a delay, never a permanently stuck file.
+ * <p>Rejection is <b>loud</b>: the queue is bounded, and an overflow logs at ERROR. The row stays
+ * claimed but no task holds it, so {@code TranscodeSweeper} re-queues it after its grace period — a
+ * dropped task is a delay, never a permanently stuck file.
  */
 @Component
 public class TranscodeExecutor {
@@ -78,10 +78,14 @@ public class TranscodeExecutor {
                 0L, TimeUnit.MILLISECONDS,
                 new PriorityBlockingQueue<>(Math.min(this.queueCapacity, 64)),
                 namedDaemonThreadFactory("transcode-"),
-                (task, exec) -> log.error(
-                        "Transcode task REJECTED — pool saturated (concurrency={}, queued={}); "
-                                + "the content row keeps its lease and TranscodeSweeper will re-drive it",
-                        this.concurrency, exec.getQueue().size()));
+                (task, exec) -> {
+                    // Only reachable during shutdown (the queue itself is unbounded). Throwing is what
+                    // makes submit() report the drop, so the caller releases the file for the sweeper.
+                    log.error("Transcode task REJECTED — pool shut down (concurrency={}, queued={}); "
+                                    + "the content row stays claimed and TranscodeSweeper will re-queue it",
+                            this.concurrency, exec.getQueue().size());
+                    throw new java.util.concurrent.RejectedExecutionException("transcode pool is shut down");
+                });
 
         log.info("Transcode pool sized: concurrency={} ({}), cpus={}, containerMemory={} MiB, "
                         + "maxHeap={} MiB, jobBudget={} MiB, queueCapacity={}",
@@ -105,7 +109,7 @@ public class TranscodeExecutor {
     public boolean submit(Runnable task, int priority, String description) {
         if (executor.getQueue().size() >= queueCapacity) {
             log.error("Transcode task REJECTED — queue at capacity {} [{}]; "
-                    + "the content row keeps its lease and TranscodeSweeper will re-drive it",
+                    + "the content row stays claimed and TranscodeSweeper will re-queue it",
                     queueCapacity, description);
             return false;
         }
@@ -113,7 +117,7 @@ public class TranscodeExecutor {
             executor.execute(new PriorityTask(priority, sequence.incrementAndGet(), task, description));
             return true;
         } catch (java.util.concurrent.RejectedExecutionException e) {
-            // The handler above already logged; this only fires on a shutdown race.
+            // The rejection handler already logged; this only fires on a shutdown race.
             return false;
         }
     }
@@ -141,8 +145,8 @@ public class TranscodeExecutor {
     /**
      * Drain on shutdown instead of discarding. A {@code docker compose up -d} otherwise throws away
      * whatever was queued, reproducing the very failure this class exists to prevent. In-flight
-     * encodes past the grace period are abandoned — their rows keep the lease and the sweeper
-     * reclaims them on the next boot.
+     * encodes past the grace period are abandoned — their rows stay TRANSCODING and the sweeper's
+     * boot recovery re-queues them.
      */
     @PreDestroy
     public void shutdown() {
@@ -150,7 +154,7 @@ public class TranscodeExecutor {
         try {
             if (!executor.awaitTermination(shutdownGraceSeconds, TimeUnit.SECONDS)) {
                 log.warn("Transcode pool did not drain within {}s — {} task(s) abandoned; "
-                                + "their leases expire and the sweeper reclaims them",
+                                + "the sweeper re-queues them on the next boot",
                         shutdownGraceSeconds, executor.getQueue().size());
                 executor.shutdownNow();
             }

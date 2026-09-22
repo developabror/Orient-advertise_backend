@@ -58,7 +58,7 @@ class TranscodeSweeperTest {
         dashboardBroadcaster = mock(DashboardEventBroadcaster.class);
         when(repository.findLostDispatchCandidates(any(Instant.class), any(Pageable.class)))
                 .thenReturn(List.of());
-        when(repository.findExpiredLeaseCandidates(any(Instant.class), any(Pageable.class)))
+        when(repository.findStalledTranscodeCandidates(any(Instant.class), any(Instant.class), any(), any(Pageable.class)))
                 .thenReturn(List.of());
         when(repository.findRetryableFailedCandidates(anyInt(), any(Instant.class), any(Pageable.class)))
                 .thenReturn(List.of());
@@ -112,23 +112,29 @@ class TranscodeSweeperTest {
         // instead would surface a merely-slow encode here and start a second ffmpeg on it.
         sweeper.sweep(NOW, false);
 
-        var cutoff = ArgumentCaptor.forClass(Instant.class);
-        verify(repository).findExpiredLeaseCandidates(cutoff.capture(), any(Pageable.class));
-        assertEquals(NOW.minus(LEASE), cutoff.getValue());
+        var leaseCutoff = ArgumentCaptor.forClass(Instant.class);
+        var queueCutoff = ArgumentCaptor.forClass(Instant.class);
+        verify(repository).findStalledTranscodeCandidates(leaseCutoff.capture(), queueCutoff.capture(),
+                any(), any(Pageable.class));
+        assertEquals(NOW.minus(LEASE), leaseCutoff.getValue());
+        // A job that never started gets the same grace as an UPLOADED row before it can count as lost.
+        assertEquals(NOW.minus(LOST_AFTER), queueCutoff.getValue());
         verify(dispatchService, never()).dispatch(anyLong(), any(), anyBoolean());
+        verify(dispatchService, never()).requeue(anyLong(), any(), any());
     }
 
     @Test
-    void expiredLease_isReclaimedFromTranscoding() {
+    void expiredLease_isRequeuedFromTranscoding() {
         var crashed = row(2L, ContentFile.Status.TRANSCODING, 1);
-        when(repository.findExpiredLeaseCandidates(any(Instant.class), any(Pageable.class)))
+        when(repository.findStalledTranscodeCandidates(any(Instant.class), any(Instant.class), any(), any(Pageable.class)))
                 .thenReturn(List.of(crashed));
-        when(dispatchService.dispatch(eq(2L), eq(ContentFile.Status.TRANSCODING), anyBoolean()))
-                .thenReturn(true);
+        when(dispatchService.requeue(eq(2L), any(Instant.class), any(Instant.class))).thenReturn(true);
 
         var result = sweeper.sweep(NOW, false);
 
-        verify(dispatchService).dispatch(2L, ContentFile.Status.TRANSCODING, false);
+        // Re-queued through the CAS on the sweeper's own predicate, not re-claimed from a status.
+        verify(dispatchService).requeue(2L, NOW.minus(LEASE), NOW.minus(LOST_AFTER));
+        verify(dispatchService, never()).dispatch(anyLong(), any(), anyBoolean());
         assertEquals(1, result.redispatched());
     }
 
@@ -138,9 +144,113 @@ class TranscodeSweeperTest {
         // lease after a crash would only delay recovery.
         sweeper.sweep(NOW, true);
 
-        var cutoff = ArgumentCaptor.forClass(Instant.class);
-        verify(repository).findExpiredLeaseCandidates(cutoff.capture(), any(Pageable.class));
-        assertEquals(NOW, cutoff.getValue());
+        var leaseCutoff = ArgumentCaptor.forClass(Instant.class);
+        var queueCutoff = ArgumentCaptor.forClass(Instant.class);
+        verify(repository).findStalledTranscodeCandidates(leaseCutoff.capture(), queueCutoff.capture(),
+                any(), any(Pageable.class));
+        assertEquals(NOW, leaseCutoff.getValue());
+        assertEquals(NOW, queueCutoff.getValue());
+    }
+
+    @Test
+    void filesHeldHere_areExcludedInTheQuery_soALongQueueCannotStarveLostRows() {
+        when(dispatchService.heldIds()).thenReturn(java.util.Set.of(11L, 12L));
+
+        sweeper.sweep(NOW, false);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<java.util.Collection<Long>> held = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(repository).findStalledTranscodeCandidates(any(Instant.class), any(Instant.class),
+                held.capture(), any(Pageable.class));
+        assertEquals(java.util.Set.of(11L, 12L), java.util.Set.copyOf(held.getValue()));
+    }
+
+    @Test
+    void encodeStillRunningPastItsLease_raisesAnError() {
+        // The sweeper never reclaims a file this process holds, so a hung ffmpeg/ffprobe would block
+        // the queue behind it in silence. ERROR is forwarded to Telegram.
+        var captured = attachAppender();
+        when(repository.countEncodesPastLease(NOW.minus(LEASE))).thenReturn(1L);
+
+        sweeper.sweep(NOW, false);
+
+        assertTrue(captured.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR
+                        && e.getFormattedMessage().contains("1 encode(s) still running")),
+                "expected an ERROR naming the stuck encode; captured: " + captured.list);
+    }
+
+    @Test
+    void healthyPool_raisesNoPastLeaseAlarm() {
+        var captured = attachAppender();
+        when(repository.countEncodesPastLease(any(Instant.class))).thenReturn(0L);
+
+        sweeper.sweep(NOW, false);
+
+        assertTrue(captured.list.stream().noneMatch(e -> e.getLevel() == Level.ERROR));
+    }
+
+    // ---------- LOGIC-08: queued is not stalled ----------
+
+    @Test
+    void queuedJobStillHeldHere_isLeftAlone_howeverLongItWaits() {
+        // The review's scenario: several long uploads on a single-width pool; this one has waited
+        // longer than the lease. It must not be re-claimed, re-queued or abandoned — it is waiting.
+        var waiting = row(7L, ContentFile.Status.TRANSCODING, 0);
+        when(repository.findStalledTranscodeCandidates(any(Instant.class), any(Instant.class), any(), any(Pageable.class)))
+                .thenReturn(List.of(waiting));
+        when(dispatchService.isPending(7L)).thenReturn(true);
+
+        var result = sweeper.sweep(NOW, false);
+
+        verify(dispatchService, never()).requeue(anyLong(), any(), any());
+        verify(repository, never()).abandonTranscode(anyLong(), any(), anyString(), any(Instant.class));
+        assertEquals(0, result.redispatched());
+        assertEquals(0, result.abandoned());
+    }
+
+    @Test
+    void encodeRunningHere_isNotReclaimed_evenPastItsLease() {
+        var slow = row(8L, ContentFile.Status.TRANSCODING, 3);
+        when(repository.findStalledTranscodeCandidates(any(Instant.class), any(Instant.class), any(), any(Pageable.class)))
+                .thenReturn(List.of(slow));
+        when(dispatchService.isPending(8L)).thenReturn(true);
+
+        sweeper.sweep(NOW, false);
+
+        // Not even at the attempt cap: this process is still running it.
+        verify(repository, never()).abandonTranscode(anyLong(), any(), anyString(), any(Instant.class));
+        verify(dispatchService, never()).requeue(anyLong(), any(), any());
+    }
+
+    @Test
+    void queueEntryThatIsGone_isRequeued_withoutSpendingAnAttempt() {
+        // Rejected by a full queue, or lost in a restart: nothing here holds it any more.
+        var lostInQueue = row(9L, ContentFile.Status.TRANSCODING, 0);
+        when(repository.findStalledTranscodeCandidates(any(Instant.class), any(Instant.class), any(), any(Pageable.class)))
+                .thenReturn(List.of(lostInQueue));
+        when(dispatchService.isPending(9L)).thenReturn(false);
+        when(dispatchService.requeue(eq(9L), any(Instant.class), any(Instant.class))).thenReturn(true);
+
+        var result = sweeper.sweep(NOW, false);
+
+        verify(dispatchService).requeue(9L, NOW.minus(LEASE), NOW.minus(LOST_AFTER));
+        assertEquals(1, result.redispatched());
+    }
+
+    @Test
+    void crashedPoisonFile_atTheCap_isAbandonedFromTranscoding() {
+        // Attempts count encodes that STARTED, so three real crashes still end the loop.
+        var poison = row(10L, ContentFile.Status.TRANSCODING, 3);
+        when(repository.findStalledTranscodeCandidates(any(Instant.class), any(Instant.class), any(), any(Pageable.class)))
+                .thenReturn(List.of(poison));
+        when(dispatchService.isPending(10L)).thenReturn(false);
+        when(repository.abandonTranscode(eq(10L), eq(ContentFile.Status.TRANSCODING), anyString(),
+                any(Instant.class))).thenReturn(1);
+
+        var result = sweeper.sweep(NOW, false);
+
+        verify(dispatchService, never()).requeue(anyLong(), any(), any());
+        assertEquals(1, result.abandoned());
     }
 
     @Test

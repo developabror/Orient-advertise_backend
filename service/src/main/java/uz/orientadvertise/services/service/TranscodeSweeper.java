@@ -32,8 +32,10 @@ import uz.orientadvertise.services.domain.repository.ContentFileRepository;
  *   <tr><th>Case</th><th>Signal</th><th>Meaning</th></tr>
  *   <tr><td>Lost dispatch</td><td>{@code UPLOADED} older than the grace period</td>
  *       <td>The after-commit dispatch never reached the pool (rejected, or a crash in between)</td></tr>
- *   <tr><td>Crashed encode</td><td>{@code TRANSCODING} with an expired lease</td>
+ *   <tr><td>Crashed encode</td><td>{@code TRANSCODING}, started, lease expired</td>
  *       <td>The process was killed mid-ffmpeg</td></tr>
+ *   <tr><td>Lost queue entry</td><td>{@code TRANSCODING}, never started, no longer queued here</td>
+ *       <td>The queue rejected it, the process restarted, or the task died before starting</td></tr>
  *   <tr><td>Retryable failure</td><td>{@code FAILED} under the attempt cap</td>
  *       <td>ffmpeg errored or hit its timeout; worth another go</td></tr>
  * </table>
@@ -42,7 +44,14 @@ import uz.orientadvertise.services.domain.repository.ContentFileRepository;
  * {@code TRANSCODING} once and does not touch the row again until the terminal state, so
  * {@code updated_at} does not advance during a 15-minute encode — an {@code updated_at}-keyed
  * sweeper would happily start a second ffmpeg on a perfectly healthy, merely slow job. The lease
- * column exists for precisely this reason and is refreshed when the pipeline actually starts.
+ * column exists for precisely this reason, and it is only set when the encode actually starts.
+ *
+ * <p><b>Queued is not stalled (LOGIC-08).</b> The lease used to be stamped at claim time, so a job
+ * waiting behind other encodes on a single-width pool for longer than the lease looked crashed: it
+ * was re-claimed (one attempt each time) and, after three rounds, marked FAILED without ever having
+ * been encoded. Now a claimed job has no lease until it starts, attempts count only encodes that
+ * started, and any row this process still holds (queued or running — {@link
+ * TranscodeDispatchService#isPending}) is skipped however old it is.
  *
  * <p>Every dispatch goes through {@link TranscodeDispatchService}, i.e. through the atomic claim, so
  * a sweep racing a live upload cannot double-start an encode. Attempts are capped so a poison file
@@ -79,8 +88,9 @@ public class TranscodeSweeper {
      *                          long encode would be reclaimed out from under itself.
      * @param failedRetryAfter  cooldown before a FAILED row is retried, so a doomed encode is not
      *                          re-run on every sweep.
-     * @param maxAttempts       total claims allowed per file before it is parked in FAILED for a
-     *                          human. A poison file must not loop forever.
+     * @param maxAttempts       encodes started per file before it is parked in FAILED for a human
+     *                          (queue waits and re-queues cost nothing). A poison file must not
+     *                          loop forever.
      * @param staleAlertAfter   backlog age that counts as an alert-worthy stuck upload; shared with
      *                          {@link TranscodeBacklogHealthIndicator} via the same property.
      */
@@ -147,15 +157,23 @@ public class TranscodeSweeper {
 
         List<ContentFile> lost = contentFileRepository.findLostDispatchCandidates(
                 now.minus(lostDispatchAfter), page);
-        // In boot mode nothing can be legitimately in flight, so the cutoff is "now".
+        // In boot mode nothing can be legitimately in flight, so both cutoffs are "now". A claimed
+        // job that never started gets the same grace as an UPLOADED row before it counts as lost.
         Instant leaseCutoff = bootMode ? now : now.minus(leaseTimeout);
-        List<ContentFile> stalled = contentFileRepository.findExpiredLeaseCandidates(leaseCutoff, page);
+        Instant queueCutoff = bootMode ? now : now.minus(lostDispatchAfter);
+        List<ContentFile> stalled = contentFileRepository.findStalledTranscodeCandidates(
+                leaseCutoff, queueCutoff, dispatchService.heldIds(), page);
         List<ContentFile> retryable = contentFileRepository.findRetryableFailedCandidates(
                 maxAttempts, now.minus(failedRetryAfter), page);
 
         int redispatched = 0;
         int abandoned = 0;
         for (var candidate : concat(lost, stalled, retryable)) {
+            boolean claimed = candidate.getStatus() == ContentFile.Status.TRANSCODING;
+            if (claimed && dispatchService.isPending(candidate.getId())) {
+                // Still queued or running in this process — waiting, not lost (LOGIC-08).
+                continue;
+            }
             if (candidate.getStorageKey() == null) {
                 // Nothing to transcode from — re-dispatching would burn attempts on a dead row.
                 abandoned += abandon(candidate, "No raw storage key — nothing to transcode", now);
@@ -166,10 +184,24 @@ public class TranscodeSweeper {
                         "Abandoned after " + candidate.getTranscodeAttempts() + " transcode attempt(s)", now);
                 continue;
             }
-            if (dispatchService.dispatch(candidate.getId(), candidate.getStatus(), false)) {
+            boolean dispatched = claimed
+                    ? dispatchService.requeue(candidate.getId(), leaseCutoff, queueCutoff)
+                    : dispatchService.dispatch(candidate.getId(), candidate.getStatus(), false);
+            if (dispatched) {
                 log.warn("Re-driving transcode [id={}, from={}, attempts={}]",
                         candidate.getId(), candidate.getStatus(), candidate.getTranscodeAttempts());
                 redispatched++;
+            }
+        }
+
+        if (!bootMode) {
+            // Crashed encodes were just re-queued (their lease is cleared), so whatever is still past
+            // its lease is running here: a hung ffmpeg/ffprobe holding a pool slot. The sweeper never
+            // reclaims a held file, so this is the only place that notices.
+            long pastLease = contentFileRepository.countEncodesPastLease(leaseCutoff);
+            if (pastLease > 0) {
+                log.error("Transcode: {} encode(s) still running after {} — possibly hung; every job "
+                        + "queued behind them waits. Check ffmpeg/ffprobe on the host", pastLease, leaseTimeout);
             }
         }
 
@@ -233,17 +265,17 @@ public class TranscodeSweeper {
      * @param backlog files still in {@code UPLOADED} past the alert threshold — the operator-facing
      *                number, independent of what this particular sweep managed to do about it
      */
-    public record SweepResult(int lostDispatch, int expiredLease, int retryableFailed,
+    public record SweepResult(int lostDispatch, int stalledTranscode, int retryableFailed,
                               int redispatched, int abandoned, long backlog) {
 
         public int total() {
-            return lostDispatch + expiredLease + retryableFailed;
+            return lostDispatch + stalledTranscode + retryableFailed;
         }
 
         @Override
         public String toString() {
-            return "lostDispatch=%d, expiredLease=%d, retryableFailed=%d, redispatched=%d, abandoned=%d, backlog=%d"
-                    .formatted(lostDispatch, expiredLease, retryableFailed, redispatched, abandoned, backlog);
+            return "lostDispatch=%d, stalledTranscode=%d, retryableFailed=%d, redispatched=%d, abandoned=%d, backlog=%d"
+                    .formatted(lostDispatch, stalledTranscode, retryableFailed, redispatched, abandoned, backlog);
         }
     }
 }

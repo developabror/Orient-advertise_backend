@@ -89,4 +89,37 @@ class TranscodeDispatchServiceTest {
 
         verify(repository).claimForTranscode(eq(4L), eq(ContentFile.Status.TRANSCODING), any(Instant.class));
     }
+
+    // ---------- LOGIC-08: requeue of a stalled TRANSCODING row ----------
+
+    @Test
+    void requeueWon_dispatchesOnce_atNormalPriority() {
+        Instant lease = Instant.parse("2026-09-06T11:40:00Z");
+        Instant queue = Instant.parse("2026-09-06T11:55:00Z");
+        when(repository.requeueStalledTranscode(eq(4L), eq(lease), eq(queue), any(Instant.class))).thenReturn(1);
+
+        assertTrue(service.requeue(4L, lease, queue));
+
+        verify(transcoder).transcodeAsync(4L);
+    }
+
+    @Test
+    void requeueLost_dispatchesNothing() {
+        // The CAS re-checks the sweeper's predicate: a task that started in the meantime wins.
+        when(repository.requeueStalledTranscode(eq(4L), any(Instant.class), any(Instant.class), any(Instant.class)))
+                .thenReturn(0);
+
+        assertFalse(service.requeue(4L, Instant.now(), Instant.now()));
+
+        verify(transcoder, never()).transcodeAsync(anyLong());
+        verify(transcoder, never()).transcodeAsyncUrgent(anyLong());
+    }
+
+    @Test
+    void isPending_asksTheTranscoder() {
+        when(transcoder.isPending(5L)).thenReturn(true);
+
+        assertTrue(service.isPending(5L));
+        assertFalse(service.isPending(6L));
+    }
 }
