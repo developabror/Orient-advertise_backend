@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.148`
+`1.0.149`
 
 ## Architecture
 
@@ -1302,6 +1302,28 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Transcoded videos always play on TV boxes: 8-bit 4:2:0 High profile (v1.0.149)
+
+> **VG-01 (review G-11).** ffmpeg was never told the output pixel format or profile, so libx264 kept
+> the source's: a 10-bit clip (the default iPhone HDR recording) became **H.264 High 10**, a 10-bit
+> 4:2:2 ProRes/DNx master became **High 4:2:2**. Both passed every check and showed READY with a
+> thumbnail, but most Android TV hardware decoders cannot play them: that ad slot was black or
+> skipped, and nothing warned anyone. Reproduced locally with real encodes before the fix.
+
+**What changed:** the encode now always adds `-pix_fmt yuv420p -profile:v high`. The level is left to
+x264, which derives it from the actual resolution and frame rate (3.1 for 720p30, 4.2 for 1080p60);
+pinning 4.1 would mislabel 1080p60. Checked on real encodes: 10-bit HEVC, 10-bit 4:2:2 ProRes and a
+1080p60 HLG clip all come out as `High, yuv420p`.
+
+**Not done (follow-up):** HDR tone mapping. An HLG source (the iPhone default) converted to 8-bit
+without tone mapping still plays and looks acceptable, because HLG is designed to degrade gracefully
+on SDR screens; a PQ/HDR10 source would look flat. Files transcoded before v1.0.149 keep their old
+format until someone retranscodes them.
+
+**Tests:** `FFmpegTranscoderTest` (+2 real encodes that run where ffmpeg is installed and are skipped
+elsewhere, + the argument assertions). Mutation-checked: without the two flags the real encodes come
+out `High 10` and `High 4:2:2` again.
 
 ### Dependency updates: Spring Boot 3.5.16 and the libraries with known CVEs (v1.0.148)
 

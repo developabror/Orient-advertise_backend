@@ -357,9 +357,66 @@ class FFmpegTranscoderTest {
         assertEquals("20", args.get(args.indexOf("-crf") + 1));
         assertTrue(args.get(args.indexOf("-vf") + 1).contains("min(1280,iw)"), args.toString());
         assertTrue(args.get(args.indexOf("-vf") + 1).contains("min(720,ih)"), args.toString());
+        // VG-01: always 8-bit 4:2:0 High profile — the only thing TV-box hardware decoders all play.
+        assertEquals("yuv420p", args.get(args.indexOf("-pix_fmt") + 1));
+        assertEquals("high", args.get(args.indexOf("-profile:v") + 1));
+        assertTrue(args.stream().noneMatch("-level"::equals), "the level is x264's to derive: " + args);
         // Explicitly NOT pinned: measured at 136 kB of 431 MB, and x264 already picks these on 1 vCPU.
         assertTrue(args.stream().noneMatch("-threads"::equals), "must not pin -threads: " + args);
         assertTrue(args.stream().noneMatch("-filter_threads"::equals), "must not pin -filter_threads");
+    }
+
+    // ---------- VG-01: real encodes of sources TV boxes can't decode as-is ----------
+
+    /**
+     * Runs the real ffmpeg with the production argument vector on the inputs that used to come out
+     * unplayable: 10-bit (iPhone HDR default) and 10-bit 4:2:2 (ProRes/DNx agency masters). Skipped
+     * where ffmpeg, libx265 or prores_ks is missing (e.g. CI without ffmpeg).
+     */
+    private void assertEncodesToHigh8BitYuv420(String sourceEncoderArgs, @org.junit.jupiter.api.io.TempDir Path dir)
+            throws Exception {
+        Path source = dir.resolve("source.mov");
+        var make = new java.util.ArrayList<>(java.util.List.of("ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc2=size=640x360:rate=30", "-t", "1"));
+        make.addAll(java.util.List.of(sourceEncoderArgs.split(" ")));
+        make.add(source.toString());
+        org.junit.jupiter.api.Assumptions.assumeTrue(run(make) == 0, "ffmpeg or its encoder is not available");
+
+        Path output = dir.resolve("out.mp4");
+        transcoder.runFfmpeg(source, output);
+
+        var probe = new ProcessBuilder("ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=profile,pix_fmt", "-of", "csv=p=0", output.toString())
+                .redirectErrorStream(true).start();
+        String result = new String(probe.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        probe.waitFor();
+        assertEquals("High,yuv420p", result, "must be 8-bit 4:2:0 High profile");
+    }
+
+    private static int run(java.util.List<String> command) {
+        try {
+            var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+            process.getInputStream().readAllBytes();
+            return process.waitFor();
+        } catch (IOException e) {
+            return -1;                                   // no ffmpeg on this machine
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return -1;
+        }
+    }
+
+    @Test
+    void realEncode_tenBitHevcSource_likeAnIphoneHdrClip_becomes8BitHigh(@org.junit.jupiter.api.io.TempDir Path dir)
+            throws Exception {
+        assertEncodesToHigh8BitYuv420("-c:v libx265 -pix_fmt yuv420p10le -x265-params log-level=error "
+                + "-color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc", dir);
+    }
+
+    @Test
+    void realEncode_tenBit422ProresMaster_becomes8BitHigh(@org.junit.jupiter.api.io.TempDir Path dir)
+            throws Exception {
+        assertEncodesToHigh8BitYuv420("-c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le", dir);
     }
 
     // ---------- thumbnails ----------

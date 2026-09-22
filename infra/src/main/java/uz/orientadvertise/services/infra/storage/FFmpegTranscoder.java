@@ -523,6 +523,15 @@ public class FFmpegTranscoder implements Transcoder {
                 .formatted(maxWidth, maxHeight));
         args.add("-c:v");
         args.add("libx264");
+        // 8-bit 4:2:0, High profile: what every TV-box hardware H.264 decoder plays. Without these,
+        // libx264 keeps the source's pixel format, so an iPhone HDR clip (10-bit) became High 10 and
+        // a ProRes/DNx master (4:2:2) became High 4:2:2 — READY in the UI, black on most screens
+        // (VG-01). The level is left to x264, which derives it from the actual resolution and frame
+        // rate; pinning 4.1 would mislabel 1080p60.
+        args.add("-pix_fmt");
+        args.add("yuv420p");
+        args.add("-profile:v");
+        args.add("high");
         args.add("-preset");
         args.add(preset);
         args.add("-crf");
