@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.147`
+`1.0.148`
 
 ## Architecture
 
@@ -44,18 +44,18 @@ Multi-module Spring Boot application with strict architectural layering enforced
 ## Tech Stack
 
 - Java 21
-- Spring Boot 3.4.5
+- Spring Boot 3.5.16
 - Gradle 8.11 (multi-module)
 - PostgreSQL 17 (production)
 - Redis 7 (session/token cache + pub/sub)
 - MinIO (S3-compatible object storage)
-- H2 with PostgreSQL mode (dev/test)
+- H2 with PostgreSQL mode (dev profile and tests only — never in the production jar)
 - Flyway (versioned schema migrations)
 - HikariCP (connection pooling)
 - Lettuce (Redis client with auto-reconnect)
 - JJWT (JWT token creation/validation)
 - Spring Security (stateless JWT authentication)
-- Springdoc OpenAPI 2.7 + Swagger UI (API documentation)
+- Springdoc OpenAPI 2.9 + Swagger UI (API documentation)
 - ArchUnit (architecture tests)
 
 ## Authentication
@@ -1302,6 +1302,59 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Dependency updates: Spring Boot 3.5.16 and the libraries with known CVEs (v1.0.148)
+
+> The 2026-09-18 review's dependency item. Spring Boot 3.4.5 carried Tomcat 10.1.40, which is
+> affected by CVE-2025-48988 (multipart DoS — reachable through the 50 MB upload endpoint) and
+> CVE-2025-52520, plus patch-level Spring Framework and Security fixes.
+
+| Dependency | Was | Now | Why |
+|---|---|---|---|
+| Spring Boot (plugin + BOM) | 3.4.5 | **3.5.16** | Newest 3.x: Spring Framework 6.2.19, Spring Security 6.5.11, Hibernate 6.6.53, Flyway 11.7.2. 4.x is a major migration (Framework 7, Hibernate 7) and was left out on purpose |
+| springdoc-openapi | 2.7.0 | 2.9.1 | Built against Boot 3.5.16 |
+| swagger-annotations | 2.2.25 | 2.2.55 | Same swagger-core as springdoc 2.9.1 |
+| MinIO client | 8.5.14 | 8.6.0 | |
+| Apache POI | 5.3.0 | 5.5.1 | CVE-2025-31672 (read path only here, bumped anyway) |
+| jjwt | 0.12.6 | 0.13.0 | 0.12.7's parser fixes; 0.13.0 adds only a public constructor |
+| ArchUnit (test) | 1.3.0 | 1.5.0 | |
+
+**Security pins on top of Boot 3.5.16.** 3.x is out of open-source support, so even its last BOM
+ships libraries with advisories published since — the Tomcat ones critical (authentication and
+authorization bypasses). An OSV scan of the production jar found 8 affected libraries; each has a
+patch release in the same line, pinned in the root `build.gradle` with the advisory ids beside it:
+
+| Library | Boot 3.5.16 | Pinned | |
+|---|---|---|---|
+| Tomcat (`tomcat.version`) | 10.1.55 | **10.1.60** | 3 critical (GHSA-9xv2-5v5q-p794, -gcx9-497g-6cp6, -h3x4-894j-xpx5); 10.1.58 was never published, 10.1.60 is the newest 10.1.x |
+| Netty (`netty.version`) | 4.1.135 | 4.1.137 | 1 critical, 1 high, 1 moderate (via Lettuce) |
+| BouncyCastle `bcprov-jdk18on` | 1.81 | 1.85 | 2 critical, 1 high, 1 moderate (via MinIO; not in Boot's BOM) |
+| PostgreSQL JDBC | 42.7.11 | 42.7.12 | 1 high |
+| Jackson (`jackson-bom.version`) | 2.21.4 | 2.21.5 | 3 moderate |
+| commons-lang3 | 3.17.0 | 3.18.0 | 1 moderate |
+| Log4j API (`log4j2.version`) | 2.24.3 | 2.25.5 | 1 moderate (SLF4J bridge only) |
+
+After the pins, the same scan reports **no known vulnerabilities in any of the 235 production
+artifacts**. Re-run it before each release and drop a pin once a Boot upgrade overtakes it.
+
+**H2 is no longer in the production jar.** It was `runtimeOnly` in `infra`, so every image shipped
+an embedded database engine it never uses. It is now `testRuntimeOnly` (infra, api) and
+`developmentOnly` in `api`: on the `bootRun` classpath for the `dev` profile, excluded from
+`bootJar`. Checked: the built jar has no `h2-*.jar`, and `./gradlew :api:bootRun
+--args='--spring.profiles.active=dev'` (the README command used to say `:service:bootRun`, which
+does not exist) boots, applies all 52 migrations to H2, and serves `/api/health`.
+
+**One build change was needed:** JUnit 5.12 (via the Boot 3.5 BOM) needs a
+`junit-platform-launcher` of the same version, and Gradle 8.11 otherwise supplies its own, so test
+discovery failed in every library module ("OutputDirectoryProvider not available"). The root build
+now declares `testRuntimeOnly 'org.junit.platform:junit-platform-launcher'` (version from the BOM).
+
+No application code changed. All 2,465 tests pass on the new versions (the real-Tomcat integration
+tests and the opt-in real-Postgres test included), the test log shows no new deprecation warnings,
+and the `dev` profile boots on Tomcat 10.1.60.
+
+**Not changed:** `telegrambots` 6.9.7.1 (the 6.x line is abandoned; moving to 7.x+ is a rewrite of the
+bot integration) and the Gradle wrapper (8.11 supports Boot 3.5).
 
 ### A transcode waiting in the queue is no longer failed as "crashed" (v1.0.147)
 
@@ -5005,8 +5058,9 @@ CORS allowed origins are bound to the configuration property `app.cors.allowed-o
 # Build all modules (start Redis first — see the note above)
 ./gradlew build
 
-# Run with dev profile (requires local Redis + MinIO)
-./gradlew :service:bootRun --args='--spring.profiles.active=dev'
+# Run with dev profile (in-memory H2; requires local Redis + MinIO). H2 is a developmentOnly
+# dependency: on the bootRun classpath, never in the production jar.
+./gradlew :api:bootRun --args='--spring.profiles.active=dev'
 
 # Run tests only
 ./gradlew test

@@ -1,12 +1,12 @@
 plugins {
     id 'java'
-    id 'org.springframework.boot' version '3.4.5' apply false
+    id 'org.springframework.boot' version '3.5.16' apply false
     id 'io.spring.dependency-management' version '1.1.7' apply false
 }
 
 allprojects {
     group = 'uz.orientadvertise.services'
-    version = '1.0.147'
+    version = '1.0.148'
 }
 
 subprojects {
@@ -30,14 +30,35 @@ subprojects {
         mavenCentral()
     }
 
+    // Spring Boot 3.x is out of open-source support, so its BOM no longer moves. Patch releases
+    // with security fixes published after 3.5.16 are pinned here; the dependency-management plugin
+    // applies project properties to every imported BOM (including the one the Boot plugin adds to
+    // :api). Checked against the OSV database on 2026-09-22 — re-check before each release, and
+    // drop a pin once the Boot version it overrides catches up.
+    ext['tomcat.version'] = '10.1.60'            // GHSA-9xv2-5v5q-p794, -gcx9-497g-6cp6, -h3x4-894j-xpx5
+    ext['netty.version'] = '4.1.137.Final'       // GHSA-c4c3-7fpv-j4q5, -fccg-mwvh-qqg4, -558v-64gr-wgg4
+    ext['jackson-bom.version'] = '2.21.5'        // GHSA-5gvw-p9qm-jgwh, -5jmj-h7xm-6q6v, -mhm7-754m-9p8w
+    ext['postgresql.version'] = '42.7.12'        // GHSA-j92g-9f8w-j867
+    ext['commons-lang3.version'] = '3.18.0'      // GHSA-j288-q9x7-2f5v
+    ext['log4j2.version'] = '2.25.5'             // GHSA-qv9r-c865-cp47 (log4j-api, via the SLF4J bridge)
+
     dependencyManagement {
         imports {
-            mavenBom "org.springframework.boot:spring-boot-dependencies:3.4.5"
+            mavenBom "org.springframework.boot:spring-boot-dependencies:3.5.16"
+        }
+        dependencies {
+            // Arrives through the MinIO client; not in Boot's BOM.
+            // GHSA-574f-3g2m-x479, -9pwp-9qqc-pr26, -c3fc-8qff-9hwx, -qp49-qgx5-5m26
+            dependency 'org.bouncycastle:bcprov-jdk18on:1.85'
         }
     }
 
     dependencies {
         testImplementation 'org.springframework.boot:spring-boot-starter-test'
+        // JUnit 5.12+ (Boot 3.5) needs a launcher of the same version; without this Gradle supplies
+        // its own and discovery fails ("OutputDirectoryProvider not available"). The version comes
+        // from the Boot BOM. The api module got one from the Boot plugin; the library modules didn't.
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     }
 
     test {
