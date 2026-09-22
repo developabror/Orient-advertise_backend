@@ -20,6 +20,7 @@ import org.springframework.web.bind.annotation.RestController;
 import uz.orientadvertise.services.api.security.ClientIp;
 import uz.orientadvertise.services.service.PasswordResetRateLimiter;
 import uz.orientadvertise.services.service.PasswordService;
+import uz.orientadvertise.services.domain.auth.PasswordPolicy;
 
 /**
  * Public, unauthenticated password recovery — lives under {@code /api/auth/**} (already
@@ -98,7 +99,7 @@ public class PasswordResetController {
 
     public record ResetPasswordRequest(
             @NotBlank String token,
-            @NotBlank @Size(min = 8, max = 200) String newPassword,
+            @NotBlank @Size(min = PasswordPolicy.MIN_LENGTH, max = PasswordPolicy.MAX_BYTES) String newPassword,
             @NotBlank String confirmPassword) {}
 
     public record ValidateTokenResponse(boolean valid) {}

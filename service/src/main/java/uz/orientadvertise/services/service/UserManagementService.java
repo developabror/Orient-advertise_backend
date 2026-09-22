@@ -11,6 +11,7 @@ import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.domain.auth.Role;
 import uz.orientadvertise.services.domain.model.AppUser;
 import uz.orientadvertise.services.domain.repository.AppUserRepository;
+import uz.orientadvertise.services.domain.auth.PasswordPolicy;
 
 /**
  * Admin-only user lifecycle: create, delete (with access cascade).
@@ -74,8 +75,8 @@ public class UserManagementService {
         if (username == null || username.isBlank()) {
             throw new IllegalArgumentException("Username is required");
         }
-        if (password == null || password.length() < 6) {
-            throw new IllegalArgumentException("Password must be at least 6 characters");
+        if (!PasswordPolicy.hasValidLength(password)) {
+            throw new IllegalArgumentException(PasswordPolicy.LENGTH_MESSAGE);
         }
         if (role == null) {
             throw new IllegalArgumentException("Role is required");

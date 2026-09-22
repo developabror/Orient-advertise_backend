@@ -18,6 +18,7 @@ import uz.orientadvertise.services.domain.notification.PasswordMailSender;
 import uz.orientadvertise.services.domain.repository.AppUserRepository;
 import uz.orientadvertise.services.infra.auth.PasswordResetTokenRepository;
 import uz.orientadvertise.services.infra.auth.RefreshTokenRepository;
+import uz.orientadvertise.services.domain.auth.PasswordPolicy;
 
 /**
  * Self-service password management: authenticated change, unauthenticated forgot/reset, and
@@ -34,8 +35,6 @@ import uz.orientadvertise.services.infra.auth.RefreshTokenRepository;
 public class PasswordService {
 
     private static final Logger log = LoggerFactory.getLogger(PasswordService.class);
-    private static final int MIN_LEN = 8;
-    private static final int MAX_LEN = 200;
     /** Identical generic message on every invalid/expired/used/missing token path (no leaks). */
     private static final String INVALID_TOKEN_MSG = "This reset link is invalid or has expired. Request a new one.";
 
@@ -168,8 +167,8 @@ public class PasswordService {
 
     /** Belt-and-suspenders server-side policy (DTO {@code @Size}/{@code @NotBlank} is the first gate). */
     private void validateNewPassword(String newPassword, String confirmPassword) {
-        if (newPassword == null || newPassword.length() < MIN_LEN || newPassword.length() > MAX_LEN) {
-            throw new IllegalArgumentException("New password must be between 8 and 200 characters.");
+        if (!PasswordPolicy.hasValidLength(newPassword)) {
+            throw new IllegalArgumentException(PasswordPolicy.LENGTH_MESSAGE);
         }
         if (!newPassword.equals(confirmPassword)) {
             throw new IllegalArgumentException("Passwords do not match.");

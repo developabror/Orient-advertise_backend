@@ -60,7 +60,7 @@ class RetentionCleanupServiceTest {
         selfField.setAccessible(true);
         selfField.set(service, service);
 
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(List.of());
         when(playbackLogRepository.findIdsOlderThan(any(), any()))
                 .thenReturn(List.of());
@@ -108,7 +108,7 @@ class RetentionCleanupServiceTest {
 
     @Test
     void runCleanup_singleBatchEachTable() {
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(List.of(1L, 2L, 3L))
                 .thenReturn(List.of());
         when(playbackLogRepository.findIdsOlderThan(any(), any()))
@@ -134,7 +134,7 @@ class RetentionCleanupServiceTest {
         List<Long> full1 = ids(1, 1000);
         List<Long> full2 = ids(1001, 2000);
         List<Long> partial = ids(2001, 2250);
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(full1)
                 .thenReturn(full2)
                 .thenReturn(partial)
@@ -144,7 +144,7 @@ class RetentionCleanupServiceTest {
 
         assertEquals(2250, result.eventsDeleted());
         // Drains until size < batchSize → 3 calls (full, full, partial), no 4th.
-        verify(eventRepository, times(3)).findExpiredIdsSkippingOpenIncidents(any(), any());
+        verify(eventRepository, times(3)).findExpiredIdsNotReferencedByIncidents(any(), any());
         verify(eventRepository, times(3)).deleteAllByIdInBatch(anyList());
     }
 
@@ -194,13 +194,13 @@ class RetentionCleanupServiceTest {
         properties.setBatchSize(1);                 // 1 row per batch keeps the test cheap
         properties.setMaxBatchesPerRun(5000);
         var remaining = new AtomicInteger(150);     // > the old cap of 100
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenAnswer(inv -> remaining.getAndDecrement() > 0 ? List.of(1L) : List.of());
 
         var result = service.runCleanup();
 
         assertEquals(150, result.eventsDeleted(), "the drain must not stop at 100 batches");
-        verify(eventRepository, times(151)).findExpiredIdsSkippingOpenIncidents(any(), any());
+        verify(eventRepository, times(151)).findExpiredIdsNotReferencedByIncidents(any(), any());
     }
 
     /**
@@ -218,14 +218,14 @@ class RetentionCleanupServiceTest {
         // without the test waiting a minute.
         properties.setMaxRunDuration(Duration.ZERO);
         properties.setMaxBatchesPerRun(5);          // a broken budget check ⇒ 5 batches, not 1
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(List.of(1L, 2L));
         var appender = attachAppender();
 
         var result = service.runCleanup();
 
         assertEquals(2, result.eventsDeleted(), "exactly one batch fits in a zero budget");
-        verify(eventRepository, times(1)).findExpiredIdsSkippingOpenIncidents(any(), any());
+        verify(eventRepository, times(1)).findExpiredIdsNotReferencedByIncidents(any(), any());
         // The backlog must be visible, and at INFO: an unfinished table is routine, and WARN
         // reaches Telegram.
         var stop = appender.list.stream()
@@ -258,7 +258,7 @@ class RetentionCleanupServiceTest {
 
     @Test
     void runCleanup_eventBatchFailure_doesNotPreventPlaybackCleanup() {
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenThrow(new RuntimeException("DB hiccup on first event batch"));
         when(playbackLogRepository.findIdsOlderThan(any(), any()))
                 .thenReturn(List.of(99L))
@@ -277,7 +277,7 @@ class RetentionCleanupServiceTest {
 
     @Test
     void deleteExpiredEventBatch_emptyList_returnsZeroAndDoesNotCallDelete() {
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(List.of());
         int deleted = service.deleteExpiredEventBatch(Instant.now());
         assertEquals(0, deleted);
@@ -290,7 +290,7 @@ class RetentionCleanupServiceTest {
 
         service.deleteExpiredEventBatch(Instant.now());
 
-        verify(eventRepository).findExpiredIdsSkippingOpenIncidents(any(),
+        verify(eventRepository).findExpiredIdsNotReferencedByIncidents(any(),
                 eq(PageRequest.of(0, 250)));
     }
 
@@ -304,7 +304,7 @@ class RetentionCleanupServiceTest {
 
     private Instant captureEventThreshold() {
         var captor = org.mockito.ArgumentCaptor.forClass(Instant.class);
-        verify(eventRepository, atLeast(1)).findExpiredIdsSkippingOpenIncidents(captor.capture(), any());
+        verify(eventRepository, atLeast(1)).findExpiredIdsNotReferencedByIncidents(captor.capture(), any());
         return captor.getValue();
     }
 
@@ -390,7 +390,7 @@ class RetentionCleanupServiceTest {
     void auditDrainFailure_doesNotAbortTheRun() {
         // A failure draining one table must not cost the deletes already committed for the others —
         // each batch runs in its own transaction precisely so partial progress sticks.
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(List.of(9L));
         when(auditLogRepository.findIdsOlderThan(any(), any()))
                 .thenThrow(new RuntimeException("db blip"));
@@ -405,7 +405,7 @@ class RetentionCleanupServiceTest {
     @Test
     void skippedRun_touchesNoTableAndReportsZeroForAllThree() {
         properties.setGuardWindow(true);
-        when(eventRepository.findExpiredIdsSkippingOpenIncidents(any(), any()))
+        when(eventRepository.findExpiredIdsNotReferencedByIncidents(any(), any()))
                 .thenReturn(List.of(1L));        // would be deleted if the guard let the run through
         Instant noonUtc = ZonedDateTime.of(2026, 5, 6, 12, 0, 0, 0, ZoneId.of("UTC")).toInstant();
 
@@ -417,7 +417,7 @@ class RetentionCleanupServiceTest {
         assertEquals(0, result.eventsDeleted());
         assertEquals(0, result.playbackLogsDeleted());
         assertEquals(0, result.auditLogsDeleted());
-        verify(eventRepository, never()).findExpiredIdsSkippingOpenIncidents(any(), any());
+        verify(eventRepository, never()).findExpiredIdsNotReferencedByIncidents(any(), any());
         verify(playbackLogRepository, never()).findIdsOlderThan(any(), any());
         verify(auditLogRepository, never()).findIdsOlderThan(any(), any());
     }

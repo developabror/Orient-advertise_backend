@@ -14,6 +14,7 @@ import jakarta.persistence.Table;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -84,36 +85,77 @@ public class Schedule {
     }
 
     /**
-     * Expand this schedule into concrete time windows up to a horizon.
-     * For NONE, returns the single window. For repeating, generates occurrences.
+     * Hard cap on the windows one expansion returns (LOGIC-12). Inputs are validated since
+     * v1.0.146, but rows saved before that were not — a DAILY schedule from year 1 to 9999 is
+     * millions of windows — and a GET of such a row must not be able to exhaust the heap.
      */
+    public static final int MAX_OCCURRENCES = 1_000;
+
+    /** {@link #expandOccurrences(Instant, Instant)} from the schedule's own start. */
     public List<TimeWindow> expandOccurrences(Instant horizon) {
+        return expandOccurrences(startTimeUtc, horizon);
+    }
+
+    /**
+     * The occurrences that are still running or yet to come at {@code from} (end after
+     * {@code from}) and start before {@code horizon} and {@code repeatEndUtc}, oldest first, at most
+     * {@link #MAX_OCCURRENCES}. NONE always returns its single window.
+     *
+     * <p>Occurrence {@code n} is computed from the original start ({@code start + n periods}), not by
+     * stepping from the previous one, so the first relevant occurrence is found without walking the
+     * schedule's whole history, and MONTHLY keeps its day: Jan 31 → Feb 28 → Mar 31 (stepping
+     * drifted to Mar 28 and stayed there).
+     */
+    public List<TimeWindow> expandOccurrences(Instant from, Instant horizon) {
         var windows = new ArrayList<TimeWindow>();
         var duration = Duration.between(startTimeUtc, endTimeUtc);
-        var limit = repeatEndUtc != null && repeatEndUtc.isBefore(horizon) ? repeatEndUtc : horizon;
 
         if (repeatType == RepeatType.NONE) {
             windows.add(new TimeWindow(startTimeUtc, endTimeUtc));
             return windows;
         }
 
-        var currentStart = startTimeUtc;
-        while (currentStart.isBefore(limit)) {
-            var currentEnd = currentStart.plus(duration);
-            windows.add(new TimeWindow(currentStart, currentEnd));
-            currentStart = advanceByRepeatType(currentStart);
+        var limit = repeatEndUtc != null && repeatEndUtc.isBefore(horizon) ? repeatEndUtc : horizon;
+        for (long n = firstRelevantIndex(from.minus(duration)); windows.size() < MAX_OCCURRENCES; n++) {
+            var start = occurrenceStart(n);
+            if (!start.isBefore(limit)) {
+                break;
+            }
+            var end = start.plus(duration);
+            if (end.isAfter(from)) {
+                windows.add(new TimeWindow(start, end));
+            }
         }
-
         return windows;
     }
 
-    private Instant advanceByRepeatType(Instant from) {
-        var dateTime = from.atZone(ZoneOffset.UTC);
+    /**
+     * An index at or below the first occurrence starting after {@code endedBy} (every earlier one
+     * has already ended). {@code between} truncates, so one step back keeps it a lower bound; the
+     * loop above skips the at most two occurrences that are already over.
+     */
+    private long firstRelevantIndex(Instant endedBy) {
+        if (!endedBy.isAfter(startTimeUtc)) {
+            return 0;
+        }
+        var anchor = startTimeUtc.atZone(ZoneOffset.UTC);
+        var target = endedBy.atZone(ZoneOffset.UTC);
+        long n = switch (repeatType) {
+            case DAILY -> ChronoUnit.DAYS.between(anchor, target);
+            case WEEKLY -> ChronoUnit.WEEKS.between(anchor, target);
+            case MONTHLY -> ChronoUnit.MONTHS.between(anchor, target);
+            case NONE -> 0;
+        };
+        return Math.max(0, n - 1);
+    }
+
+    private Instant occurrenceStart(long n) {
+        var anchor = startTimeUtc.atZone(ZoneOffset.UTC);
         return switch (repeatType) {
-            case DAILY -> dateTime.plusDays(1).toInstant();
-            case WEEKLY -> dateTime.plusWeeks(1).toInstant();
-            case MONTHLY -> dateTime.plusMonths(1).toInstant();
-            case NONE -> Instant.MAX;
+            case DAILY -> anchor.plusDays(n).toInstant();
+            case WEEKLY -> anchor.plusWeeks(n).toInstant();
+            case MONTHLY -> anchor.plusMonths(n).toInstant();
+            case NONE -> startTimeUtc;
         };
     }
 

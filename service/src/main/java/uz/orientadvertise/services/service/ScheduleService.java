@@ -1,5 +1,6 @@
 package uz.orientadvertise.services.service;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -49,7 +50,7 @@ public class ScheduleService implements ScheduleEvaluator {
                                           Instant endTimeUtc, RepeatType repeatType,
                                           Instant repeatEndUtc) {
         assertAssignmentInScope(assignment);
-        rejectIfWindowEntirelyInPast(startTimeUtc, endTimeUtc, repeatType, repeatEndUtc);
+        validateWindow(startTimeUtc, endTimeUtc, repeatType, repeatEndUtc);
 
         var schedule = new Schedule(assignment, startTimeUtc, endTimeUtc, repeatType, repeatEndUtc);
         var warnings = detectOverlaps(assignment.getId(), schedule);
@@ -77,8 +78,8 @@ public class ScheduleService implements ScheduleEvaluator {
     }
 
     /**
-     * Replace the time window of an existing schedule. Validation parity with create:
-     * the (possibly repeating) window must not be entirely in the past.
+     * Replace the time window of an existing schedule. Validation parity with create
+     * ({@link #validateWindow}).
      */
     @Transactional
     public Schedule update(Long scheduleId, Instant startTimeUtc, Instant endTimeUtc,
@@ -87,7 +88,7 @@ public class ScheduleService implements ScheduleEvaluator {
                 .orElseThrow(() -> new ResourceNotFoundException("Schedule", scheduleId));
         assertAssignmentInScope(existing.getAssignment());
 
-        rejectIfWindowEntirelyInPast(startTimeUtc, endTimeUtc, repeatType, repeatEndUtc);
+        validateWindow(startTimeUtc, endTimeUtc, repeatType, repeatEndUtc);
 
         // Schedule has no setters for the time fields; rather than introduce mutators
         // that complicate invariants, soft-delete the old row and create a fresh one
@@ -98,12 +99,47 @@ public class ScheduleService implements ScheduleEvaluator {
         return scheduleRepository.save(replacement);
     }
 
-    private void rejectIfWindowEntirelyInPast(Instant startTimeUtc, Instant endTimeUtc,
-                                               RepeatType repeatType, Instant repeatEndUtc) {
+    /**
+     * LOGIC-12: nothing used to check the window's shape, and expansion walked every occurrence
+     * from the start, so a DAILY schedule from year 1 was ~740k windows on every create and every
+     * evaluation — an operator-triggered CPU/heap exhaustion. Expansion is now arithmetic and capped
+     * ({@link Schedule#expandOccurrences(Instant, Instant)}); this rejects the shapes that were
+     * never meaningful:
+     * <ul>
+     *   <li>an end at or before the start (a zero or negative window);</li>
+     *   <li>a repeating window longer than its repeat interval, which overlaps its own next
+     *       occurrence (MONTHLY uses 28 days, the shortest month);</li>
+     *   <li>a repeat end at or before the start (no occurrence at all);</li>
+     *   <li>a window, or repeat horizon, entirely in the past.</li>
+     * </ul>
+     */
+    private static void validateWindow(Instant startTimeUtc, Instant endTimeUtc,
+                                       RepeatType repeatType, Instant repeatEndUtc) {
+        if (startTimeUtc == null || endTimeUtc == null) {
+            throw new InvalidUploadException("Schedule start and end times are required");
+        }
+        if (!endTimeUtc.isAfter(startTimeUtc)) {
+            throw new InvalidUploadException("Schedule end time must be after its start time");
+        }
+        if (repeatType != null && repeatType != RepeatType.NONE) {
+            Duration interval = switch (repeatType) {
+                case DAILY -> Duration.ofDays(1);
+                case WEEKLY -> Duration.ofDays(7);
+                case MONTHLY -> Duration.ofDays(28);
+                case NONE -> throw new IllegalStateException("unreachable");
+            };
+            if (Duration.between(startTimeUtc, endTimeUtc).compareTo(interval) > 0) {
+                throw new InvalidUploadException("A " + repeatType + " schedule's window can be at most "
+                        + interval.toDays() + " day(s) long; a longer one overlaps its own next occurrence");
+            }
+            if (repeatEndUtc != null && !repeatEndUtc.isAfter(startTimeUtc)) {
+                throw new InvalidUploadException("Schedule repeat end must be after its start time");
+            }
+        }
         var now = Instant.now();
         // For non-repeating: end must not be in the past.
         if (repeatType == null || repeatType == RepeatType.NONE) {
-            if (endTimeUtc != null && !endTimeUtc.isAfter(now)) {
+            if (!endTimeUtc.isAfter(now)) {
                 throw new InvalidUploadException(
                         "Schedule end time must be in the future, got: " + endTimeUtc);
             }
@@ -122,8 +158,8 @@ public class ScheduleService implements ScheduleEvaluator {
             return false;
         }
 
-        var horizon = atTimeUtc.plusSeconds(1);
-        return schedule.expandOccurrences(horizon).stream()
+        // From atTimeUtc: only the occurrences still running then, not the schedule's whole history.
+        return schedule.expandOccurrences(atTimeUtc, atTimeUtc.plusSeconds(1)).stream()
                 .anyMatch(w -> !atTimeUtc.isBefore(w.start()) && atTimeUtc.isBefore(w.end()));
     }
 
@@ -131,33 +167,51 @@ public class ScheduleService implements ScheduleEvaluator {
         var warnings = new ArrayList<OverlapWarning>();
         var existing = scheduleRepository.findByAssignmentIdAndDeletedAtIsNull(assignmentId);
 
+        // Compare from now (or the new schedule's start, if later): windows already over can't
+        // conflict, and a repeating schedule may start in the past — expanding it from its start
+        // would spend the whole MAX_OCCURRENCES budget on history and miss every future overlap.
+        var now = Instant.now();
+        var from = newSchedule.getStartTimeUtc().isAfter(now) ? newSchedule.getStartTimeUtc() : now;
+        var firstEnd = newSchedule.getEndTimeUtc();
         var horizon = newSchedule.getRepeatEndUtc() != null
                 ? newSchedule.getRepeatEndUtc()
-                : newSchedule.getEndTimeUtc().plusSeconds(86400 * 90); // 90 day horizon for repeating
+                : (firstEnd.isAfter(from) ? firstEnd : from).plus(Duration.ofDays(90)); // 90 days past what's left
 
-        var newWindows = newSchedule.expandOccurrences(horizon);
+        var newWindows = newSchedule.expandOccurrences(from, horizon);
 
         for (var existingSchedule : existing) {
-            var existingWindows = existingSchedule.expandOccurrences(horizon);
-
-            for (var nw : newWindows) {
-                for (var ew : existingWindows) {
-                    if (nw.overlaps(ew)) {
-                        warnings.add(new OverlapWarning(
-                                existingSchedule.getId(),
-                                nw,
-                                ew
-                        ));
-                        break; // One overlap per existing schedule is enough for the warning
-                    }
-                }
-                if (!warnings.isEmpty() && java.util.Objects.equals(warnings.getLast().existingScheduleId(), existingSchedule.getId())) {
-                    break; // Already warned about this existing schedule
-                }
+            var existingWindows = existingSchedule.expandOccurrences(from, horizon);
+            var overlap = firstOverlap(newWindows, existingWindows);
+            if (overlap != null) {
+                // One overlap per existing schedule is enough for the warning.
+                warnings.add(new OverlapWarning(existingSchedule.getId(), overlap[0], overlap[1]));
             }
         }
 
         return warnings;
+    }
+
+    /**
+     * The first overlapping pair, or {@code null}. Both lists come from
+     * {@link Schedule#expandOccurrences(Instant, Instant)}: sorted by start and, with one fixed length
+     * per schedule, by end too — so a merge walk is enough, O(n + m) instead of every pair.
+     */
+    private static TimeWindow[] firstOverlap(List<TimeWindow> a, List<TimeWindow> b) {
+        int i = 0;
+        int j = 0;
+        while (i < a.size() && j < b.size()) {
+            var x = a.get(i);
+            var y = b.get(j);
+            if (x.overlaps(y)) {
+                return new TimeWindow[] {x, y};
+            }
+            if (!x.end().isAfter(y.start())) {
+                i++;        // x is over before y starts
+            } else {
+                j++;        // y is over before x starts
+            }
+        }
+        return null;
     }
 
     public record ScheduleResult(Schedule schedule, List<OverlapWarning> warnings) {

@@ -55,9 +55,11 @@ public record ScheduleDetail(
     }
 
     /**
-     * Reuses {@link Schedule#expandOccurrences(Instant)} — same expansion the overlap
+     * Reuses {@link Schedule#expandOccurrences(Instant, Instant)} — same expansion the overlap
      * detector uses, so a schedule that does not collide with any other on creation will
-     * never disagree with this projection on what the next occurrence is.
+     * never disagree with this projection on what the next occurrence is. Expanding from
+     * {@code now} (not the schedule's start) keeps a long-running schedule's GET to a couple of
+     * windows instead of its whole history (LOGIC-12).
      *
      * <p>The filter {@code start.isAfter(currentEnd) || start.equals(currentEnd)} is the
      * implementation of "next start, not the current one": it skips a window whose
@@ -65,7 +67,7 @@ public record ScheduleDetail(
      */
     private static Instant computeNextOccurrence(Schedule s, Instant now) {
         Instant horizon = pickHorizon(s, now);
-        return s.expandOccurrences(horizon).stream()
+        return s.expandOccurrences(now, horizon).stream()
                 .filter(w -> {
                     boolean isCurrent = !w.start().isAfter(now) && now.isBefore(w.end());
                     boolean startsInFuture = !w.start().isBefore(now);

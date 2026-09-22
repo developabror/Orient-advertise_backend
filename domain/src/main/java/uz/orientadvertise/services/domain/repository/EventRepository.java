@@ -33,18 +33,21 @@ public interface EventRepository extends JpaRepository<Event, Long> {
                               Pageable pageable);
 
     /**
-     * Retention-cleanup helper. Returns ids of events older than {@code threshold} that
-     * are NOT referenced by any non-RESOLVED incident — those are safe to delete.
-     * An event is "linked" if it's the {@code firstEvent} or {@code lastEvent} of an
-     * incident; we keep the linked event row so the incident's audit trail stays intact.
+     * Retention-cleanup helper. Returns ids of events older than {@code threshold} that no
+     * incident references as its {@code firstEvent} or {@code lastEvent} — those are safe to
+     * delete. A referenced event is kept for as long as its incident exists, whatever the
+     * incident's status: {@code incident.first_event_id}/{@code last_event_id} are plain
+     * foreign keys (no {@code ON DELETE}) and incidents are never deleted, so deleting the event
+     * of a RESOLVED incident fails the whole batch. Skipping only open incidents (DATA-03) made
+     * that batch the first one every night — ordering is {@code id ASC} — so event retention
+     * stopped for good ~90 days after the first resolved incident.
      */
     @Query("SELECT e.id FROM Event e WHERE e.occurredAt < :threshold " +
            "AND NOT EXISTS (SELECT 1 FROM Incident i WHERE " +
-           "(i.firstEvent.id = e.id OR i.lastEvent.id = e.id) " +
-           "AND i.status <> 'RESOLVED') " +
+           "i.firstEvent.id = e.id OR i.lastEvent.id = e.id) " +
            "ORDER BY e.id ASC")
-    List<Long> findExpiredIdsSkippingOpenIncidents(@Param("threshold") Instant threshold,
-                                                    Pageable pageable);
+    List<Long> findExpiredIdsNotReferencedByIncidents(@Param("threshold") Instant threshold,
+                                                       Pageable pageable);
 
     @Query("SELECT COUNT(e) FROM Event e WHERE " +
            "(:facilityId IS NULL OR e.device.facility.id = :facilityId) AND " +

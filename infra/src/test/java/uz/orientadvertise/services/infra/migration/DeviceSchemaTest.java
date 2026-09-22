@@ -14,6 +14,7 @@ import org.springframework.test.context.ActiveProfiles;
 import uz.orientadvertise.services.infra.TestApplication;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @SpringBootTest(classes = TestApplication.class)
@@ -54,18 +55,37 @@ class DeviceSchemaTest {
         }, "Duplicate serial_number among non-deleted devices must be blocked");
     }
 
+    /**
+     * G-6 (V50): a soft-deleted device must not block its serial. It used to — the box behind an
+     * admin-deleted device got a 500 from /register on every boot, forever.
+     */
     @Test
-    void serialNumber_remainsUniqueEvenAfterSoftDelete() throws Exception {
+    void serialNumber_ofSoftDeletedDevice_canBeRegisteredAgain() throws Exception {
         try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
             stmt.execute("INSERT INTO device (region_id, serial_number, name, status, created_at, updated_at, deleted_at) VALUES (100, 'SN-REUSE', 'D1', 'OFFLINE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            stmt.execute("INSERT INTO device (region_id, serial_number, name, status, created_at, updated_at) VALUES (100, 'SN-REUSE', 'D2', 'ONLINE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+
+            try (var rs = stmt.executeQuery("SELECT COUNT(*) FROM device WHERE serial_number = 'SN-REUSE'")) {
+                rs.next();
+                assertEquals(2, rs.getInt(1), "the deleted row keeps its serial for history");
+            }
+        }
+    }
+
+    @Test
+    void serialNumber_deletingTheLiveDevice_frees_andADeletedDuplicateCannotComeBackAlive() throws Exception {
+        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("INSERT INTO device (id, region_id, serial_number, name, status, created_at, updated_at) VALUES (501, 100, 'SN-CYCLE', 'D1', 'ONLINE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            stmt.execute("UPDATE device SET deleted_at = CURRENT_TIMESTAMP WHERE id = 501");
+            stmt.execute("INSERT INTO device (id, region_id, serial_number, name, status, created_at, updated_at) VALUES (502, 100, 'SN-CYCLE', 'D2', 'ONLINE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
         }
 
-        // serial_number is globally unique at DB level — even soft-deleted records hold the constraint
+        // Un-deleting 501 would make two live devices with one serial — the rule still holds.
         assertThrows(SQLException.class, () -> {
             try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
-                stmt.execute("INSERT INTO device (region_id, serial_number, name, status, created_at, updated_at) VALUES (100, 'SN-REUSE', 'D2', 'ONLINE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+                stmt.execute("UPDATE device SET deleted_at = NULL WHERE id = 501");
             }
-        }, "Serial number must remain globally unique even with soft-deleted records");
+        }, "Two live devices must never share a serial");
     }
 
     @Test

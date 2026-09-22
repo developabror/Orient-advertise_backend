@@ -34,6 +34,7 @@ import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.service.AdvertiserContentService;
 import uz.orientadvertise.services.service.OperatorContentService;
 import uz.orientadvertise.services.service.UserManagementService;
+import uz.orientadvertise.services.domain.auth.PasswordPolicy;
 
 /**
  * Admin-only user lifecycle and advertiser-content link/unlink endpoints.
@@ -220,7 +221,7 @@ public class UserController {
 
     public record CreateUserRequest(
             @NotBlank @Size(min = 3, max = 100) String username,
-            @NotBlank @Size(min = 6, max = 200) String password,
+            @NotBlank @Size(min = PasswordPolicy.MIN_LENGTH, max = PasswordPolicy.MAX_BYTES) String password,
             @NotNull Role role,
             // Optional recovery email (the FE create-user modal already collects it). Validated
             // only when present; null/blank means "no email".

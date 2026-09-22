@@ -89,6 +89,39 @@ class UserManagementServiceTest {
                 service.create("alice", "abc", Role.ADVERTISER, null));
     }
 
+    // AUTH-08: creation used to accept 6 characters while change/reset required 8.
+    @Test
+    void create_sevenCharacterPassword_isRejected_likeChangeAndReset() {
+        assertThrows(IllegalArgumentException.class, () ->
+                service.create("alice", "seven77", Role.ADVERTISER, null));
+    }
+
+    @Test
+    void create_eightCharacterPassword_isAccepted() {
+        when(userRepository.save(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var user = service.create("alice", "eight888", Role.ADVERTISER, null);
+
+        assertEquals("alice", user.getUsername());
+    }
+
+    // bcrypt reads at most 72 bytes and the encoder throws past that — reject it up front.
+    @Test
+    void create_passwordOverBcryptsSeventyTwoBytes_isRejected() {
+        assertThrows(IllegalArgumentException.class, () ->
+                service.create("alice", "x".repeat(73), Role.ADVERTISER, null));
+        // 37 Cyrillic letters: under 72 characters, but 74 bytes.
+        assertThrows(IllegalArgumentException.class, () ->
+                service.create("alice", "ж".repeat(37), Role.ADVERTISER, null));
+    }
+
+    @Test
+    void create_passwordOfExactlySeventyTwoBytes_isAccepted() {
+        when(userRepository.save(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        assertEquals("alice", service.create("alice", "x".repeat(72), Role.ADVERTISER, null).getUsername());
+    }
+
     @Test
     void create_nullRole_throws400() {
         assertThrows(IllegalArgumentException.class, () ->

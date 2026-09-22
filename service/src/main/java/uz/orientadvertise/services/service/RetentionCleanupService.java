@@ -160,7 +160,7 @@ public class RetentionCleanupService {
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public int deleteExpiredEventBatch(Instant threshold) {
-        List<Long> ids = eventRepository.findExpiredIdsSkippingOpenIncidents(
+        List<Long> ids = eventRepository.findExpiredIdsNotReferencedByIncidents(
                 threshold, PageRequest.of(0, properties.getBatchSize()));
         if (ids.isEmpty()) return 0;
         eventRepository.deleteAllByIdInBatch(ids);

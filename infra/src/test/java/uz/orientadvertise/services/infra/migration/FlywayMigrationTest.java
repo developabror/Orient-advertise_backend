@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class FlywayMigrationTest {
 
     /** Total applied migrations: V1..V48 inclusive (V36 is the Java migration). */
-    private static final int EXPECTED_MIGRATIONS = 48;
+    private static final int EXPECTED_MIGRATIONS = 51;
 
     @Autowired
     private DataSource dataSource;
@@ -45,8 +45,8 @@ class FlywayMigrationTest {
         MigrationInfo[] applied = info.applied();
 
         assertNotNull(applied);
-        // Bump on EVERY new migration. The count includes the Java migration V36 (there is no
-        // V36__*.sql on disk), and the loop pins the versions as a contiguous 1..N run so an
+        // Bump on EVERY new migration. The count includes the Java migrations V36, V50 and V51
+        // (no V*.sql on disk for them), and the loop pins the versions as a contiguous 1..N run so an
         // out-of-order or skipped version fails loudly here rather than on a prod deploy.
         assertEquals(EXPECTED_MIGRATIONS, applied.length);
         for (int i = 0; i < EXPECTED_MIGRATIONS; i++) {

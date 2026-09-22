@@ -201,7 +201,7 @@ class ScheduleServiceTest {
         var window = new Schedule.TimeWindow(
                 Instant.now().minus(1, ChronoUnit.MINUTES),
                 Instant.now().plus(1, ChronoUnit.MINUTES));
-        when(nowSchedule.expandOccurrences(any())).thenReturn(List.of(window));
+        when(nowSchedule.expandOccurrences(any(), any())).thenReturn(List.of(window));
 
         var futureSchedule = mock(Schedule.class);
         when(futureSchedule.isDeleted()).thenReturn(false);
@@ -209,7 +209,7 @@ class ScheduleServiceTest {
         var futureWindow = new Schedule.TimeWindow(
                 Instant.now().plus(1, ChronoUnit.HOURS),
                 Instant.now().plus(2, ChronoUnit.HOURS));
-        when(futureSchedule.expandOccurrences(any())).thenReturn(List.of(futureWindow));
+        when(futureSchedule.expandOccurrences(any(), any())).thenReturn(List.of(futureWindow));
 
         when(scheduleRepository.findAll()).thenReturn(List.of(nowSchedule, futureSchedule));
 
@@ -255,5 +255,136 @@ class ScheduleServiceTest {
         org.junit.jupiter.api.Assertions.assertThrows(
                 uz.orientadvertise.services.common.exception.InvalidUploadException.class,
                 () -> service.update(1L, pastStart, pastEnd, RepeatType.NONE, null));
+    }
+
+    // ----- LOGIC-12: window validation -----
+
+    private void assertRejected(Instant start, Instant end, RepeatType type, Instant repeatEnd) {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                uz.orientadvertise.services.common.exception.InvalidUploadException.class,
+                () -> service.createSchedule(assignment, start, end, type, repeatEnd));
+    }
+
+    @Test
+    void createSchedule_endBeforeOrAtStart_throws() {
+        assertRejected(june1End, june1, RepeatType.NONE, null);
+        assertRejected(june1, june1, RepeatType.NONE, null);
+    }
+
+    @Test
+    void createSchedule_repeatingWindowLongerThanItsInterval_throws() {
+        assertRejected(june1, june1.plus(25, ChronoUnit.HOURS), RepeatType.DAILY, null);
+        assertRejected(june1, june1.plus(8, ChronoUnit.DAYS), RepeatType.WEEKLY, null);
+        assertRejected(june1, june1.plus(29, ChronoUnit.DAYS), RepeatType.MONTHLY, null);
+    }
+
+    @Test
+    void createSchedule_repeatEndNotAfterStart_throws() {
+        assertRejected(june1, june1End, RepeatType.DAILY, june1);
+    }
+
+    @Test
+    void createSchedule_repeatingWindowOfExactlyOneInterval_isAccepted() {
+        when(scheduleRepository.findByAssignmentIdAndDeletedAtIsNull(anyLong())).thenReturn(List.of());
+        when(scheduleRepository.save(any(Schedule.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = service.createSchedule(assignment, june1, june1.plus(1, ChronoUnit.DAYS),
+                RepeatType.DAILY, july1);
+
+        assertNotNull(result.schedule());
+    }
+
+    // ----- LOGIC-12: bounded, arithmetic expansion -----
+
+    @Test
+    void expandOccurrences_scheduleFromYearOne_startsAtFrom_notAtTheBeginningOfTime() {
+        var ancient = new Schedule(assignment, Instant.parse("0001-01-01T08:00:00Z"),
+                Instant.parse("0001-01-01T18:00:00Z"), RepeatType.DAILY, null);
+
+        var windows = ancient.expandOccurrences(june1, june1.plus(3, ChronoUnit.DAYS));
+
+        // June 1 08:00 has not ended at June 1 08:00, so it is the first; then June 2 and 3.
+        assertEquals(3, windows.size());
+        assertEquals(june1, windows.getFirst().start());
+        assertEquals(june1End, windows.getFirst().end());
+    }
+
+    @Test
+    void expandOccurrences_isCappedForRowsSavedBeforeValidation() {
+        var legacy = new Schedule(assignment, Instant.parse("0001-01-01T08:00:00Z"),
+                Instant.parse("0001-01-01T09:00:00Z"), RepeatType.DAILY, Instant.parse("9999-12-31T00:00:00Z"));
+
+        assertEquals(Schedule.MAX_OCCURRENCES,
+                legacy.expandOccurrences(Instant.parse("9999-12-31T00:00:00Z")).size());
+    }
+
+    @Test
+    void expandOccurrences_monthly_keepsTheDayOfMonth_noDrift() {
+        var jan31 = Instant.parse("2031-01-31T10:00:00Z");
+        var monthly = new Schedule(assignment, jan31, jan31.plus(1, ChronoUnit.HOURS), RepeatType.MONTHLY, null);
+
+        var windows = monthly.expandOccurrences(Instant.parse("2031-04-01T00:00:00Z"));
+
+        assertEquals(List.of(jan31, Instant.parse("2031-02-28T10:00:00Z"), Instant.parse("2031-03-31T10:00:00Z")),
+                windows.stream().map(Schedule.TimeWindow::start).toList());
+    }
+
+    @Test
+    void isActiveAt_longRunningSchedule_answersFromTheCurrentOccurrence() {
+        var daily = new Schedule(assignment, Instant.parse("2001-01-01T08:00:00Z"),
+                Instant.parse("2001-01-01T18:00:00Z"), RepeatType.DAILY, null);
+
+        assertTrue(service.isActiveAt(daily, Instant.parse("2030-06-01T12:00:00Z")));
+        assertFalse(service.isActiveAt(daily, Instant.parse("2030-06-01T20:00:00Z")));
+    }
+
+    @Test
+    void createSchedule_overlapFoundDeepInBothRepeatingSchedules() {
+        // Existing: WEEKLY Saturdays 10:00–12:00. New: DAILY 11:00–11:30, starting on a Monday.
+        // The first shared slot is the following Saturday — past the first few windows of each.
+        var existing = new Schedule(assignment, Instant.parse("2030-06-01T10:00:00Z"),
+                Instant.parse("2030-06-01T12:00:00Z"), RepeatType.WEEKLY, null);
+        when(scheduleRepository.findByAssignmentIdAndDeletedAtIsNull(anyLong())).thenReturn(List.of(existing));
+        when(scheduleRepository.save(any(Schedule.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = service.createSchedule(assignment, Instant.parse("2030-06-03T11:00:00Z"),
+                Instant.parse("2030-06-03T11:30:00Z"), RepeatType.DAILY, Instant.parse("2030-06-20T00:00:00Z"));
+
+        assertEquals(1, result.warnings().size());
+        assertEquals(Instant.parse("2030-06-08T11:00:00Z"), result.warnings().getFirst().newWindow().start());
+        assertEquals(Instant.parse("2030-06-08T10:00:00Z"), result.warnings().getFirst().existingWindow().start());
+    }
+
+    @Test
+    void createSchedule_repeatingSchedulesThatNeverMeet_noWarning() {
+        var existing = new Schedule(assignment, Instant.parse("2030-06-01T10:00:00Z"),
+                Instant.parse("2030-06-01T12:00:00Z"), RepeatType.WEEKLY, null);
+        when(scheduleRepository.findByAssignmentIdAndDeletedAtIsNull(anyLong())).thenReturn(List.of(existing));
+        when(scheduleRepository.save(any(Schedule.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = service.createSchedule(assignment, Instant.parse("2030-06-03T13:00:00Z"),
+                Instant.parse("2030-06-03T14:00:00Z"), RepeatType.DAILY, Instant.parse("2030-09-01T00:00:00Z"));
+
+        assertFalse(result.hasWarnings());
+    }
+
+    @Test
+    void createSchedule_repeatingScheduleThatStartedYearsAgo_stillWarnsAboutAFutureOverlap() {
+        // New DAILY 10:00–11:00 started three years ago (> MAX_OCCURRENCES days); existing WEEKLY
+        // 10:30–11:30 starts next week. Expanding the new one from its start would only ever
+        // compare windows that are already over.
+        var today = Instant.now().truncatedTo(ChronoUnit.DAYS);
+        var newStart = today.minus(3 * 365, ChronoUnit.DAYS).plus(10, ChronoUnit.HOURS);
+        var existing = new Schedule(assignment, today.plus(7, ChronoUnit.DAYS).plus(630, ChronoUnit.MINUTES),
+                today.plus(7, ChronoUnit.DAYS).plus(690, ChronoUnit.MINUTES), RepeatType.WEEKLY, null);
+        when(scheduleRepository.findByAssignmentIdAndDeletedAtIsNull(anyLong())).thenReturn(List.of(existing));
+        when(scheduleRepository.save(any(Schedule.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = service.createSchedule(assignment, newStart, newStart.plus(1, ChronoUnit.HOURS),
+                RepeatType.DAILY, null);
+
+        assertEquals(1, result.warnings().size());
+        assertEquals(today.plus(7, ChronoUnit.DAYS).plus(10, ChronoUnit.HOURS),
+                result.warnings().getFirst().newWindow().start());
     }
 }

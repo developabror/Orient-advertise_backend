@@ -197,6 +197,18 @@ class UserControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
+    // AUTH-08: the DTO used to allow 6 characters; creation now matches change/reset (8).
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void create_sevenCharacterPassword_returns400() throws Exception {
+        mockMvc.perform(post("/api/users")
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"username":"alice","password":"seven77","role":"ADVERTISER"}"""))
+                .andExpect(status().isBadRequest());
+    }
+
     @Test
     @WithMockUser(roles = "ADMIN")
     void create_unknownRole_returns400() throws Exception {

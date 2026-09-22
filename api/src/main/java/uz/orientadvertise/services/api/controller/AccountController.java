@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import uz.orientadvertise.services.common.exception.AuthenticationException;
 import uz.orientadvertise.services.service.PasswordService;
+import uz.orientadvertise.services.domain.auth.PasswordPolicy;
 
 /**
  * Authenticated self-service account management — change own password, set/clear recovery
@@ -81,7 +82,7 @@ public class AccountController {
 
     public record ChangePasswordRequest(
             @NotBlank String currentPassword,
-            @NotBlank @Size(min = 8, max = 200) String newPassword,
+            @NotBlank @Size(min = PasswordPolicy.MIN_LENGTH, max = PasswordPolicy.MAX_BYTES) String newPassword,
             @NotBlank String confirmPassword) {}
 
     /** Blank/null email clears the recovery address; a non-blank value must be a valid email. */

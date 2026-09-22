@@ -64,6 +64,9 @@ public interface PlaylistItemRepository extends JpaRepository<PlaylistItem, Long
            "AND pi.playlist.deletedAt IS NULL")
     long countDistinctActivePlaylistsByContentFileId(@Param("contentFileId") Long contentFileId);
 
+    // The four shifts below move a range by one in a single statement. They rely on
+    // uq_playlist_position being checked per statement, not per row — V51 makes it DEFERRABLE
+    // INITIALLY IMMEDIATE on Postgres for exactly this (LOGIC-09).
     @Modifying
     @Query("UPDATE PlaylistItem pi SET pi.position = pi.position + 1 " +
            "WHERE pi.playlist.id = :playlistId AND pi.position >= :fromPosition AND pi.position < :toPosition")

@@ -129,7 +129,8 @@ public class DeviceRegistrationService {
                     device.getSyncGroupId());
         }
 
-        // New device: create and register
+        // New device: create and register. A soft-deleted device with this serial does not block it
+        // (V50: the serial is unique among live devices only) — the box gets a fresh device row.
         var region = resolveDefaultRegion();
         var name = deviceName != null ? deviceName : "Device-" + serialNumber;
         var device = new Device(region, null, serialNumber, name);

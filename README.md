@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.145`
+`1.0.146`
 
 ## Architecture
 
@@ -444,7 +444,7 @@ All errors use a **uniform response format** with a `correlationId` for tracing:
 
 Schema is managed exclusively by Flyway versioned migrations. **No `ddl-auto: update` in production** — only `validate` (dev) or `none` (prod).
 
-- Migrations: `infra/src/main/resources/db/migration/V*.sql` — **head is `V48__content_assignment_confirmed_at.sql`**
+- Migrations: `infra/src/main/resources/db/migration/V*.sql` (plus Java migrations in `infra/src/main/java/db/migration/`) — **head is `V51__playlist_position_unique_checked_per_statement` (Java)**
 - Rollbacks: `infra/src/test/resources/db/rollback/U*.sql`
 - Migration failure **halts application startup** (Flyway default + Spring Boot propagation)
 - **Every new migration must bump `EXPECTED_MIGRATIONS` in `FlywayMigrationTest`** — it pins both
@@ -480,13 +480,13 @@ Devices and device groups use **soft delete only** — records are never physica
 
 - `Device.softDelete()` / `DeviceGroup.softDelete()` sets `deleted_at`
 - All repository queries filter by `deletedAtIsNull` (only return active records)
-- `serial_number` is **globally unique at DB level** — even soft-deleted devices retain their serial
+- `serial_number` is **unique among live devices** (V50, v1.0.146). A soft-deleted device keeps its serial for history, but no longer blocks it: the same TV box can register again after an admin deletes its device
 
 ### Edge Cases (enforced at DB level)
 
 - **Deleting region with active devices → blocked** — `ON DELETE RESTRICT` on `device.region_id` FK
 - **Facility name unique within region** — `UNIQUE(region_id, name)` constraint
-- **serial_number globally unique** — `UNIQUE` constraint on `device.serial_number` (DB-level, regardless of soft-delete state)
+- **serial_number unique among live devices** — `UNIQUE` on the generated column `device.live_serial` (the serial while `deleted_at IS NULL`, NULL once deleted; V50). Same rule on Postgres and H2
 - **Device group name unique within project** — `UNIQUE(project_id, name)` constraint (a group may span regions within its project, V37)
 - All constraints tested in `SchemaConstraintTest` and `DeviceSchemaTest`
 
@@ -681,10 +681,16 @@ Overlap detection expands recurring schedules into concrete `TimeWindow` occurre
 | PUT    | `/api/schedules/{id}`    | ADMIN, OPERATOR | Replace time/repeat (soft-deletes old, creates new) |
 | DELETE | `/api/schedules/{id}`    | ADMIN, OPERATOR | Soft delete |
 
-**Edge case: end-in-the-past validation.**
-- For `repeat_type=NONE`: `endTimeUtc` must be after `now()` — `400 Invalid Upload` otherwise
-- For repeating: `repeatEndUtc` must be after `now()` — `400 Invalid Upload` otherwise
-- Validation runs on both POST and PUT
+**Edge case: window validation** (`400 Invalid Upload` otherwise; POST and PUT alike).
+- `endTimeUtc` must be after `startTimeUtc` (v1.0.146)
+- Repeating: the window can be at most one repeat interval long — 1 day (DAILY), 7 days (WEEKLY), 28 days (MONTHLY) — or it overlaps its own next occurrence; `repeatEndUtc`, when set, must be after `startTimeUtc` (v1.0.146)
+- For `repeat_type=NONE`: `endTimeUtc` must be after `now()`
+- For repeating: `repeatEndUtc` must be after `now()`
+
+**Bounded expansion (v1.0.146).** Occurrence *n* is computed from the original start, so a schedule is
+expanded from the moment that matters (now, or the new schedule's start) instead of from its first
+occurrence, MONTHLY keeps its day of month (Jan 31 → Feb 28 → Mar 31), and one expansion returns at
+most `Schedule.MAX_OCCURRENCES` (1,000) windows. Overlap warnings compare two sorted lists in one pass.
 
 **Quartz job: per-minute evaluation.**
 `ScheduleEvaluationJob` is registered via Spring Boot's `spring-boot-starter-quartz`:
@@ -1081,7 +1087,7 @@ bounds a `DELETE`.
 
 **Edge cases:**
 
-- **Events linked to open incidents are skipped.** `EventRepository.findExpiredIdsSkippingOpenIncidents(...)` filters out any event referenced as the `firstEvent` or `lastEvent` of a non-RESOLVED incident — losing those would orphan the incident's audit trail. After the incident is resolved, the event becomes deletable on the next nightly run.
+- **Events an incident references are kept.** `EventRepository.findExpiredIdsNotReferencedByIncidents(...)` filters out any event referenced as the `firstEvent` or `lastEvent` of **any** incident, whatever its status. `incident.first_event_id`/`last_event_id` are plain foreign keys and incidents are never deleted, so such an event can never be deleted — until v1.0.146 the query skipped only *open* incidents, the first batch holding a resolved incident's event failed every night, and event retention stopped for good (DATA-03). That is two kept rows per incident; `V49` indexes both columns for the probe and the FK checks.
 - **Time-of-day guard.** Even if the scheduler fires late or an operator triggers `runCleanup()` manually from a console, the method aborts with a no-op return when the current time is outside the **01:00–04:00 Asia/Karachi** window. Set `app.retention.guard-window=false` to disable in non-prod environments.
 - **The per-run cap is a safety stop, not a budget.** It used to be `MAX_BATCHES_PER_RUN = 100`, i.e. 100k rows per table per night — which silently became a *ceiling*: past roughly 26 always-on devices `playback_log` gained more rows per day than a night could delete, so the table could never shrink again. The real bound is now wall-clock time; the cap only exists so a delete that never actually removes the rows it counted can't loop forever.
 - **Monotonic progress.** `findIds` is `ORDER BY id ASC`, so successive runs don't repeat work.
@@ -1296,6 +1302,76 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Pre-release fixes: event retention, deleted devices, playlist shifts, schedules, exports, passwords (v1.0.146)
+
+> Seven small fixes from the 2026-09-18 review, picked because each one is easy to hit in normal
+> use. Frontend half: FE-19 (route roles; viewers no longer see incident actions they cannot use).
+
+**DATA-03 — event retention stopped for good.** Retention skipped only the events of *open*
+incidents, but `incident.first_event_id`/`last_event_id` are plain foreign keys and incidents are
+never deleted, so the first batch holding a resolved incident's event failed — and, ordered by
+`id ASC`, it was the first batch every night. Since v1.0.140 every offline→online cycle
+auto-resolves an incident, so this would have hit about 90 days after deploy. The query
+(`findExpiredIdsNotReferencedByIncidents`) now skips events that **any** incident references; `V49`
+indexes both columns.
+
+**G-6 — a deleted device could never register again.** The deleted row kept its serial and V4 made
+`serial_number` globally `UNIQUE`, so the box got a 500 from `/register` on every boot. `V50` (Java,
+because V4's inline constraint has an engine-generated name) replaces it with `UNIQUE` on a
+generated `live_serial` column — the serial while live, NULL once deleted — so the rule is "unique
+among live devices" on Postgres and H2 alike. The box registers as a new device; the deleted one
+keeps its history. No code change was needed in `DeviceRegistrationService`.
+
+**LOGIC-09 — shifting playlist items could hit a duplicate key.** Postgres checks a plain `UNIQUE`
+row by row, so `UPDATE … SET position = position ± 1` collided depending on physical row order
+(reorder, then remove → 409/500). `V51` re-declares `uq_playlist_position` as
+`DEFERRABLE INITIALLY IMMEDIATE`, checked at the end of each statement. Postgres-only (a no-op on
+H2, which already checks per statement — why tests never saw it).
+
+**LOGIC-12 — any operator could exhaust the heap with one schedule.** Expansion walked every
+occurrence from the start: a DAILY schedule from year 1 was ~740k windows on create, on every GET
+(VIEWER too) and on every evaluation. Occurrences are now computed arithmetically from the moment
+that matters, capped at 1,000 per expansion (for rows saved before validation), MONTHLY no longer
+drifts (Jan 31 → Feb 28 → Mar 31), and overlap detection is a single merge pass over the windows
+from now on (a repeating schedule that started years ago used to be compared on its history only).
+New validation: end after start; a repeating window at most one interval long; repeat end after start.
+
+**AUTHZ-03 — formula-looking export cells.** Device names, serials and event payloads come from
+devices, and `/register` needs no login. POI writes them as text, so nothing runs on open — but
+F2 + Enter (or a copy into CSV) turns `=HYPERLINK(…)` into a live formula. Cells starting with
+`= + - @`, tab or CR now get Excel's *quote prefix* style: always text, value unchanged.
+
+**AUTH-09 — dead default-login bean removed.** `InMemoryUserRepository` (a live `@Repository` with
+`admin`/`password`, injected nowhere) and its `UserInfo` record are deleted.
+
+**AUTH-08 — one password rule.** Creating a user accepted 6 characters; change and reset required 8.
+`PasswordPolicy` — at least 8 characters, at most 72 **bytes** — now drives all three, and the three
+request DTOs' `@Size`. The ceiling is bcrypt's: the encoder throws past 72 bytes, so the old 200 let
+73–200 characters (or 37 Cyrillic letters) pass validation and fail inside the encoder. Login is
+unchanged on purpose: it must accept whatever an account was created with. The frontend already
+required 8 everywhere.
+
+**Tests:** `EventRetentionIncidentReferenceTest` (new, real schema: resolved/open incident events
+skipped, returned ids deletable, the old failure reproduced), `DeviceSchemaTest` (the test that
+pinned the G-6 bug is inverted; + un-deleting a duplicate is still refused),
+`DeviceReRegistrationAfterDeleteIntegrationTest` (new: register → delete → register, and the new
+device is still 409-protected), `ScheduleServiceTest` (+11), `ExcelExportServiceTest` (+3),
+`UserManagementServiceTest` (+4), `UserControllerTest` (+1), and `PostgresMigrationSmokeTest`
+(new, opt-in, below).
+
+**Real-Postgres check (opt-in).** H2 cannot show V51 (a no-op there) or V50's Postgres naming, so
+`PostgresMigrationSmokeTest` runs the migration chain on a real, disposable Postgres. It reproduces the
+LOGIC-09 collision on the pre-V51 schema, shows it gone after V51, and checks V50's constraint swap.
+It is skipped unless `ORIENT_PG_TEST_URL` is set, and it only cleans a database named
+`orient_migration_smoke`:
+
+```bash
+docker run -d --rm --name orient-pg-smoke -p 127.0.0.1:55432:5432 \
+  -e POSTGRES_PASSWORD=smoke -e POSTGRES_DB=orient_migration_smoke postgres:17-alpine
+ORIENT_PG_TEST_URL=jdbc:postgresql://127.0.0.1:55432/orient_migration_smoke \
+  ./gradlew :infra:test --tests '*PostgresMigrationSmokeTest'
+```
 
 ### Operator project scope enforced on content moves, retranscode, upload and every create (v1.0.145)
 
