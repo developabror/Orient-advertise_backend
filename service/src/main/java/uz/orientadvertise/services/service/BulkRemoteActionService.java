@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,17 +32,20 @@ public class BulkRemoteActionService {
     private final RemoteActionRepository remoteActionRepository;
     private final PlaylistRepository playlistRepository;
     private final ObjectMapper objectMapper;
+    private final ApplicationEventPublisher eventPublisher;
 
     public BulkRemoteActionService(DeviceGroupRepository deviceGroupRepository,
                                     DeviceRepository deviceRepository,
                                     RemoteActionRepository remoteActionRepository,
                                     PlaylistRepository playlistRepository,
-                                    ObjectMapper objectMapper) {
+                                    ObjectMapper objectMapper,
+                                    ApplicationEventPublisher eventPublisher) {
         this.deviceGroupRepository = deviceGroupRepository;
         this.deviceRepository = deviceRepository;
         this.remoteActionRepository = remoteActionRepository;
         this.playlistRepository = playlistRepository;
         this.objectMapper = objectMapper;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -153,7 +157,10 @@ public class BulkRemoteActionService {
                             device.getId(), actionType, pending.getFirst().getId()));
         }
         var action = new RemoteAction(device, actionType, payload, issuedBy);
-        return remoteActionRepository.save(action);
+        var saved = remoteActionRepository.save(action);
+        eventPublisher.publishEvent(new RemoteActionIssuedEvent(
+                saved.getId(), device.getId(), saved.getActionType(), saved.getIssuedAt()));
+        return saved;
     }
 
     public record DeviceFailure(Long deviceId, String reason) {}

@@ -2,7 +2,7 @@
 
 **Audience:** the OrientedTV Android signage client team.
 **Purpose:** everything the device must send, receive, parse, persist and tolerate when it talks to the backend: REST contracts, the WebSocket channel and every frame on it, the MinIO download, timers, limits, failure modes.
-**Backend baseline:** `1.0.138` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4).
+**Backend baseline:** `1.0.150` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.150 in R22–R25 below).
 **How this was verified:** every statement was checked against the backend source. The wire examples were captured from a live run of `1.0.135` (dev profile, real MinIO and Redis, real ffmpeg transcode, a real WebSocket client) on 2026-09-14. Rules marked *(verified)* were exercised end to end in that run.
 
 Where this document disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md`, or with an earlier revision of this file, **this document wins**. If you built against the previous revision, read the revision notes right below first.
@@ -11,6 +11,32 @@ Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always 
 
 ---
 
+## What changed for the device since backend 1.0.138 (read this first)
+
+| # | Since | Change | Client action |
+|---|---|---|---|
+| R22 | 1.0.144 | `/sync` answers **503** when object storage is unreachable, instead of a plan with the unreachable files silently missing. | Treat it like any 5xx: keep playing cached content, **do not** apply it as "no content" and **do not** delete files, retry with backoff (§1.6, §6.2). |
+| R23 | 1.0.146 | A device an admin deleted can register again: the same serial gets **201** as a **new device** (new `deviceId`, new token, default placement, no content until an operator assigns it). It used to fail with 500 forever. | Always persist the `deviceId` **and** token from every `/register` response; never assume the `deviceId` survives a decommission. Keep the local media store. Remove any "decommissioned — stop retrying" logic built for the old 500 (§2, §4). |
+| R24 | 1.0.149 | Every newly processed file is **8-bit 4:2:0 H.264 High** (level picked by the encoder). 10-bit / 4:2:2 uploads used to become High 10 / High 4:2:2, which most hardware decoders reject. | Nothing required. Keep the per-item decoder-failure defence for files processed before 1.0.149 (§6.5). |
+| R25 | 1.0.150 | `ACTION_PENDING` is **pushed as soon as an action is issued** (after commit), not only replayed on connect. | Handle the frame at any time: fetch `GET /actions/pending`, execute, **deduplicate by `actionId`** (it also arrives by heartbeat and replay). The 30–60 s poll while connected is no longer needed (§8.1). |
+
+No other wire change between 1.0.138 and 1.0.150: request/response shapes, auth, timers and limits
+are unchanged (the dependency upgrade to Spring Boot 3.5 in 1.0.148 changed nothing on the wire).
+One behaviour change needs no client action but may surprise QA: since 1.0.142, when a short
+"Replace" campaign ends, screens go back to the booking underneath it instead of going blank. This
+arrives as an ordinary content-version change.
+
+### Coming next: planned, not in the backend yet
+
+These fixes are designed but not built. Build the client so it works both before and after them.
+
+| Planned fix | What will change for the device | Build it now like this |
+|---|---|---|
+| Anchor per content version (VG-06) | A playlist edit will get a **fresh anchor** with `activateAt` in the future: at least 2 min, longer when the edit adds files to download. All screens on the assignment switch together at `activateAt`, and the loop starts again from the first item. Today an edit reuses the old anchor, so `activateAt` is already in the past (§7.4, G-14). | Apply the §7.3 formula to **every** pending version, edits included: keep the live version until `activateAt`, then switch. Do **not** special-case edits as "switch as soon as confirmed"; with today's past `activateAt` the formula already switches at once. Keep the old files until the switch (§7.4). |
+| Plays checked against their own time (VG-03) | A play will be checked against the campaign that was live at its `playedAt` (plus a 30 min grace), not the one live now. Plays reported after a campaign switch will stop being rejected. No wire change. | Keep flushing promptly (§11). Nothing else. |
+| `/sync` no longer holds a DB connection while it checks storage (VG-07) | No payload change. A hanging object store will give a 503 after about 3 s instead of a request that hangs for minutes. | Already covered by R22: treat it as any 5xx. |
+| Operator playlist panel (VG-02) | The device page's Prev/Next/Jump controls will start to work, so `PLAYLIST_CONTROL` will actually reach devices from the dashboard. The dashboard will hide them for devices in schedule mode, but the external API can still send them. | Make sure `PLAYLIST_CONTROL` is implemented as in §8.3, including `FAILED` with `result: "SCHEDULE_MODE"`. |
+
 ## Revision notes: corrections to the previous revision
 
 These are behaviour differences between the previous spec and what the backend actually does. Each one is a client change.
@@ -18,12 +44,12 @@ These are behaviour differences between the previous spec and what the backend a
 | # | Previous spec said | Actual behaviour | Section |
 |---|---|---|---|
 | R1 | Content changes are pushed as WS `SYNC_REQUIRED` | Live content pushes are **`SYNC_CONTENT`** with a `reason`. `SYNC_REQUIRED` is sent **only as a replay when the socket connects**. | §10.3 |
-| R2 | New actions arrive live as WS `ACTION_PENDING` | `ACTION_PENDING` is **only replayed on connect**. An action issued while you are connected is **not pushed**; you get it from the next heartbeat or from `GET /actions/pending`. | §8.1 |
+| R2 | New actions arrive live as WS `ACTION_PENDING` | **Since backend v1.0.150, yes**: a frame is pushed as soon as the action is committed, and also replayed on every connect. It is best-effort, so the heartbeat and `GET /actions/pending` remain the guarantee. Before v1.0.150 it was only replayed on connect. | §8.1 |
 | R3 | `currentFileIds` = every file you hold "regardless of download status" | List **only fully downloaded and verified** files. The server never issues a URL for a file you claim to hold, so a partial file listed there can never be resumed. | §6.2 |
 | R4 | `fullSync` is a hint you can ignore | With `fullSync: true` the server **ignored your `currentFileIds`**. `filesToAdd` repeats files you already have, and `filesToDelete` is always empty, so you must garbage-collect yourself. | §6.3, §6.4 |
 | R5 | `URGENT_CONTENT` is never pushed | It **is** pushed to every connected device on the whole fleet. It is not actionable, so ignore it. | §10.3 |
 | R6 | The server pings every ~90 s | The server **never pings**. The client must send WS pings. | §10.6 |
-| R7 | A deleted device gets 404 and should re-register | A deleted (or rotated) token gets **401**. Re-registering a soft-deleted serial currently fails with **500**. | §2 |
+| R7 | A deleted device gets 404 and should re-register | A deleted (or rotated) token gets **401**. ~~Re-registering a soft-deleted serial currently fails with **500**.~~ Since 1.0.146 it registers as a new device (R23). | §2 |
 | R8 | Action `payload` looks like a JSON object | `payload` is a **JSON document encoded as a string**, and it may be `null`. Action types also include `PLAYLIST_CONTROL` and `ASSIGN_CONTENT`. | §8.2, §8.3 |
 | R9 | `VOLUME_SET` and `desiredVolume` are both valid | `VOLUME_SET` does **not** change `desiredVolume`, so the next beat pulls the volume back. | §8.3 |
 | R10 | `MISMATCH` means content changed mid-sync | `MISMATCH` means you confirmed something other than what **your latest `/sync`** returned. Content changing mid-sync still yields `CONFIRMED`. | §6.6 |
@@ -142,7 +168,7 @@ Suggested timeouts: connect 10 s, read 30 s. Use a 60 s read timeout for `/sync`
 
 | Item | Behaviour |
 |---|---|
-| `deviceId` | int64 assigned at first registration. Stable across re-registrations of the same serial. |
+| `deviceId` | int64 assigned at registration. Stable across re-registrations of the same serial inside an admin window. **A new `deviceId`** is assigned when the serial registers again after an admin deleted the device (R23). |
 | `deviceToken` | `dtk_` + 32 lowercase hex (36 chars). Opaque. No expiry, no refresh endpoint. |
 | Header | `X-Device-Token: <deviceToken>` on every call except `POST /register` and MinIO GETs. |
 | Validation | Checked against the database on **every** REST request with no cache, so revocation is immediate for REST. |
@@ -160,7 +186,7 @@ Suggested timeouts: connect 10 s, read 30 s. Use a 60 s read timeout for `/sync`
 
 **An open WebSocket is not closed when your token is revoked or your device is deleted** *(verified both)*. It keeps receiving pushes. A REST 401 is the authoritative signal, so close the socket yourself.
 
-**Decommissioned devices:** after an admin soft-deletes a device, re-registering **the same serial fails with 500** (the serial stays unique even on deleted rows) *(verified)*. Every attempt also consumes registration rate-limit budget. On repeated 5xx from `/register`, back off exponentially up to 1 hour and surface "device decommissioned — contact operator" in diagnostics. See §16 G-6.
+**Decommissioned devices:** after an admin soft-deletes a device, your token gets 401. Re-registering **the same serial** (since 1.0.146) returns **201** and creates a **new device**: new `deviceId`, new token, default placement, no content until an operator assigns it (R23). It counts against the new-device registration budget (10/hour per IP). Persist the new `deviceId` and token and carry on with the normal flow; your media store stays useful if the same content is assigned again. On repeated 5xx from `/register`, still back off exponentially up to 1 hour.
 
 **Serial uniqueness is your responsibility.** Two boxes with the same `serialNumber` cannot both work: since 1.0.137 the second one gets 409 on `/register` for as long as the first holds the serial (before, they evicted each other's token in an endless 401 → re-register ping-pong). Derive the serial from hardware identity where the app has the privilege. Otherwise use `Settings.Secure.ANDROID_ID` (unique per signing key + user + device, resets on factory reset). Only as a last resort use a generated UUID persisted in app storage. **Never ship a device image with pre-populated app data.** The serial is case-sensitive and must match `^[A-Za-z0-9][A-Za-z0-9._:-]*$` (≤ 100 chars): whitespace or any other character gets 400.
 
@@ -211,7 +237,7 @@ Nothing else is meant for devices. Operator endpoints return **403** for a devic
 
 | Field | Type | Meaning |
 |---|---|---|
-| `deviceId` | int64 | Your id for every path. Unchanged on re-registration. |
+| `deviceId` | int64 | Your id for every path. Unchanged on re-registration inside an admin window; **new** after the device was deleted (R23). Always persist it. |
 | `deviceToken` | string | **Always a fresh token.** On 200 the previous token died at that instant. |
 | `serialNumber` | string | Echo. |
 | `status` | `"registered"` \| `"re-registered"` | Informational only. |
@@ -355,6 +381,7 @@ GET /api/devices/12/sync                                                        
 
 - **Side effect:** when the response carries work (non-empty add/delete, or `expectedContentVersion ≠ currentVersion`), the server arms a sync-pending marker for that `expectedContentVersion`. A matching confirm clears it. If 30 minutes pass without a matching confirm, a `SYNC_TIMEOUT` incident opens and the marker clears; the next `/sync` re-arms it. The 30 minutes count from the **first** `/sync` of the cycle, so refreshing URLs does not reset them.
 - **Every call re-signs URLs**, and probes storage once for each file it offers you. It is not free.
+- **`503` = object storage is unreachable** (since 1.0.144, R22). The server refuses to hand you a plan that silently leaves files out. Keep playing what you have, do not delete anything, and retry with backoff like any 5xx.
 - Keep the URL under ~8 KB (the server's header limit). The comma form is shorter; ~1000 ids fit comfortably.
 
 ### 6.3 Response
@@ -479,7 +506,7 @@ GET /api/devices/12/sync                                                        
 - **Container:** MP4 with fast-start.
 - **Video:** H.264 (High profile for normal 8-bit sources, verified), scaled down to fit **1920×1080** by default with aspect ratio preserved. That cap is server-configurable. The frame rate is kept from the source.
 - **Audio:** AAC-LC, 128 kbit/s, **present only if the source had audio**.
-- **Pixel format and H.264 profile are not forced.** A 10-bit or 4:2:2 source can produce a High 10 or High 4:2:2 stream that many hardware decoders reject. Handle a decoder failure per item: keep the slot timing, show black or hold the previous frame for that slot, and record the `fileId` plus error for diagnostics (§8.3 `GET_DIAGNOSTICS`). **Never crash the loop.**
+- **Pixel format and H.264 profile are forced since backend v1.0.149:** every processed file is 8-bit 4:2:0 H.264 High profile (level chosen by the encoder: 3.1 for 720p30 up to 4.2 for 1080p60). Files transcoded before v1.0.149 from a 10-bit or 4:2:2 source can still be High 10 or High 4:2:2 until they are retranscoded, so keep the defence below. Handle a decoder failure per item: keep the slot timing, show black or hold the previous frame for that slot, and record the `fileId` plus error for diagnostics (§8.3 `GET_DIAGNOSTICS`). **Never crash the loop.**
 
 ### 6.6 Confirm (go-live)
 
@@ -601,6 +628,7 @@ offsetMs = elapsed − slot.slotStartMs          // seek the media here on join
 - The anchor is created the first time anyone (a device's `/sync` or the server's readiness monitor) sees an assignment: `activateAt = anchorEpochMs = now + 2 min` (server default).
 - It is **immutable for the life of the assignment.** A later playlist edit produces a new `expectedContentVersion` but **reuses the same anchor and `activateAt`**, which is usually long in the past by then *(verified: after a dwell edit the version changed, the anchor stayed identical, and `loopDurationMs` went 6000 → 5000)*.
 - So "hold the old version until `activateAt`" matters only for a brand-new assignment. For edits, cut over as soon as you are confirmed, and expect the on-screen position to jump because `loopDurationMs` changed. That jump is correct.
+- Get this behaviour from the §7.3 formula (a past `activateAt` switches at once), not from a special case for edits. A planned backend fix gives edits a future `activateAt` (see "Coming next" at the top), and the formula handles that with no client change.
 - Keep the old version's files until the cut-over has happened.
 
 ### 7.5 Operator group jump
@@ -641,13 +669,13 @@ When the schedule fields are null, loop `playlistOrder` by `index`, holding each
 |---|---|---|
 | Heartbeat `pendingActions[]` | yes | Every beat, until the action is confirmed, expired **and** swept. |
 | `GET /api/devices/{id}/actions/pending` | yes | Any time. Returns a plain JSON array of PendingAction, same shape and order as the heartbeat. |
-| WS `ACTION_PENDING` frame | **no** (id, type and `issuedAt` only) | **Only as a replay on socket connect.** No frame is pushed when an operator issues an action. |
+| WS `ACTION_PENDING` frame | **no** (id, type and `issuedAt` only) | **Pushed when the action is issued** (backend v1.0.150+, after the issuing transaction commits), and **replayed on every socket connect**. |
 
 Consequences:
-- While the socket is connected, a new action reaches you on the **next heartbeat**, i.e. within one beat (≤120 s).
+- While the socket is connected, a new action normally reaches you **within a second** as an `ACTION_PENDING` frame. The push is best-effort (a failed write is not retried), so the **next heartbeat** (≤120 s) is still the guarantee.
 - While the socket is **disconnected**, poll `/actions/pending` every **30 s**, and stop when the socket connects (the connect replay covers you).
-- If one-beat latency is unacceptable for your UX (transport controls, pause), you **MAY** also poll every 30–60 s while connected. The proper fix, a live push when an action is issued, is backend gap G-1 (§16).
-- An `ACTION_PENDING` frame has no payload. On receiving one, call `GET /actions/pending` once and execute from that response.
+- The 30–60 s poll while connected, recommended before v1.0.150 for transport controls, is no longer needed.
+- An `ACTION_PENDING` frame has no payload. On receiving one, call `GET /actions/pending` once and execute from that response. The same action arrives by push, heartbeat and replay: **deduplicate by `actionId`** (§8.3).
 
 ### 8.2 PendingAction shape
 
@@ -860,7 +888,7 @@ Frames are JSON text, discriminated by `type`. **Ignore unknown `type` values** 
 ```
 - Action: run the sync flow. `expectedVersion` is advisory: confirm whatever `/sync` returns.
 
-**`ACTION_PENDING`**: sent **only as a connect replay** (§8.1) *(verified)*.
+**`ACTION_PENDING`**: pushed when an action is issued (backend v1.0.150+) and replayed on connect (§8.1).
 ```json
 {"type":"ACTION_PENDING","actionId":3,"actionType":"SYNC_CONTENT","issuedAt":"2026-09-14T17:42:21.579375Z"}
 ```
@@ -1057,9 +1085,9 @@ The server can override every value through its configuration. Do not hardcode s
 
 | Endpoint | 200/201 | 400 | 401 | 403 | 404 | 409 | 429 | 500 (deterministic causes) |
 |---|---|---|---|---|---|---|---|---|
-| `POST /register` | 201 new, 200 re-reg (admin window only) | blank/over-long/badly formed serial, name > 200, bad JSON | stale `X-Device-Token` sent | — | — | already registered, no window (retry) | rate limit | soft-deleted serial, no Content-Type |
+| `POST /register` | 201 new (also a serial whose device was deleted, R23), 200 re-reg (admin window only) | blank/over-long/badly formed serial, name > 200, bad JSON | stale `X-Device-Token` sent | — | — | already registered, no window (retry) | rate limit | no Content-Type |
 | `POST /heartbeat` | ok | JSON type errors | §2 | wrong id | race only | — | — | `contentVersion` > 64, no Content-Type |
-| `GET /sync` | ok | bad or mixed `currentFileIds` | §2 | wrong id | race only | — | — | — |
+| `GET /sync` | ok | bad or mixed `currentFileIds` | §2 | wrong id | race only | — | — | — (**503** while object storage is unreachable, R22) |
 | `POST /sync/confirm` | CONFIRMED or MISMATCH | blank `reportedVersion` | §2 | wrong id | race only | — | — | > 64 chars, no Content-Type |
 | `GET /time` | ok | — | §2 | wrong id | — | — | — | — |
 | `GET /actions/pending` | ok (array) | — | §2 | wrong id | — | — | — | — |
@@ -1092,20 +1120,20 @@ These are current backend behaviours that are arguably bugs. The client rules ab
 
 | ID | Gap | Client defence |
 |---|---|---|
-| G-1 | Issuing an action does not push `ACTION_PENDING`; it is only replayed on connect. | Heartbeat pickup; optional 30–60 s poll (§8.1). |
+| G-1 | ~~Issuing an action does not push `ACTION_PENDING`; it is only replayed on connect.~~ **Fixed in backend v1.0.150:** pushed after commit. | Heartbeat pickup stays the guarantee (§8.1). |
 | G-2 | A group jump is not signalled by the heartbeat or the connect replay. | `/sync` on every (re)connect and every 10 min in schedule mode (§7.5). |
 | G-3 | `VOLUME_SET` does not update `desiredVolume`, so it reverts on the next beat. | Treat `desiredVolume` as authoritative (§8.3). |
 | G-4 | A missing `Content-Type` gives 500 instead of 415. | Always send it (§1.2). |
 | G-5 | Over-length strings give 500 instead of 400 for versions > 64. **Fixed for `/register` in 1.0.137** (serial and name now give 400). | Enforce the limits client-side (§1.2). |
-| G-6 | A soft-deleted device cannot re-register its serial (500), and every attempt consumes rate-limit budget. | Back off up to 1 h and surface "decommissioned" (§2). |
+| G-6 | ~~A soft-deleted device cannot re-register its serial (500).~~ **Fixed in backend 1.0.146:** it registers as a new device (R23). | Persist the new `deviceId` (§2). |
 | G-7 | A null `contentFileId` or `playedAt` gives 500 and rolls back the whole playback batch. | Validate before enqueueing (§11). |
 | G-8 | Token rotation or device deletion does not close an open WebSocket. | Close it yourself on REST 401 (§10.8). |
 | G-9 | `URGENT_CONTENT` is broadcast fleet-wide, unscoped, and carries nothing actionable. | Ignore it (§10.3). |
 | G-10 | Concurrent server pushes to one socket are not serialised, so a frame can be dropped. | Frames only accelerate; correctness comes from REST (§10.4). |
-| G-11 | The transcoder does not force `yuv420p` or an H.264 profile. | Tolerate decoder failures per item (§6.5). |
+| G-11 | ~~The transcoder does not force `yuv420p` or an H.264 profile.~~ **Fixed in backend v1.0.149:** output is forced to 8-bit 4:2:0 High. | Tolerate decoder failures per item (§6.5). |
 | G-12 | `filesToAdd[].contentType` and `name` describe the original upload, not the served MP4. | Ignore both for decoding (§6.3). |
 | G-13 | The legacy bulk path can issue `ASSIGN_CONTENT`, or REBOOT/SYNC_CONTENT with an arbitrary or null payload. | Tolerant payload parsing; FAILED for unsupported types (§8.2, §8.3). |
-| G-14 | The coordinated cut-over (`activateAt` in the future) happens only for a new assignment; edits reuse the old anchor. | Cut over when confirmed (§7.4). |
+| G-14 | The coordinated cut-over (`activateAt` in the future) happens only for a new assignment; edits reuse the old anchor. **Fix planned** (VG-06, see "Coming next"). | Apply §7.3 to every pending version: today it switches at once, and after the fix it will wait for `activateAt` (§7.4). |
 | G-15 | `SYNC_CONTENT` is emitted as a literal string and is not a member of the backend's push-type enum. The wire string is stable and documented here. | None needed. |
 
 ---

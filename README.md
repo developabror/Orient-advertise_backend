@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.149`
+`1.0.150`
 
 ## Architecture
 
@@ -1302,6 +1302,28 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Remote actions reach a connected device at once (v1.0.150)
+
+> **VG-04 (review G-1).** Issuing an action (Reboot, Next, Prev, volume, playlist control, a group
+> action) only saved a `remote_action` row. `ACTION_PENDING` was pushed only when a device
+> (re)connected, so a connected device learned of the action at its next heartbeat — up to ~130 s —
+> and with two missed beats the 5-minute action expired and never ran. The buttons looked broken.
+
+**What changed:** every path that creates an action (`RemoteActionService.issue`, the group path
+`BulkRemoteActionService.issueOneIsolated`) publishes a `RemoteActionIssuedEvent`, and
+`RemoteActionPushListener` pushes the same `ACTION_PENDING` frame the connect replay sends — after the
+issuing transaction commits, so a rolled-back action never reaches a device (`fallbackExecution`
+covers the group path, which runs without a surrounding transaction). The frame is formatted in one
+place (`DevicePushFrames.actionPending`), shared with the replay. The push is best-effort; the
+heartbeat and `GET /actions/pending` stay the guarantee, and devices already deduplicate by
+`actionId`. `ANDROID_DEVICE_FLOW_SPEC.md` (R2, §8.1, §10, G-1) is updated.
+
+**Tests:** `RemoteActionPushIntegrationTest` (new, real context: committed → pushed, rolled back →
+never pushed, group action with no surrounding transaction → pushed to every member),
+`RemoteActionPushListenerTest` (new), `RemoteActionServiceTest` (+2), `BulkRemoteActionServiceTest`
+(+1 assertion). Mutation-checked: removing the publish, firing before commit, or dropping
+`fallbackExecution` each fails exactly the test written for it.
 
 ### Transcoded videos always play on TV boxes: 8-bit 4:2:0 High profile (v1.0.149)
 

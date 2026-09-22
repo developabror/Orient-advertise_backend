@@ -15,6 +15,7 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 import uz.orientadvertise.services.domain.content.DevicePushChannel;
+import uz.orientadvertise.services.domain.content.DevicePushFrames;
 import uz.orientadvertise.services.domain.content.PushMessageType;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.RemoteActionRepository;
@@ -156,11 +157,8 @@ public class DeviceWebSocketHandler extends TextWebSocketHandler implements Devi
             try {
                 var pending = raRepo.findPendingByDevice(deviceId);
                 for (var action : pending) {
-                    var msg = """
-                            {"type":"%s","actionId":%d,"actionType":"%s","issuedAt":"%s"}"""
-                            .formatted(PushMessageType.ACTION_PENDING.name(),
-                                    action.getId(), action.getActionType(), action.getIssuedAt());
-                    sendQuietly(session, msg);
+                    sendQuietly(session, DevicePushFrames.actionPending(
+                            action.getId(), action.getActionType(), action.getIssuedAt()));
                 }
                 if (!pending.isEmpty()) {
                     log.info("Replayed {} pending action(s) to device {}", pending.size(), deviceId);

@@ -33,6 +33,7 @@ class BulkRemoteActionServiceTest {
     private DeviceGroupRepository deviceGroupRepository;
     private DeviceRepository deviceRepository;
     private RemoteActionRepository remoteActionRepository;
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
     private BulkRemoteActionService service;
 
     @BeforeEach
@@ -43,7 +44,8 @@ class BulkRemoteActionServiceTest {
         // PlaylistRepository + ObjectMapper are only consulted for ASSIGN_CONTENT — REBOOT
         // and SYNC_CONTENT tests don't need to stub them.
         service = new BulkRemoteActionService(deviceGroupRepository, deviceRepository,
-                remoteActionRepository, mock(PlaylistRepository.class), new ObjectMapper());
+                remoteActionRepository, mock(PlaylistRepository.class), new ObjectMapper(),
+                eventPublisher = mock(org.springframework.context.ApplicationEventPublisher.class));
     }
 
     @Test
@@ -77,6 +79,10 @@ class BulkRemoteActionServiceTest {
         assertEquals(3, result.succeededCount());
         assertEquals(0, result.skippedCount());
         assertEquals(0, result.failedCount());
+        // VG-04: every created action is pushed, one event per device.
+        var events = org.mockito.ArgumentCaptor.forClass(RemoteActionIssuedEvent.class);
+        verify(eventPublisher, org.mockito.Mockito.times(3)).publishEvent(events.capture());
+        assertEquals(List.of(10L, 20L, 30L), events.getAllValues().stream().map(RemoteActionIssuedEvent::deviceId).toList());
     }
 
     @Test

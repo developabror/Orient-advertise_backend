@@ -40,7 +40,8 @@ class BulkRemoteActionServiceAssignContentTest {
         remoteActionRepository = mock(RemoteActionRepository.class);
         playlistRepository = mock(PlaylistRepository.class);
         service = new BulkRemoteActionService(deviceGroupRepository, deviceRepository,
-                remoteActionRepository, playlistRepository, new ObjectMapper());
+                remoteActionRepository, playlistRepository, new ObjectMapper(),
+                mock(org.springframework.context.ApplicationEventPublisher.class));
 
         // Default group + 2 devices — every test uses the same group, only the payload
         // and playlist stubbing varies.

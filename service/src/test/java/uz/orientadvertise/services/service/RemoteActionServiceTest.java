@@ -23,12 +23,39 @@ import static org.mockito.Mockito.when;
 class RemoteActionServiceTest {
 
     private RemoteActionRepository repository;
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
     private RemoteActionService service;
 
     @BeforeEach
     void setUp() {
         repository = mock(RemoteActionRepository.class);
-        service = new RemoteActionService(repository, mock(DeviceRepository.class));
+        eventPublisher = mock(org.springframework.context.ApplicationEventPublisher.class);
+        service = new RemoteActionService(repository, mock(DeviceRepository.class), eventPublisher);
+    }
+
+    // VG-04: the device is told the moment the action is committed, not at its next heartbeat.
+    @Test
+    void issue_publishesTheActionForAnImmediatePush() {
+        var device = mockDevice(1L);
+        when(repository.findPendingByDeviceAndType(1L, "REBOOT")).thenReturn(List.of());
+        when(repository.save(any(RemoteAction.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        var action = service.issue(device, "REBOOT", "{}", "admin");
+
+        verify(eventPublisher).publishEvent(new RemoteActionIssuedEvent(
+                action.getId(), 1L, "REBOOT", action.getIssuedAt()));
+    }
+
+    @Test
+    void issue_rejectedDuplicate_publishesNothing() {
+        var device = mockDevice(1L);
+        var existing = mock(RemoteAction.class);
+        when(existing.getId()).thenReturn(99L);
+        when(repository.findPendingByDeviceAndType(1L, "REBOOT")).thenReturn(List.of(existing));
+
+        assertThrows(IllegalStateException.class, () -> service.issue(device, "REBOOT", "{}", "admin"));
+
+        org.mockito.Mockito.verifyNoInteractions(eventPublisher);
     }
 
     @Test

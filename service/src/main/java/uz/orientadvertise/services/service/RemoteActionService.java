@@ -6,6 +6,7 @@ import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -29,11 +30,14 @@ public class RemoteActionService {
 
     private final RemoteActionRepository repository;
     private final DeviceRepository deviceRepository;
+    private final ApplicationEventPublisher eventPublisher;
 
     public RemoteActionService(RemoteActionRepository repository,
-                                 DeviceRepository deviceRepository) {
+                                 DeviceRepository deviceRepository,
+                                 ApplicationEventPublisher eventPublisher) {
         this.repository = repository;
         this.deviceRepository = deviceRepository;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -61,6 +65,9 @@ public class RemoteActionService {
         var saved = repository.save(action);
         log.info("Issued remote action [id={}, device={}, type={}, expires={}]",
                 saved.getId(), device.getId(), actionType, saved.getExpiresAt());
+        // Pushed to the device after commit (VG-04), so a rolled-back issue never reaches it.
+        eventPublisher.publishEvent(new RemoteActionIssuedEvent(
+                saved.getId(), device.getId(), saved.getActionType(), saved.getIssuedAt()));
         return saved;
     }
 

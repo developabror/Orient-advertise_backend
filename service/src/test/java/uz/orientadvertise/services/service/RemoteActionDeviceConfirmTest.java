@@ -25,7 +25,8 @@ class RemoteActionDeviceConfirmTest {
     @BeforeEach
     void setUp() {
         repository = mock(RemoteActionRepository.class);
-        service = new RemoteActionService(repository, mock(DeviceRepository.class));
+        service = new RemoteActionService(repository, mock(DeviceRepository.class),
+                mock(org.springframework.context.ApplicationEventPublisher.class));
     }
 
     @Test
