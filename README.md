@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.150`
+`1.0.151`
 
 ## Architecture
 
@@ -1302,6 +1302,36 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### The device page's playlist panel works again (v1.0.151)
+
+> **VG-02.** The operator UI's active-playlist panel called `GET /api/devices/{id}/playlist`, which is
+> device-only (`hasRole('DEVICE')` and the token's id must equal the path id). Every operator, admin and
+> viewer therefore got 403, the frontend swallowed it, and every device page said "No playlist assigned"
+> with the Prev/Next/Jump controls permanently hidden.
+
+**What changed:** a new operator-side endpoint `GET /api/devices/{id}/active-playlist`
+(`ADMIN`/`OPERATOR`/`VIEWER`, then `assertScopeForDevice` so an out-of-scope operator gets 404, never a
+hint the device exists). It returns the **deliverable** items in play order, re-indexed from 0, so
+`items[].index` is exactly the `position` that `POST /playlist/control` accepts for a JUMP: the row an
+operator clicks and the clip the device jumps to cannot drift apart. `PlaylistControlService` now lists
+and range-checks through one helper for that reason.
+
+The device's own `/playlist` stays device-pinned: it presigns a media URL per item and probes storage
+for each one, so widening it would leak media to viewers and make a panel refresh do object-store I/O.
+The new endpoint does no storage I/O at all and carries no URLs or storage keys. `durationSeconds` is
+the slot the device really plays (the 10 s default when an item has no dwell and the file no length),
+never null. `scheduled` reports that a playback anchor exists — the device is in synchronised group
+playback and answers `PLAYLIST_CONTROL` with `FAILED "SCHEDULE_MODE"` — so the UI can disable per-device
+transport and point at the sync-group jump. The anchor is only read (`PlaybackScheduleService.find`);
+rendering a panel never arms a cut-over.
+
+**Tests:** `PlaylistControlServiceTest` (+6: re-indexing across a non-deliverable item, the default-slot
+duration, the listed rows matching the JUMP bound, no assignment, unknown device, anchor read but never
+created), `DeviceControllerTest` (+8: 200 for admin/operator/viewer with the indexed items and no URLs,
+200 with no items when nothing is assigned, 404 out of scope without touching the service, 403 for
+advertiser and for a device token, 401 unauthenticated, and a regression that an operator still gets
+403 from the device-only `/playlist`).
 
 ### Remote actions reach a connected device at once (v1.0.150)
 

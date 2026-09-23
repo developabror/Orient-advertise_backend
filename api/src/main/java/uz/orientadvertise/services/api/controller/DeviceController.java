@@ -24,6 +24,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import uz.orientadvertise.services.api.dto.ActivePlaylistResponse;
 import uz.orientadvertise.services.api.dto.SetVolumeRequest;
 import uz.orientadvertise.services.api.security.ClientIp;
 import uz.orientadvertise.services.domain.content.DevicePushChannel;
@@ -344,24 +345,37 @@ public class DeviceController {
     }
 
     /**
-     * Resolved playlist for a device — used by <b>both</b> the TV-Box (the original audience)
-     * and the operator UI's device-detail panel.
+     * Resolved playlist for a device — <b>device-only</b>, and the device may only ask for
+     * itself ({@code #id == authentication.principal}, on top of the {@code hasRole("DEVICE")}
+     * matcher in {@link uz.orientadvertise.services.api.security.SecurityConfig}).
      *
-     * <p><b>Auth:</b> {@code permitAll} in {@link uz.orientadvertise.services.api.security.SecurityConfig}.
-     * The TV-Box hits this without a JWT; the operator UI hits it with the operator's JWT,
-     * which is also accepted (Spring Security treats the JWT as superfluous on a permitAll
-     * matcher). The response is identical for both — no role-aware projection — because the
-     * operator panel renders exactly what the device sees, including resolved sources and
-     * presigned URLs. If a future change needs to redact device-only fields for operators,
-     * split this into {@code GET /api/devices/{id}/playlist} (device) and
-     * {@code GET /api/devices/{id}/playlist/operator-view} (role-gated) — do not narrow this
-     * matcher in place, because TV-Boxes have no token to present.
+     * <p>It presigns a URL per item and probes storage for each one, so it is neither free nor
+     * safe to widen: a presigned URL handed to a VIEWER is a media leak. The operator UI uses
+     * {@link #activePlaylist} instead, which lists the same order with no URLs and no I/O.
      */
     @GetMapping("/{id}/playlist")
     @PreAuthorize("hasRole('DEVICE') and #id == authentication.principal")
     public ResponseEntity<PlaylistResponse> playlist(@PathVariable Long id) {
         PlaylistView view = syncService.getPlaylistView(id);
         return ResponseEntity.ok(PlaylistResponse.from(view));
+    }
+
+    /**
+     * The device's current playlist for the operator UI's device-detail panel: the deliverable
+     * items in play order, indexed exactly as {@code POST /playlist/control} expects a JUMP
+     * {@code position}.
+     *
+     * <p>Read-only, and deliberately a separate path from the device's {@code /playlist} (which
+     * stays device-pinned): no presigned URLs, no storage calls. ADVERTISER and device tokens
+     * get 403; an operator asking about a device outside their projects gets 404, never a hint
+     * that it exists. An unassigned device is 200 with a null {@code playlistId}.
+     */
+    @GetMapping("/{id}/active-playlist")
+    @PreAuthorize("hasAnyRole('ADMIN', 'OPERATOR', 'VIEWER')")
+    public ResponseEntity<ActivePlaylistResponse> activePlaylist(@PathVariable Long id) {
+        managementService.assertScopeForDevice(id);   // operator scope ⇒ 404 if out of scope
+        return ResponseEntity.ok(
+                ActivePlaylistResponse.from(playlistControlService.getActivePlaylist(id)));
     }
 
     /**

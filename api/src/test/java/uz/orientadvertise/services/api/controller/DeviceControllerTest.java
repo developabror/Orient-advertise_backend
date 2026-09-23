@@ -28,6 +28,8 @@ import uz.orientadvertise.services.service.DeviceSyncService.SyncFileToAdd;
 import uz.orientadvertise.services.service.DeviceSyncService.PlaylistEntry;
 import uz.orientadvertise.services.service.DeviceSyncService.SyncPlan;
 import uz.orientadvertise.services.service.PlaylistControlService;
+import uz.orientadvertise.services.service.PlaylistControlService.ActivePlaylistItemView;
+import uz.orientadvertise.services.service.PlaylistControlService.ActivePlaylistView;
 import uz.orientadvertise.services.service.PlaylistControlService.ControlAction;
 import uz.orientadvertise.services.domain.model.RemoteAction;
 
@@ -1287,6 +1289,100 @@ class DeviceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"action\":\"NEXT\"}"))
                 .andExpect(status().isUnauthorized());
+    }
+
+    // ----- GET /{id}/active-playlist: the operator panel's list (VG-02) -----
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "OPERATOR")
+    void activePlaylist_operator_returnsIndexedItems() throws Exception {
+        when(playlistControlService.getActivePlaylist(11L)).thenReturn(new ActivePlaylistView(
+                11L, 100L, "Mall Loop", 45000L, false,
+                List.of(new ActivePlaylistItemView(0, 0, 10L, "Intro", 30L),
+                        new ActivePlaylistItemView(1, 2, 12L, "Promo", 15L))));
+
+        mockMvc.perform(get("/api/devices/11/active-playlist"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.deviceId").value(11))
+                .andExpect(jsonPath("$.playlistId").value(100))
+                .andExpect(jsonPath("$.playlistName").value("Mall Loop"))
+                .andExpect(jsonPath("$.totalDurationSeconds").value(45))
+                .andExpect(jsonPath("$.scheduled").value(false))
+                .andExpect(jsonPath("$.items[1].index").value(1))
+                .andExpect(jsonPath("$.items[1].position").value(2))
+                .andExpect(jsonPath("$.items[1].fileId").value(12))
+                .andExpect(jsonPath("$.items[1].name").value("Promo"))
+                .andExpect(jsonPath("$.items[1].durationSeconds").value(15))
+                // Operator-safe projection: no presigned URL, no storage key.
+                .andExpect(jsonPath("$.items[1].url").doesNotExist())
+                .andExpect(jsonPath("$.items[1].storageKey").doesNotExist());
+        verify(managementService).assertScopeForDevice(11L);
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "VIEWER")
+    void activePlaylist_viewer_isAllowed() throws Exception {
+        when(playlistControlService.getActivePlaylist(11L)).thenReturn(new ActivePlaylistView(
+                11L, 100L, "Mall Loop", 30000L, true,
+                List.of(new ActivePlaylistItemView(0, 0, 10L, "Intro", 30L))));
+
+        mockMvc.perform(get("/api/devices/11/active-playlist"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.scheduled").value(true));
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "ADMIN")
+    void activePlaylist_admin_noAssignment_returns200WithNoItems() throws Exception {
+        when(playlistControlService.getActivePlaylist(12L))
+                .thenReturn(new ActivePlaylistView(12L, null, null, 0L, false, List.of()));
+
+        mockMvc.perform(get("/api/devices/12/active-playlist"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.playlistId").doesNotExist())
+                .andExpect(jsonPath("$.items").isEmpty());
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "OPERATOR")
+    void activePlaylist_outOfOperatorScope_returns404_withoutTouchingTheService() throws Exception {
+        org.mockito.Mockito.doThrow(new ResourceNotFoundException("Device", 13L))
+                .when(managementService).assertScopeForDevice(13L);
+
+        mockMvc.perform(get("/api/devices/13/active-playlist"))
+                .andExpect(status().isNotFound());
+        verifyNoInteractions(playlistControlService);
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "ADVERTISER")
+    void activePlaylist_advertiser_forbidden() throws Exception {
+        mockMvc.perform(get("/api/devices/11/active-playlist"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(playlistControlService);
+    }
+
+    @Test
+    void activePlaylist_deviceToken_forbidden() throws Exception {
+        // Fleet data is operator-only: a device may read its own /playlist, never this view.
+        mockMvc.perform(get("/api/devices/11/active-playlist").with(device(11)))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(playlistControlService);
+    }
+
+    @Test
+    void activePlaylist_unauthenticated_returns401() throws Exception {
+        mockMvc.perform(get("/api/devices/11/active-playlist"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @org.springframework.security.test.context.support.WithMockUser(roles = "OPERATOR")
+    void playlist_staysDeviceOnly_forOperators() throws Exception {
+        // The bug VG-02 fixed: the panel used to call this and always got 403. It must stay 403 —
+        // it presigns media URLs — which is why the panel now has its own endpoint.
+        mockMvc.perform(get("/api/devices/11/playlist"))
+                .andExpect(status().isForbidden());
     }
 
     private RemoteAction mockRemoteAction(Long actionId, Long deviceId, String payload) {
