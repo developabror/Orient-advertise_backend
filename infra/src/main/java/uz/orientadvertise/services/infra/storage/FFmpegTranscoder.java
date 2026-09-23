@@ -309,7 +309,11 @@ public class FFmpegTranscoder implements Transcoder {
                 return;
             }
 
-            // 7. Upload processed to content-processed
+            // 7. Upload processed to content-processed. Remember what this file pointed at first:
+            //    a retranscode writes a NEW key, and the old object would otherwise sit in the
+            //    bucket forever with nothing referencing it (VG-08).
+            String supersededProcessedKey = file.getProcessedStorageKey();
+            String supersededThumbnailKey = file.getThumbnailStorageKey();
             var processedKey = "processed/" + UUID.randomUUID() + ".mp4";
             var size = Files.size(processedTemp);
             // Integrity checksum of the EXACT bytes we serve (the processed MP4), so the device
@@ -340,6 +344,12 @@ public class FFmpegTranscoder implements Transcoder {
                         contentFileId, processedKey);
                 return;
             }
+            // The row now points at the new objects, so the ones it pointed at before are
+            // unreferenced. Best-effort and AFTER the update: a failed delete leaks one object,
+            // where deleting first would blank the clip on every screen if the update then failed.
+            deleteSuperseded(contentFileId, PROCESSED_BUCKET, supersededProcessedKey, processedKey);
+            deleteSuperseded(contentFileId, thumbnailBucket, supersededThumbnailKey, thumbnailKey);
+
             log.info("Transcode complete [id={}, processed={}, thumbnail={}, size={}, checksum={}]",
                     contentFileId, processedKey, thumbnailKey, size, checksum);
             broadcast(contentFileId, ContentFile.Status.READY, null, route);
@@ -353,6 +363,26 @@ public class FFmpegTranscoder implements Transcoder {
         } finally {
             deleteQuietly(rawTemp);
             deleteQuietly(processedTemp);
+        }
+    }
+
+    /**
+     * Drop an object a retranscode has just replaced (VG-08). Best-effort by design: the database
+     * already points at the new object, so a failure here costs one orphaned file, which the
+     * deleted-content sweeper never sees (the row is not deleted) but which also harms nothing
+     * beyond disk. It is never called with the key the row now holds.
+     */
+    private void deleteSuperseded(Long contentFileId, String bucket, String oldKey, String newKey) {
+        if (oldKey == null || oldKey.equals(newKey)) {
+            return;
+        }
+        try {
+            storageClient.delete(bucket, oldKey);
+            log.info("Removed superseded object after retranscode [id={}, bucket={}, key={}]",
+                    contentFileId, bucket, oldKey);
+        } catch (Exception e) {
+            log.warn("Could not remove superseded object [id={}, bucket={}, key={}]: {} — "
+                    + "it is now unreferenced and only costs disk", contentFileId, bucket, oldKey, e.toString());
         }
     }
 

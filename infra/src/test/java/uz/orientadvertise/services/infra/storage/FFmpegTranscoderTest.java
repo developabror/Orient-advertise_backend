@@ -120,6 +120,53 @@ class FFmpegTranscoderTest {
     }
 
     @Test
+    void retranscode_removesTheObjectsItJustReplaced() {
+        // VG-08: a retranscode writes a NEW processed key, so the old MP4 (and poster) become
+        // unreferenced. Nothing deleted them, and the deleted-content sweeper never sees them
+        // either — the row is alive. Every re-encode used to cost another copy of the video.
+        var file = claimedFile(1L);
+        when(file.getProcessedStorageKey()).thenReturn("processed/old.mp4");
+        when(file.getThumbnailStorageKey()).thenReturn("thumbs/old.jpg");
+        when(videoInspector.inspect(any())).thenReturn(InspectionResult.valid());
+        when(videoInspector.extractDurationSeconds(any())).thenReturn(120);
+        when(contentFileRepository.markTranscodeReady(anyLong(), anyString(), anyLong(), anyString(),
+                isNull(), anyInt(), any(Instant.class))).thenReturn(1);
+
+        transcoder.runPipeline(1L);
+
+        verify(storageClient).delete("content-processed", "processed/old.mp4");
+        verify(storageClient).delete("content-thumbnails", "thumbs/old.jpg");
+    }
+
+    @Test
+    void retranscode_keepsTheOldObjectWhenTheTerminalWriteDidNotLand() {
+        // The row still points at the old key, so deleting it would blank the clip on every screen.
+        var file = claimedFile(1L);
+        when(file.getProcessedStorageKey()).thenReturn("processed/old.mp4");
+        when(videoInspector.inspect(any())).thenReturn(InspectionResult.valid());
+        when(videoInspector.extractDurationSeconds(any())).thenReturn(120);
+        when(contentFileRepository.markTranscodeReady(anyLong(), anyString(), anyLong(), anyString(),
+                isNull(), anyInt(), any(Instant.class))).thenReturn(0);   // lost the claim
+
+        transcoder.runPipeline(1L);
+
+        verify(storageClient, never()).delete(eq("content-processed"), eq("processed/old.mp4"));
+    }
+
+    @Test
+    void firstTranscode_hasNothingToSupersede() {
+        claimedFile(1L);   // no previous keys
+        when(videoInspector.inspect(any())).thenReturn(InspectionResult.valid());
+        when(videoInspector.extractDurationSeconds(any())).thenReturn(120);
+        when(contentFileRepository.markTranscodeReady(anyLong(), anyString(), anyLong(), anyString(),
+                isNull(), anyInt(), any(Instant.class))).thenReturn(1);
+
+        transcoder.runPipeline(1L);
+
+        verify(storageClient, never()).delete(anyString(), anyString());
+    }
+
+    @Test
     void transcode_persistsProcessedSizeAndChecksumOfProcessedObject() throws Exception {
         // The device downloads the PROCESSED object, so sizeBytes must be the processed size and
         // checksum its SHA-256 — otherwise the device's downloaded-bytes check never matches and it

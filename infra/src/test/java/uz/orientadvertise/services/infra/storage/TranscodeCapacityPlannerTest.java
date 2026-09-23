@@ -3,6 +3,7 @@ package uz.orientadvertise.services.infra.storage;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -69,16 +70,52 @@ class TranscodeCapacityPlannerTest {
     }
 
     @Test
-    void neverReturnsZeroOrNegative_forAnyHostShape() {
-        // A pipeline that cannot run at all is worse than one that runs slowly: the file would sit
-        // in UPLOADED forever, which is the failure this whole release exists to remove.
-        int[][] shapes = {{0, 0, 0}, {1, 1, 1}, {-1, -5, -5}, {0, 128, 4096}};
+    void staysWithinBounds_forAnyHostShape() {
+        // A pipeline that runs slowly still beats one that does not run — but see VG-17 below for
+        // the one shape where refusing is the only safe answer.
+        int[][] shapes = {{0, 0, 0}, {1, 1, 1}, {-1, -5, -5}};
         for (int[] shape : shapes) {
             int planned = TranscodeCapacityPlanner.plan(shape[0], shape[1], mib(shape[2]), mib(shape[2]),
                     JOB_MB, RESERVE_MB, MAX_CAP);
             assertTrue(planned >= 1 && planned <= MAX_CAP,
                     "planned=" + planned + " for cpus=" + shape[1] + " mem=" + shape[2]);
         }
+    }
+
+    // ---------- VG-17: an impossible budget must be refused, a tight one must not ----------
+
+    @Test
+    void negativeBudget_plansZero_ratherThanOneEncodeThatKillsTheJvm() {
+        // Heap alone fills the container: 4 GiB of -Xmx in a 4 GiB cgroup, so after the reserve
+        // there is LESS THAN NOTHING left. This used to plan 1; ffmpeg is a child of the JVM and
+        // charged to the same cgroup, so that one encode gets the BACKEND OOM-killed —
+        // oom_badness picks the bigger process. The file sitting in UPLOADED is the better loss.
+        assertEquals(0, plan(0, 128, 4096, 4096));
+        assertEquals(0, plan(0, 4, 1024, 1024));
+    }
+
+    @Test
+    void tightButPositiveBudget_stillPlansOne() {
+        // Today's production box: 700 MiB container, 315 MiB heap, 256 MiB reserve leaves 129 MiB
+        // against a 320 MiB job budget. That is tight, not impossible — the budget subtracts the
+        // WHOLE max heap, which is rarely all resident, and this box does encode successfully at
+        // -preset veryfast (~218 MiB peak). Refusing here would have turned transcoding off in
+        // production; the executor logs the missing headroom instead.
+        assertEquals(1, plan(0, 1, 700, 315));
+        assertTrue(TranscodeCapacityPlanner.isTightOnMemory(mib(700), mib(315), JOB_MB, RESERVE_MB));
+    }
+
+    @Test
+    void aHostWithHeadroom_isNotReportedAsTight() {
+        assertFalse(TranscodeCapacityPlanner.isTightOnMemory(mib(4096), mib(1024), JOB_MB, RESERVE_MB));
+        // Unknown memory says nothing about headroom, so it must not raise the warning either.
+        assertFalse(TranscodeCapacityPlanner.isTightOnMemory(0, mib(1024), JOB_MB, RESERVE_MB));
+    }
+
+    @Test
+    void anExplicitOverride_stillWins_evenOnAnImpossibleBox() {
+        // The operator escape hatch: "I know this host, run one anyway".
+        assertEquals(1, plan(1, 128, 4096, 4096));
     }
 
     @Test

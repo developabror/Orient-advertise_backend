@@ -26,12 +26,14 @@ class TranscodeBacklogHealthIndicatorTest {
     private static final Duration LEASE = Duration.ofMinutes(20);
 
     private ContentFileRepository repository;
+    private uz.orientadvertise.services.infra.storage.TranscodeExecutor transcodeExecutor;
     private TranscodeBacklogHealthIndicator indicator;
 
     @BeforeEach
     void setUp() {
         repository = mock(ContentFileRepository.class);
-        indicator = new TranscodeBacklogHealthIndicator(repository, STALE_AFTER, LEASE);
+        transcodeExecutor = mock(uz.orientadvertise.services.infra.storage.TranscodeExecutor.class);
+        indicator = new TranscodeBacklogHealthIndicator(repository, transcodeExecutor, STALE_AFTER, LEASE);
     }
 
     @Test
@@ -101,5 +103,17 @@ class TranscodeBacklogHealthIndicatorTest {
             assertEquals("backlog query failed", reason);
             assertTrue(!reason.contains("jdbc"), "must not echo connection detail to an anonymous caller");
         }
+    }
+
+    @Test
+    void reportsDownAtOnceWhenTheHostCannotFitAnEncode() {
+        // VG-17: the pool sized itself to zero rather than letting the kernel OOM-kill the JVM.
+        // Without this the only symptom is uploads sitting in UPLOADED until the stale window.
+        when(transcodeExecutor.isDisabled()).thenReturn(true);
+
+        var status = indicator.check();
+
+        assertInstanceOf(HealthStatus.Status.Down.class, status.status());
+        assertTrue(((HealthStatus.Status.Down) status.status()).reason().contains("disabled"));
     }
 }

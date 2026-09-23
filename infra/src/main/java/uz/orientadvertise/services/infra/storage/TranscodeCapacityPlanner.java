@@ -35,8 +35,14 @@ public final class TranscodeCapacityPlanner {
      * @param reserveMb    non-heap JVM overhead to keep off the table (metaspace, code cache,
      *                     thread stacks, direct buffers, the OS page cache the JVM needs)
      * @param maxCap       upper bound so an enormous host does not spawn an absurd number of encodes
-     * @return concurrency in {@code [1, maxCap]} — never 0, because a pipeline that cannot run is
-     *         worse than one that runs slowly
+     * @return concurrency in {@code [1, maxCap]}, or <b>0</b> when the memory budget is negative —
+     *         the heap plus the reserve already exceed the container, so an encode has nothing to
+     *         run in (VG-17). It used to floor at 1 even then, on the reasoning that a slow pipeline
+     *         beats a stopped one; but the encode is a CHILD of the JVM, charged to the same cgroup,
+     *         and {@code oom_badness} kills the parent, so starting it costs the whole backend.
+     *         Refusing is visible (ERROR at startup, health DOWN, uploads stay UPLOADED); an OOM
+     *         kill looks like a random restart. A merely TIGHT budget still returns 1 — see the
+     *         body. An explicit {@code app.video.transcode.concurrency} overrides all of this.
      */
     public static int plan(int configured,
                            int cpus,
@@ -60,10 +66,35 @@ public final class TranscodeCapacityPlanner {
             long available = containerMemoryBytes
                     - Math.max(0, jvmMaxHeapBytes)
                     - mib(Math.max(0, reserveMb));
-            byMemory = (int) Math.max(1, available / mib(jobMemoryMb));
+            // VG-17. Two different situations used to collapse into "1":
+            //   available <= 0  — the heap plus the reserve already exceed the container, so an
+            //                     encode has literally nothing to run in. Starting one puts an
+            //                     ffmpeg child in the JVM's cgroup and oom_badness kills the JVM:
+            //                     the backend dies, not the encode. Refuse, loudly (0).
+            //   0 < available < one job — tight, not impossible. The budget subtracts the WHOLE
+            //                     max heap, which is rarely all resident, so today's 700 MiB
+            //                     production box lands here and does encode successfully at
+            //                     -preset veryfast (~218 MiB peak). Allow one, and let the
+            //                     executor warn that there is no headroom.
+            byMemory = available <= 0 ? 0 : (int) Math.max(1, available / mib(jobMemoryMb));
         }
 
-        return Math.max(1, Math.min(cap, Math.min(byCpu, byMemory)));
+        int planned = Math.min(cap, Math.min(byCpu, byMemory));
+        return Math.max(0, planned);
+    }
+
+    /**
+     * True when one encode is allowed but the arithmetic leaves it no headroom — the caller should
+     * say so at startup, because this is the shape that OOM-kills as soon as the preset gets
+     * heavier or the heap grows.
+     */
+    public static boolean isTightOnMemory(long containerMemoryBytes, long jvmMaxHeapBytes,
+                                          int jobMemoryMb, int reserveMb) {
+        if (containerMemoryBytes <= 0 || jobMemoryMb <= 0) {
+            return false;   // unknown memory is not a claim about headroom
+        }
+        long available = containerMemoryBytes - Math.max(0, jvmMaxHeapBytes) - mib(Math.max(0, reserveMb));
+        return available > 0 && available < mib(jobMemoryMb);
     }
 
     private static long mib(long megabytes) {

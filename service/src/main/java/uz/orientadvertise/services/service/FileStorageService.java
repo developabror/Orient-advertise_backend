@@ -53,6 +53,21 @@ public class FileStorageService {
         storageClient.delete(DEFAULT_BUCKET, objectName);
     }
 
+    /**
+     * Remove a processed MP4. Only two things may call this: the sweeper that reclaims a
+     * soft-deleted file's bytes, and a retranscode superseding its own previous output — a device
+     * downloads from this bucket, so deleting an object a live playlist still lists blanks that
+     * slot on every screen holding it.
+     */
+    public void deleteProcessed(String objectName) {
+        storageClient.delete(PROCESSED_BUCKET, objectName);
+    }
+
+    /** Remove a poster JPEG. Same rule as {@link #deleteProcessed}. */
+    public void deleteThumbnail(String objectName) {
+        storageClient.delete(thumbnailBucket, objectName);
+    }
+
     public boolean isStorageAvailable() {
         return storageClient.isAvailable();
     }

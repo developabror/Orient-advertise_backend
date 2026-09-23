@@ -50,7 +50,9 @@ public class TranscodeExecutor {
     public static final int PRIORITY_URGENT = 0;
     public static final int PRIORITY_NORMAL = 10;
 
+    /** Null when transcoding is disabled for lack of memory — see the constructor. */
     private final ThreadPoolExecutor executor;
+    private final boolean disabled;
     private final AtomicLong sequence = new AtomicLong();
     private final int concurrency;
     private final int queueCapacity;
@@ -70,10 +72,23 @@ public class TranscodeExecutor {
 
         this.concurrency = TranscodeCapacityPlanner.plan(configuredConcurrency, cpus, containerMemory,
                 heap, jobMemoryMb, reserveMb, maxConcurrency);
+        // 0 means the host cannot fit even one encode (VG-17). Running one anyway would put an
+        // ffmpeg child in the JVM's own cgroup and let the kernel kill the BACKEND, so the pipeline
+        // stops instead — loudly, and with both ways out named.
+        this.disabled = this.concurrency < 1;
+        if (this.disabled) {
+            log.error("Transcoding is DISABLED — this host cannot fit one encode: containerMemory={} MiB, "
+                            + "maxHeap={} MiB, reserve={} MiB, jobBudget={} MiB. Uploads will stay in "
+                            + "UPLOADED and /api/health reports the transcode component DOWN. Fix by "
+                            + "giving the container more memory, or by lowering "
+                            + "app.video.transcode.job-memory-mb together with the ffmpeg preset. "
+                            + "app.video.transcode.concurrency overrides this deliberately.",
+                    containerMemory / (1024 * 1024), heap / (1024 * 1024), reserveMb, jobMemoryMb);
+        }
         this.queueCapacity = Math.max(1, queueCapacity);
         this.shutdownGraceSeconds = Math.max(1, shutdownGraceSeconds);
 
-        this.executor = new ThreadPoolExecutor(
+        this.executor = this.disabled ? null : new ThreadPoolExecutor(
                 this.concurrency, this.concurrency,
                 0L, TimeUnit.MILLISECONDS,
                 new PriorityBlockingQueue<>(Math.min(this.queueCapacity, 64)),
@@ -86,6 +101,17 @@ public class TranscodeExecutor {
                             this.concurrency, exec.getQueue().size());
                     throw new java.util.concurrent.RejectedExecutionException("transcode pool is shut down");
                 });
+
+        if (!this.disabled && TranscodeCapacityPlanner.isTightOnMemory(containerMemory, heap, jobMemoryMb, reserveMb)) {
+            // One encode is allowed, but only because the budget subtracts a heap that is rarely
+            // all resident. It works today at -preset veryfast (~218 MiB); a heavier preset
+            // (medium is ~438 MiB) on this shape is what OOM-kills the JVM (VG-17).
+            log.warn("Transcode pool has NO memory headroom: containerMemory={} MiB, maxHeap={} MiB, "
+                            + "reserve={} MiB leaves less than one job budget ({} MiB). One encode runs "
+                            + "anyway and does succeed at the current preset, but do not raise the ffmpeg "
+                            + "preset or the heap on this host without giving the container more memory.",
+                    containerMemory / (1024 * 1024), heap / (1024 * 1024), reserveMb, jobMemoryMb);
+        }
 
         log.info("Transcode pool sized: concurrency={} ({}), cpus={}, containerMemory={} MiB, "
                         + "maxHeap={} MiB, jobBudget={} MiB, queueCapacity={}",
@@ -107,6 +133,12 @@ public class TranscodeExecutor {
      *         logged at ERROR; the caller's row stays claimed for the sweeper)
      */
     public boolean submit(Runnable task, int priority, String description) {
+        if (disabled) {
+            log.error("Transcode task REJECTED — transcoding is disabled on this host (not enough "
+                    + "memory for one encode) [{}]; the content row stays claimed and "
+                    + "TranscodeSweeper will re-queue it", description);
+            return false;
+        }
         if (executor.getQueue().size() >= queueCapacity) {
             log.error("Transcode task REJECTED — queue at capacity {} [{}]; "
                     + "the content row stays claimed and TranscodeSweeper will re-queue it",
@@ -129,12 +161,12 @@ public class TranscodeExecutor {
 
     /** Tasks waiting to start — surfaced by the Telegram {@code /health} command. */
     public int getQueueDepth() {
-        return executor.getQueue().size();
+        return disabled ? 0 : executor.getQueue().size();
     }
 
     /** Encodes running right now. */
     public int getActiveCount() {
-        return executor.getActiveCount();
+        return disabled ? 0 : executor.getActiveCount();
     }
 
     /** Configured queue bound, for capacity reporting. */
@@ -148,8 +180,16 @@ public class TranscodeExecutor {
      * encodes past the grace period are abandoned — their rows stay TRANSCODING and the sweeper's
      * boot recovery re-queues them.
      */
+    /** True when this host cannot fit one encode, so nothing is processed (VG-17). */
+    public boolean isDisabled() {
+        return disabled;
+    }
+
     @PreDestroy
     public void shutdown() {
+        if (disabled) {
+            return;
+        }
         executor.shutdown();
         try {
             if (!executor.awaitTermination(shutdownGraceSeconds, TimeUnit.SECONDS)) {

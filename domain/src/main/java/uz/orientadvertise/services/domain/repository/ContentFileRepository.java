@@ -270,6 +270,28 @@ public interface ContentFileRepository extends JpaRepository<ContentFile, Long> 
                            @Param("transcoding") ContentFile.Status transcoding,
                            @Param("now") Instant now);
 
+    /**
+     * Soft-deleted files that still own bytes in object storage, oldest deletion first (VG-08).
+     * Feeds the sweeper that reclaims them; a row is picked up only after the grace period, and
+     * only while it still has a key to clear, so a swept file is never revisited.
+     */
+    @Query("SELECT c FROM ContentFile c "
+           + "WHERE c.deletedAt IS NOT NULL AND c.deletedAt < :cutoff "
+           + "AND (c.processedStorageKey IS NOT NULL OR c.thumbnailStorageKey IS NOT NULL) "
+           + "ORDER BY c.deletedAt ASC")
+    List<ContentFile> findDeletedWithStorageObjects(@Param("cutoff") Instant cutoff, Pageable pageable);
+
+    /**
+     * Record that a deleted file's bytes are gone. Clearing the keys is what makes the sweep
+     * idempotent — and it is done ONLY after the objects are actually removed, so a storage outage
+     * leaves the row for the next run rather than losing track of the bytes forever.
+     */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Query("UPDATE ContentFile c SET c.processedStorageKey = NULL, c.thumbnailStorageKey = NULL, "
+           + "c.updatedAt = :now WHERE c.id = :id AND c.deletedAt IS NOT NULL")
+    int clearStorageKeysOfDeleted(@Param("id") Long id, @Param("now") Instant now);
+
     /** @see #markTranscodeReady */
     default int markTranscodeReady(Long id, String processedKey, long sizeBytes, String checksum,
                                     String thumbnailKey, Integer durationSeconds, Instant now) {

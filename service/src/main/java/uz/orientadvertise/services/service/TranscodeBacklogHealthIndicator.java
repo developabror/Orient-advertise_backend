@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 import uz.orientadvertise.services.common.util.DateUtils;
 import uz.orientadvertise.services.domain.model.HealthStatus;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
+import uz.orientadvertise.services.infra.storage.TranscodeExecutor;
 
 /**
  * Reports whether uploads are actually being transcoded.
@@ -40,6 +41,7 @@ public class TranscodeBacklogHealthIndicator {
     private static final String COMPONENT = "transcode-backlog";
 
     private final ContentFileRepository contentFileRepository;
+    private final TranscodeExecutor transcodeExecutor;
     private final Duration staleAfter;
     private final Duration leaseTimeout;
 
@@ -49,9 +51,11 @@ public class TranscodeBacklogHealthIndicator {
      */
     public TranscodeBacklogHealthIndicator(
             ContentFileRepository contentFileRepository,
+            TranscodeExecutor transcodeExecutor,
             @Value("${app.video.sweeper.stale-alert-after:PT10M}") Duration staleAfter,
             @Value("${app.video.sweeper.lease-timeout:PT20M}") Duration leaseTimeout) {
         this.contentFileRepository = contentFileRepository;
+        this.transcodeExecutor = transcodeExecutor;
         this.staleAfter = staleAfter;
         this.leaseTimeout = leaseTimeout;
     }
@@ -62,6 +66,13 @@ public class TranscodeBacklogHealthIndicator {
             long stuck = contentFileRepository.countStaleUploaded(now.minus(staleAfter));
             long pastLease = contentFileRepository.countEncodesPastLease(now.minus(leaseTimeout));
             var problems = new java.util.ArrayList<String>();
+            if (transcodeExecutor.isDisabled()) {
+                // VG-17: the pool refused to size itself because one encode does not fit in this
+                // host's memory. Say so at once — otherwise the only symptom is uploads quietly
+                // sitting in UPLOADED until the stale window below trips, which reads like a bug.
+                problems.add("transcoding is disabled — this host has too little memory for one "
+                        + "encode (see the startup ERROR for the numbers)");
+            }
             if (stuck > 0) {
                 problems.add("%d content file(s) stuck in UPLOADED for more than %s".formatted(stuck, staleAfter));
             }

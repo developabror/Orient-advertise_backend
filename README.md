@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.153`
+`1.0.154`
 
 ## Architecture
 
@@ -1302,6 +1302,45 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Deleted content stops costing disk, and a host too small to encode says so (v1.0.154)
+
+Two post-release findings, both about a box running out of something.
+
+> **VG-08 — deleted content never freed its bytes.** Deleting content only stamped `deleted_at`; the
+> processed MP4 and its poster stayed in MinIO forever, and a retranscode silently orphaned the
+> previous MP4 on top. The only lifecycle rule covers `content-raw` (source uploads), so the buckets
+> devices actually download from grew monotonically. On a 10 GiB box that ends with Postgres
+> crash-looping on a full disk.
+
+> **VG-17 — the capacity planner promised an encode it could not pay for.** When the memory budget
+> came out **negative** — the max heap plus the reserve already exceeding the container — the planner
+> still returned 1. ffmpeg is a child of the JVM and charged to the same cgroup, and `oom_badness`
+> picks the bigger process, so that one encode gets the **backend** killed, not the encode. It reads
+> as a random restart.
+
+**What changed**
+
+- `ContentObjectCleanupService` reclaims a deleted file's processed and thumbnail objects once
+  `app.storage.deleted-content-grace` (default 7 days) has passed, then clears the keys. The keys are
+  cleared **after** the delete, so a storage outage leaves the row for the next pass rather than
+  losing the only pointer to bytes that are still there. Storage calls run outside any transaction
+  (the VG-07 rule), a file that is not deleted is never considered, and one bad key cannot strand
+  the batch. Hourly, bounded by `app.storage.cleanup-batch-size`.
+- A retranscode now deletes the objects it just replaced, after the terminal write lands — never
+  before, since until then the row still points at them and deleting would blank the clip on every
+  screen holding it.
+- The planner returns **0** for a negative budget, and `TranscodeExecutor` then refuses work with an
+  ERROR naming the numbers and both ways out; `/api/health` reports the transcode component DOWN
+  immediately instead of waiting for uploads to pile up. A merely **tight** budget still runs one
+  encode and logs the missing headroom: today's production box (700 MiB, 315 MiB heap) lands there
+  and does encode fine at `-preset veryfast`, so refusing would have turned transcoding off in
+  production. `app.video.transcode.concurrency` overrides all of it.
+
+**Tests:** `ContentObjectCleanupServiceTest` (new, 7), `FFmpegTranscoderTest` (+3 for the superseded
+objects, including "the terminal write did not land → keep the old object"),
+`TranscodeCapacityPlannerTest` (+4, and the old "never returns zero" property rewritten to the new
+contract), `TranscodeExecutorTest` (+1), `TranscodeBacklogHealthIndicatorTest` (+1).
 
 ### `/sync` stops holding the pool, and a playlist edit cuts over as a group (v1.0.153)
 

@@ -257,6 +257,18 @@ app:
     # ISO-8601 duration. A bare number is MILLISECONDS to both readers of this key (this binding
     # and the @Scheduled that drives the probe) — write PT30S, not 30.
     recheck-interval: ${APP_MINIO_RECHECK_INTERVAL:PT30S}
+  storage:
+    # Reclaiming the bytes of DELETED content (VG-08). Deleting content only stamped deleted_at:
+    # the processed MP4 and its poster stayed in MinIO forever, and only content-raw had a
+    # lifecycle rule — so storage grew monotonically and a small disk eventually took Postgres
+    # down with it. ContentObjectCleanupService now removes them, then clears the keys.
+    #   deleted-content-grace: how long a deleted file's bytes survive. This is the ONLY window in
+    #     which an accidental delete can still be recovered by hand, so do not set it to zero.
+    #   cleanup-interval / cleanup-batch-size: how often it runs and how many files one pass may
+    #     reclaim. Bounded per pass so a bulk delete cannot spend an hour inside one sweep.
+    deleted-content-grace: ${APP_STORAGE_DELETED_CONTENT_GRACE:P7D}
+    cleanup-interval: ${APP_STORAGE_CLEANUP_INTERVAL:PT1H}
+    cleanup-batch-size: ${APP_STORAGE_CLEANUP_BATCH_SIZE:200}
   # Remote view/control (operator "Connect" to a TV-Box). SHIPS DARK: with enabled=false,
   # POST /api/devices/{id}/remote returns 503 and the heartbeat never emits desiredRemoteSession,
   # so the wire is byte-identical to the pre-feature contract. Enable per environment once a

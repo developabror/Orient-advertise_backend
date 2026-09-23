@@ -153,13 +153,43 @@ class TranscodeExecutorTest {
 
     @Test
     void autoPlannedConcurrency_isAlwaysUsable() {
-        // Whatever machine CI runs on, the pool must come up with at least one worker.
+        // Whatever machine CI runs on, the pool must come up with at least one worker. (A host too
+        // small to fit ANY encode is the one exception — see below — and CI is not one.)
         var executor = new TranscodeExecutor(0, 8, 320, 256, 10, 1);
         try {
-            assertTrue(executor.getConcurrency() >= 1, "auto plan must never yield 0 workers");
+            assertTrue(executor.getConcurrency() >= 1, "auto plan must never yield 0 workers here");
             assertTrue(executor.getConcurrency() <= 8, "auto plan must respect the cap");
+            assertFalse(executor.isDisabled());
         } finally {
             executor.shutdown();
+        }
+    }
+
+    @Test
+    void aHostThatCannotFitAnEncode_refusesWorkInsteadOfKillingTheJvm() {
+        // VG-17. A reserve larger than the whole container drives the memory budget negative, so
+        // the planner returns 0. Starting an encode anyway would charge ffmpeg's RSS to the JVM's
+        // cgroup and get the BACKEND OOM-killed; refusing keeps the file in UPLOADED, which the
+        // sweeper and /api/health both surface.
+        org.junit.jupiter.api.Assumptions.assumeTrue(HostResources.containerMemoryLimitBytes() > 0,
+                "this host reports no memory limit, so the planner cannot reason about memory");
+        var executor = new TranscodeExecutor(0, 8, 320, Integer.MAX_VALUE, 10, 1);
+        var appender = attachAppender();
+        try {
+            assertTrue(executor.isDisabled());
+            assertEquals(0, executor.getConcurrency());
+
+            var ran = new java.util.concurrent.atomic.AtomicBoolean(false);
+            boolean accepted = executor.submit(() -> ran.set(true), TranscodeExecutor.PRIORITY_NORMAL, "job");
+
+            assertFalse(accepted, "a disabled pool must reject, so the caller releases the row");
+            assertFalse(ran.get(), "nothing may run");
+            assertEquals(0, executor.getQueueDepth());
+            assertEquals(0, executor.getActiveCount());
+            assertTrue(appender.list.stream().anyMatch(e -> e.getFormattedMessage().contains("disabled")),
+                    "the refusal must be loud — an operator has to know why nothing transcodes");
+        } finally {
+            executor.shutdown();   // must not throw with no pool behind it
         }
     }
 
