@@ -2,7 +2,7 @@
 
 **Audience:** the OrientedTV Android signage client team.
 **Purpose:** everything the device must send, receive, parse, persist and tolerate when it talks to the backend: REST contracts, the WebSocket channel and every frame on it, the MinIO download, timers, limits, failure modes.
-**Backend baseline:** `1.0.153` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.153 in R22–R28 below).
+**Backend baseline:** `1.0.155` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.155 in R22–R29 below).
 **How this was verified:** every statement was checked against the backend source. The wire examples were captured from a live run of `1.0.135` (dev profile, real MinIO and Redis, real ffmpeg transcode, a real WebSocket client) on 2026-09-14. Rules marked *(verified)* were exercised end to end in that run.
 
 Where this document disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md`, or with an earlier revision of this file, **this document wins**. If you built against the previous revision, read the revision notes right below first.
@@ -22,8 +22,9 @@ Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always 
 | R26 | 1.0.151 | **`PLAYLIST_CONTROL` now really arrives from the dashboard.** The operator device page could never send one before (its panel was broken), so in practice only the external API issued these. The dashboard hides the buttons for a device in synchronised playback, but the external API can still send one at any time. | No wire change. Make sure `PLAYLIST_CONTROL` is implemented as in §8.3 — `PREV`/`NEXT`/`JUMP` with `position` = the 0-based index into your **delivered** list — and that a device following a group anchor answers `FAILED` with `result: "SCHEDULE_MODE"` rather than jumping out of sync. |
 | R27 | 1.0.152 | A reported play is checked against the campaign that was live **when it played**, not the one live now, and is credited to it. A play whose campaign ended is still accepted for 30 minutes afterwards. | Nothing required — and you may drop any "flush before a content switch" special case. Keep `playedAt` accurate to the millisecond and keep flushing promptly (§11). |
 | R28 | 1.0.153 | **A playlist edit now gets its own `activateAt`, in the future** (at least 2 min, more when the edit adds files to download), instead of reusing the assignment's original anchor whose instant had already passed. Every screen on the assignment switches together at that instant, and the loop restarts from the first item. `/sync` also answers **503 in about 3 s** when object storage hangs, rather than eventually. | **Apply the §7.3 formula to EVERY pending version, edits included**: keep playing the live version until `activateAt`, then switch, and keep the old files until you do. Do not special-case an edit as "switch as soon as confirmed" — that is what pulls one screen out of step with the rest of its site (§7.4). |
+| R29 | 1.0.155 | **`URGENT_CONTENT` is no longer sent at all.** It was broadcast to every connected device in the fleet on an "urgent" upload, carried nothing actionable, and this spec already told you to ignore it. `urgent` now means only what it always did on the server: that file jumps the transcode queue. | Nothing to do. If you kept a branch for this frame you may delete it; unknown frame types must still be ignored (§10), so an old client is unaffected either way. |
 
-No other wire change between 1.0.138 and 1.0.153: request/response shapes, auth, timers and limits
+No other wire change between 1.0.138 and 1.0.155: request/response shapes, auth, timers and limits
 are unchanged (the dependency upgrade to Spring Boot 3.5 in 1.0.148 changed nothing on the wire).
 One behaviour change needs no client action but may surprise QA: since 1.0.142, when a short
 "Replace" campaign ends, screens go back to the booking underneath it instead of going blank. This
@@ -39,7 +40,7 @@ These are behaviour differences between the previous spec and what the backend a
 | R2 | New actions arrive live as WS `ACTION_PENDING` | **Since backend v1.0.150, yes**: a frame is pushed as soon as the action is committed, and also replayed on every connect. It is best-effort, so the heartbeat and `GET /actions/pending` remain the guarantee. Before v1.0.150 it was only replayed on connect. | §8.1 |
 | R3 | `currentFileIds` = every file you hold "regardless of download status" | List **only fully downloaded and verified** files. The server never issues a URL for a file you claim to hold, so a partial file listed there can never be resumed. | §6.2 |
 | R4 | `fullSync` is a hint you can ignore | With `fullSync: true` the server **ignored your `currentFileIds`**. `filesToAdd` repeats files you already have, and `filesToDelete` is always empty, so you must garbage-collect yourself. | §6.3, §6.4 |
-| R5 | `URGENT_CONTENT` is never pushed | It **is** pushed to every connected device on the whole fleet. It is not actionable, so ignore it. | §10.3 |
+| R5 | `URGENT_CONTENT` is never pushed | ~~It **is** pushed to every connected device on the whole fleet.~~ True again since 1.0.155: the frame was removed (R29). Ignore it if an older server sends one. | §10.3 |
 | R6 | The server pings every ~90 s | The server **never pings**. The client must send WS pings. | §10.6 |
 | R7 | A deleted device gets 404 and should re-register | A deleted (or rotated) token gets **401**. ~~Re-registering a soft-deleted serial currently fails with **500**.~~ Since 1.0.146 it registers as a new device (R23). | §2 |
 | R8 | Action `payload` looks like a JSON object | `payload` is a **JSON document encoded as a string**, and it may be `null`. Action types also include `PLAYLIST_CONTROL` and `ASSIGN_CONTENT`. | §8.2, §8.3 |
@@ -62,7 +63,7 @@ These are behaviour differences between the previous spec and what the backend a
 ## 0. Mental model
 
 1. **The backend is the single source of truth.** The device never decides *what* to play or *which version* is current. It reports what it has, asks for the diff, downloads, verifies, confirms, then plays.
-2. **The heartbeat is the contract; the WebSocket is an accelerator.** Almost every WS frame carries information you can also get from the heartbeat, `/sync` or `/actions/pending`. The exceptions are §7.5 (group jump, which needs `/sync`) and `URGENT_CONTENT` (nothing to act on). Build every feature so it works with the socket down.
+2. **The heartbeat is the contract; the WebSocket is an accelerator.** Almost every WS frame carries information you can also get from the heartbeat, `/sync` or `/actions/pending`. The one exception is §7.5 (the group jump, which needs `/sync`). Build every feature so it works with the socket down.
 3. **Content version is an opaque 64-char lowercase hex token.** Store it, echo it, compare it for equality. Never parse or compute it.
 4. **You only download the processed MP4** from a MinIO presigned URL that `/sync` hands you. You never touch buckets, raw uploads or the transcoder.
 5. **Identity is `deviceId` + `deviceToken`.** Every authenticated call puts your own `deviceId` in the path and the token in `X-Device-Token`.
@@ -857,7 +858,7 @@ On **every** successful connection the server immediately replays, in this order
 1. One **`ACTION_PENDING`** frame per PENDING action, by `issuedAt` ascending. Expired-but-unswept actions are included.
 2. **`SYNC_REQUIRED`**, only if content is assigned and it differs from the version the server has stored for you. The stored version is updated by your heartbeat `contentVersion` and by every confirm (even a MISMATCH), and **cleared by re-registration**.
 
-Nothing else is replayed: no `SYNC_CONTENT`, no group jump, no `URGENT_CONTENT`, and no remote-session frame (the heartbeat covers sessions). So after every (re)connect you **MUST** also run `/sync` once (§6.1).
+Nothing else is replayed: no `SYNC_CONTENT`, no group jump, and no remote-session frame (the heartbeat covers sessions). So after every (re)connect you **MUST** also run `/sync` once (§6.1).
 
 ### 10.3 Inbound frames
 
@@ -887,12 +888,12 @@ Frames are JSON text, discriminated by `type`. **Ignore unknown `type` values** 
 ```
 - It has no `payload` and no `expiresAt`. Action: call `GET /actions/pending` once, then execute per §8.
 
-**`URGENT_CONTENT`**: broadcast *(verified)*.
+**`URGENT_CONTENT`**: **removed in backend 1.0.155** (R29). It used to be broadcast to every connected device in the fleet on an "urgent" upload:
 ```json
 {"type":"URGENT_CONTENT","contentFileId":2,"projectId":1}
 ```
-- Sent to **every connected device on the whole fleet**, whatever its project, when an operator uploads a file with `urgent=true`. At that moment the file is not transcoded and is not in any playlist.
-- Action: **ignore it** (debug log only). It **MUST NOT** trigger a download or a sync, because a fleet-wide sync on every urgent upload would stampede the server. Once the file is added to your playlist you receive `SYNC_CONTENT`.
+- It was never actionable — at that moment the file is not transcoded and is in no playlist — so this spec always said to ignore it. The server no longer sends it. A file reaches you the ordinary way: it is added to a playlist, and you receive `SYNC_CONTENT`.
+- Against an older server, ignore it as before (debug log only). It **MUST NOT** trigger a download or a sync.
 
 **`REMOTE_SESSION_START`** *(verified)*.
 ```json
@@ -1121,7 +1122,7 @@ These are current backend behaviours that are arguably bugs. The client rules ab
 | G-6 | ~~A soft-deleted device cannot re-register its serial (500).~~ **Fixed in backend 1.0.146:** it registers as a new device (R23). | Persist the new `deviceId` (§2). |
 | G-7 | A null `contentFileId` or `playedAt` gives 500 and rolls back the whole playback batch. | Validate before enqueueing (§11). |
 | G-8 | Token rotation or device deletion does not close an open WebSocket. | Close it yourself on REST 401 (§10.8). |
-| G-9 | `URGENT_CONTENT` is broadcast fleet-wide, unscoped, and carries nothing actionable. | Ignore it (§10.3). |
+| G-9 | ~~`URGENT_CONTENT` is broadcast fleet-wide, unscoped, and carries nothing actionable.~~ **Fixed in backend v1.0.155:** the frame was removed (R29). | Ignore it on older servers (§10.3). |
 | G-10 | Concurrent server pushes to one socket are not serialised, so a frame can be dropped. | Frames only accelerate; correctness comes from REST (§10.4). |
 | G-11 | ~~The transcoder does not force `yuv420p` or an H.264 profile.~~ **Fixed in backend v1.0.149:** output is forced to 8-bit 4:2:0 High. | Tolerate decoder failures per item (§6.5). |
 | G-12 | `filesToAdd[].contentType` and `name` describe the original upload, not the served MP4. | Ignore both for decoding (§6.3). |

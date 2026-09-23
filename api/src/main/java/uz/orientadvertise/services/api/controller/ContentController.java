@@ -26,8 +26,6 @@ import org.springframework.web.multipart.MultipartFile;
 import uz.orientadvertise.services.api.dto.ContentFileDetail;
 import uz.orientadvertise.services.api.dto.ContentFileSummary;
 import uz.orientadvertise.services.api.openapi.SensitiveEndpoint;
-import uz.orientadvertise.services.api.ws.DeviceWebSocketHandler;
-import uz.orientadvertise.services.api.ws.DeviceWebSocketHandler.PushResult;
 import uz.orientadvertise.services.common.util.ProjectIds;
 import uz.orientadvertise.services.common.util.VideoUploadValidator;
 import uz.orientadvertise.services.domain.model.ContentFile;
@@ -48,18 +46,15 @@ public class ContentController {
     private final ContentListService listService;
     private final ContentManagementService managementService;
     private final ContentRetranscodeService retranscodeService;
-    private final DeviceWebSocketHandler webSocketHandler;
 
     public ContentController(ContentUploadService uploadService,
                               ContentListService listService,
                               ContentManagementService managementService,
-                              ContentRetranscodeService retranscodeService,
-                              DeviceWebSocketHandler webSocketHandler) {
+                              ContentRetranscodeService retranscodeService) {
         this.uploadService = uploadService;
         this.listService = listService;
         this.managementService = managementService;
         this.retranscodeService = retranscodeService;
-        this.webSocketHandler = webSocketHandler;
     }
 
     /**
@@ -167,15 +162,14 @@ public class ContentController {
             @ApiResponse(responseCode = "202", description = "Upload accepted; transcoding queued",
                     content = @Content(schema = @Schema(implementation = UploadResponse.class),
                             examples = {
-                                    @ExampleObject(name = "Bound to project (urgent)", value = """
+                                    @ExampleObject(name = "Bound to project (priority)", value = """
                                             {
                                               "fileId": 1042,
                                               "status": "UPLOADED",
                                               "storageKey": "raw/2026/01/abc123.mp4",
                                               "urgent": true,
                                               "projectId": 7,
-                                              "webSocketPush": { "sent": 12, "skipped": 0, "failed": 1 },
-                                              "message": "Urgent upload accepted; transcoding queued at front + WebSocket pushed"
+                                              "message": "Priority upload accepted; queued at the front of the transcode pool"
                                             }
                                             """),
                                     @ExampleObject(name = "Orphan upload (no project)", value = """
@@ -185,7 +179,6 @@ public class ContentController {
                                               "storageKey": "raw/2026/01/def456.mp4",
                                               "urgent": false,
                                               "projectId": null,
-                                              "webSocketPush": null,
                                               "message": "Upload accepted as orphan content (no project bound); attach a project via PATCH /api/content/{id}/project. Transcoding in progress"
                                             }
                                             """)
@@ -213,22 +206,17 @@ public class ContentController {
                 urgent,
                 uploader);
 
-        PushResult pushResult = null;
-        // Only fan out if the file is bound to a real project — orphan content has no
-        // device audience yet. The FE flips on urgent again after assigning a project
-        // if it wants the same effect post-binding.
-        if (urgent && result.projectId() != null) {
-            var msg = """
-                    {"type":"URGENT_CONTENT","contentFileId":%d,"projectId":%d}"""
-                    .formatted(result.fileId(), result.projectId());
-            pushResult = webSocketHandler.broadcast(msg);
-        }
-
+        // VG-19: this used to broadcast an URGENT_CONTENT frame. It is gone, and nothing is lost:
+        // the frame went to EVERY connected device in the fleet (carrying a contentFileId and
+        // projectId to devices of other projects), the device spec tells clients to ignore it
+        // because it carries nothing actionable, and a just-uploaded file cannot be played anyway —
+        // it is not transcoded, not in a playlist and not assigned. `urgent` means exactly one real
+        // thing, which it has always done: this file goes to the FRONT of the transcode queue.
         String message;
         if (result.projectId() == null) {
             message = "Upload accepted as orphan content (no project bound); attach a project via PATCH /api/content/{id}/project. Transcoding in progress";
         } else if (urgent) {
-            message = "Urgent upload accepted; transcoding queued at front + WebSocket pushed";
+            message = "Priority upload accepted; queued at the front of the transcode pool";
         } else {
             message = "Upload accepted; transcoding in progress";
         }
@@ -238,7 +226,6 @@ public class ContentController {
                 result.storageKey(),
                 result.urgent(),
                 result.projectId(),
-                pushResult,
                 message));
     }
 
@@ -366,18 +353,15 @@ public class ContentController {
             String status,
             @Schema(description = "MinIO object key under the raw bucket", example = "raw/2026/01/abc123.mp4")
             String storageKey,
-            @Schema(description = "Whether the upload was queued at the front of the transcode pool", example = "true")
+            @Schema(description = "Whether the upload was queued at the FRONT of the transcode pool. That is all "
+                    + "`urgent` has ever meant: it does not put the file on any screen. Transcoding status is "
+                    + "broadcast to operators over /ws/dashboard as CONTENT_STATUS_CHANGE frames.",
+                    example = "true")
             boolean urgent,
             @Schema(description = "Bound project id, or null for orphan uploads", example = "7", nullable = true)
             Long projectId,
-            @Schema(description = "Result of the DEVICE-facing URGENT_CONTENT fan-out for urgent uploads "
-                    + "(null when not urgent or orphan). This is NOT operator transcoding progress — "
-                    + "transcoding status (TRANSCODING/READY/FAILED/INVALID) is broadcast separately to "
-                    + "operators over the /ws/dashboard WebSocket as CONTENT_STATUS_CHANGE frames.",
-                    nullable = true)
-            PushResult webSocketPush,
             @Schema(description = "Human-readable summary of the outcome",
-                    example = "Urgent upload accepted; transcoding queued at front + WebSocket pushed")
+                    example = "Priority upload accepted; queued at the front of the transcode pool")
             String message
     ) {}
 

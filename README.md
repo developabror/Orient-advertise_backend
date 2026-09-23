@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.154`
+`1.0.155`
 
 ## Architecture
 
@@ -1302,6 +1302,45 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### "Urgent upload" now describes what it actually does (v1.0.155)
+
+> **VG-19.** The dialog promised that an urgent upload "notifies all assigned devices immediately",
+> "may interrupt the active playlist" and is "queued for immediate playback" — and then reported
+> **"0 devices notified"**, every time. Two separate things were wrong, and only the first was in the
+> bug report: the frontend uploads without a project (content starts as an orphan), and the backend
+> only pushed when a project was present, so the push never fired.
+
+**Making the push fire would not have helped.** The `URGENT_CONTENT` frame was broadcast to **every
+connected device in the fleet**, carrying a `contentFileId` and `projectId` to devices of other
+projects; `ANDROID_DEVICE_FLOW_SPEC.md` tells clients to **ignore** it (R5, G-9) because it carries
+nothing actionable; and a just-uploaded file cannot be played by anyone — it is not transcoded, not
+in a playlist and not assigned to any device. "Devices will switch to it as soon as they receive the
+push" described a feature that does not exist. Building it for real is a different piece of work
+(an emergency takeover: auto-assign at top priority once transcoding finishes, plus a device-side
+interrupt), and it belongs in a release of its own.
+
+**What `urgent` really does, and always did, is worth keeping:** the file goes to the **front of the
+transcode queue** (`PRIORITY_URGENT`). With a backlog that is the difference between ready in a
+minute and ready in an hour.
+
+**What changed**
+
+- The `URGENT_CONTENT` broadcast is **removed**. Nothing consumed it, and it leaked ids across
+  projects. `ContentController` no longer needs `DeviceWebSocketHandler` at all.
+- `UploadResponse.webSocketPush` is **gone** from the wire (it could only ever be null or a count of
+  devices that ignore the frame). The accepted-message now reads "Priority upload accepted; queued
+  at the front of the transcode pool".
+- The UI calls it a **priority upload** in all three languages and says what it does: this file is
+  processed first; add it to a playlist to put it on screen. The fabricated "N devices notified"
+  headline is gone, and so is the content badge's "URGENT" → now "PRIORITY".
+- `ANDROID_DEVICE_FLOW_SPEC.md` baseline 1.0.155: R29 records the frame's removal, R5 and G-9 are
+  struck through, and §10.3 keeps the old shape documented for older servers.
+
+**Tests:** `UrgentUploadModal.test.tsx` (+2 — the copy promises a place in the queue and not
+playback, and an upload still succeeds without the removed field);
+`ContentUploadCommitOrderingIntegrationTest` continues to pin that an urgent upload is dispatched at
+the front after commit.
 
 ### Deleted content stops costing disk, and a host too small to encode says so (v1.0.154)
 
