@@ -9,9 +9,10 @@ import uz.orientadvertise.services.service.SyncGroupPlaybackService.JumpResultVi
  * re-anchored to. {@code anchorEpochMs = activateAtEpochMs − slotStart[index]}; every member's next
  * {@code /sync} returns this anchor and they converge on {@code index} at {@code activateAt}.
  *
- * <p>{@code dispatched} reflects the immediate push fan-out; counts are best-effort (the batched
- * dispatcher returns before its staggered batches fire, so offline members converge on their next
- * heartbeat regardless).
+ * <p>No fan-out counts: since VG-18 the push is dispatched only after the jump's transaction
+ * commits, so nothing has been sent when this response is built. Pushing before the commit is
+ * exactly what made a member miss the jump it was being told about. Offline members converge on
+ * their next heartbeat either way.
  */
 public record SyncGroupJumpResult(
         Long syncGroupId,
@@ -19,14 +20,11 @@ public record SyncGroupJumpResult(
         long anchorEpochMs,
         long activateAtEpochMs,
         String activateAtIso,
-        int memberCount,
-        Dispatched dispatched) {
-
-    public record Dispatched(int sent, int skipped, int failed) {}
+        int memberCount) {
 
     public static SyncGroupJumpResult from(JumpResultView v) {
         return new SyncGroupJumpResult(v.syncGroupId(), v.index(), v.anchorEpochMs(),
                 v.activateAtEpochMs(), Instant.ofEpochMilli(v.activateAtEpochMs()).toString(),
-                v.memberCount(), new Dispatched(v.sent(), v.skipped(), v.failed()));
+                v.memberCount());
     }
 }

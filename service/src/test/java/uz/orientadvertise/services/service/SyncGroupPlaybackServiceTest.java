@@ -55,7 +55,7 @@ class SyncGroupPlaybackServiceTest {
     private ContentVersionService contentVersionService;
     private PlaylistItemRepository playlistItemRepository;
     private SyncGroupPlaybackOverrideRepository overrideRepository;
-    private SyncDispatcher syncDispatcher;
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
     private OperatorScopeResolver operatorScopeResolver;
     private SyncGroupPlaybackService service;
 
@@ -67,19 +67,17 @@ class SyncGroupPlaybackServiceTest {
         contentVersionService = mock(ContentVersionService.class);
         playlistItemRepository = mock(PlaylistItemRepository.class);
         overrideRepository = mock(SyncGroupPlaybackOverrideRepository.class);
-        syncDispatcher = mock(SyncDispatcher.class);
+        eventPublisher = mock(org.springframework.context.ApplicationEventPublisher.class);
         operatorScopeResolver = mock(OperatorScopeResolver.class);
         service = new SyncGroupPlaybackService(groupRepository, deviceRepository, assignmentService,
-                contentVersionService, playlistItemRepository, overrideRepository, syncDispatcher,
+                contentVersionService, playlistItemRepository, overrideRepository, eventPublisher,
                 operatorScopeResolver, Duration.ofSeconds(5));
 
         // Default: in-scope admin, group + project present. Build mocks first, then stub.
         SyncGroup g = group(GROUP_ID, PROJECT_ID);
         ScopedProjects scope = new ScopedProjects(null, Role.ADMIN, null, false);
-        SyncDispatcher.DispatchResult dispatch = new SyncDispatcher.DispatchResult(2, 1, 0, 0, 0);
         when(operatorScopeResolver.resolve()).thenReturn(scope);
         when(groupRepository.findByIdWithProject(GROUP_ID)).thenReturn(Optional.of(g));
-        when(syncDispatcher.dispatchSyncToDevices(any(), any())).thenReturn(dispatch);
     }
 
     // ----- jump: happy path -----
@@ -116,10 +114,13 @@ class SyncGroupPlaybackServiceTest {
         assertEquals(1, o.getChosenIndex());
         assertEquals(o.getActivateAtEpochMs() - 10_000L, o.getAnchorEpochMs());
 
-        @SuppressWarnings("unchecked")
-        ArgumentCaptor<List<Long>> ids = ArgumentCaptor.forClass(List.class);
-        verify(syncDispatcher).dispatchSyncToDevices(ids.capture(), eq("sync-group-jump"));
-        assertEquals(List.of(1L, 2L), ids.getValue());
+        // VG-18: the members are told to re-sync through an event, dispatched only once this
+        // transaction commits. Pushing from inside it let a member read the group's override
+        // before the row was visible and miss the jump it was being told about.
+        var event = ArgumentCaptor.forClass(SyncGroupJumpedEvent.class);
+        verify(eventPublisher).publishEvent(event.capture());
+        assertEquals(List.of(1L, 2L), event.getValue().memberIds());
+        assertEquals(GROUP_ID, event.getValue().syncGroupId());
     }
 
     @Test
@@ -180,7 +181,7 @@ class SyncGroupPlaybackServiceTest {
         var ex = assertThrows(IllegalStateException.class, () -> service.jumpToIndex(GROUP_ID, 0, "op"));
         assertEquals("sync group has no member devices", ex.getMessage());
         verify(overrideRepository, never()).save(any());
-        verify(syncDispatcher, never()).dispatchSyncToDevices(any(), any());
+        verify(eventPublisher, never()).publishEvent(any(SyncGroupJumpedEvent.class));
     }
 
     @Test

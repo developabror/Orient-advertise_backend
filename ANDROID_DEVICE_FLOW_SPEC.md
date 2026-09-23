@@ -2,7 +2,7 @@
 
 **Audience:** the OrientedTV Android signage client team.
 **Purpose:** everything the device must send, receive, parse, persist and tolerate when it talks to the backend: REST contracts, the WebSocket channel and every frame on it, the MinIO download, timers, limits, failure modes.
-**Backend baseline:** `1.0.155` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.155 in R22–R29 below).
+**Backend baseline:** `1.0.156` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.156 in R22–R30 below).
 **How this was verified:** every statement was checked against the backend source. The wire examples were captured from a live run of `1.0.135` (dev profile, real MinIO and Redis, real ffmpeg transcode, a real WebSocket client) on 2026-09-14. Rules marked *(verified)* were exercised end to end in that run.
 
 Where this document disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md`, or with an earlier revision of this file, **this document wins**. If you built against the previous revision, read the revision notes right below first.
@@ -23,8 +23,9 @@ Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always 
 | R27 | 1.0.152 | A reported play is checked against the campaign that was live **when it played**, not the one live now, and is credited to it. A play whose campaign ended is still accepted for 30 minutes afterwards. | Nothing required — and you may drop any "flush before a content switch" special case. Keep `playedAt` accurate to the millisecond and keep flushing promptly (§11). |
 | R28 | 1.0.153 | **A playlist edit now gets its own `activateAt`, in the future** (at least 2 min, more when the edit adds files to download), instead of reusing the assignment's original anchor whose instant had already passed. Every screen on the assignment switches together at that instant, and the loop restarts from the first item. `/sync` also answers **503 in about 3 s** when object storage hangs, rather than eventually. | **Apply the §7.3 formula to EVERY pending version, edits included**: keep playing the live version until `activateAt`, then switch, and keep the old files until you do. Do not special-case an edit as "switch as soon as confirmed" — that is what pulls one screen out of step with the rest of its site (§7.4). |
 | R29 | 1.0.155 | **`URGENT_CONTENT` is no longer sent at all.** It was broadcast to every connected device in the fleet on an "urgent" upload, carried nothing actionable, and this spec already told you to ignore it. `urgent` now means only what it always did on the server: that file jumps the transcode queue. | Nothing to do. If you kept a branch for this frame you may delete it; unknown frame types must still be ignored (§10), so an old client is unaffected either way. |
+| R30 | 1.0.156 | **A request with no (or an unsupported) `Content-Type` now answers 415**, naming the media type the endpoint consumes, instead of 500. An `Accept` header that excludes JSON answers 406. Separately, an operator group jump is pushed only **after** it is committed, so a member that syncs on the push can no longer read the group's state before the jump is visible and miss it. | Keep sending `Content-Type: application/json` (§1.2) — a 415 is now a clear client-side signal rather than a server error to retry blindly. Treat 415 and 406 as **final**: never retry them unchanged. The jump change needs nothing from the client. |
 
-No other wire change between 1.0.138 and 1.0.155: request/response shapes, auth, timers and limits
+No other wire change between 1.0.138 and 1.0.156: request/response shapes, auth, timers and limits
 are unchanged (the dependency upgrade to Spring Boot 3.5 in 1.0.148 changed nothing on the wire).
 One behaviour change needs no client action but may surprise QA: since 1.0.142, when a short
 "Replace" campaign ends, screens go back to the booking underneath it instead of going blank. This
@@ -1079,14 +1080,14 @@ The server can override every value through its configuration. Do not hardcode s
 
 | Endpoint | 200/201 | 400 | 401 | 403 | 404 | 409 | 429 | 500 (deterministic causes) |
 |---|---|---|---|---|---|---|---|---|
-| `POST /register` | 201 new (also a serial whose device was deleted, R23), 200 re-reg (admin window only) | blank/over-long/badly formed serial, name > 200, bad JSON | stale `X-Device-Token` sent | — | — | already registered, no window (retry) | rate limit | no Content-Type |
-| `POST /heartbeat` | ok | JSON type errors | §2 | wrong id | race only | — | — | `contentVersion` > 64, no Content-Type |
+| `POST /register` | 201 new (also a serial whose device was deleted, R23), 200 re-reg (admin window only) | blank/over-long/badly formed serial, name > 200, bad JSON | stale `X-Device-Token` sent | — | — | already registered, no window (retry) | rate limit | — (**415** for a missing/unsupported Content-Type since 1.0.156, R30) |
+| `POST /heartbeat` | ok | JSON type errors | §2 | wrong id | race only | — | — | `contentVersion` > 64 (**415** for Content-Type, R30) |
 | `GET /sync` | ok | bad or mixed `currentFileIds` | §2 | wrong id | race only | — | — | — (**503** while object storage is unreachable, R22) |
-| `POST /sync/confirm` | CONFIRMED or MISMATCH | blank `reportedVersion` | §2 | wrong id | race only | — | — | > 64 chars, no Content-Type |
+| `POST /sync/confirm` | CONFIRMED or MISMATCH | blank `reportedVersion` | §2 | wrong id | race only | — | — | > 64 chars (**415** for Content-Type, R30) |
 | `GET /time` | ok | — | §2 | wrong id | — | — | — | — |
 | `GET /actions/pending` | ok (array) | — | §2 | wrong id | — | — | — | — |
-| `POST /actions/{aid}/confirm` | every outcome | missing or lowercase `status` | §2 | wrong id | **never** (UNKNOWN instead) | — | — | no Content-Type |
-| `POST /remote/{sid}/ack` | ok | bad `status` | §2 | wrong id | unknown or foreign session | session terminal | — | no Content-Type |
+| `POST /actions/{aid}/confirm` | every outcome | missing or lowercase `status` | §2 | wrong id | **never** (UNKNOWN instead) | — | — | — (**415** for Content-Type, R30) |
+| `POST /remote/{sid}/ack` | ok | bad `status` | §2 | wrong id | unknown or foreign session | session terminal | — | — (**415** for Content-Type, R30) |
 | `POST /playback` | ok (per-entry tally) | > 500, malformed entry | §2 | wrong id | race only | — | — | null `contentFileId` / `playedAt`, no Content-Type |
 | `GET /playlist` | ok | — | §2 | wrong id | race only | — | — | — |
 | `WS /ws/devices/{id}` | 101 | non-numeric id | no / bad token | wrong id, `Origin` sent | — | — | — | — |
@@ -1117,7 +1118,7 @@ These are current backend behaviours that are arguably bugs. The client rules ab
 | G-1 | ~~Issuing an action does not push `ACTION_PENDING`; it is only replayed on connect.~~ **Fixed in backend v1.0.150:** pushed after commit. | Heartbeat pickup stays the guarantee (§8.1). |
 | G-2 | A group jump is not signalled by the heartbeat or the connect replay. | `/sync` on every (re)connect and every 10 min in schedule mode (§7.5). |
 | G-3 | `VOLUME_SET` does not update `desiredVolume`, so it reverts on the next beat. | Treat `desiredVolume` as authoritative (§8.3). |
-| G-4 | A missing `Content-Type` gives 500 instead of 415. | Always send it (§1.2). |
+| G-4 | ~~A missing `Content-Type` gives 500 instead of 415.~~ **Fixed in backend v1.0.156:** it is a 415 naming what the endpoint consumes (R30). | Always send it (§1.2); treat the 415 as final. |
 | G-5 | Over-length strings give 500 instead of 400 for versions > 64. **Fixed for `/register` in 1.0.137** (serial and name now give 400). | Enforce the limits client-side (§1.2). |
 | G-6 | ~~A soft-deleted device cannot re-register its serial (500).~~ **Fixed in backend 1.0.146:** it registers as a new device (R23). | Persist the new `deviceId` (§2). |
 | G-7 | A null `contentFileId` or `playedAt` gives 500 and rolls back the whole playback batch. | Validate before enqueueing (§11). |

@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.155`
+`1.0.156`
 
 ## Architecture
 
@@ -1302,6 +1302,40 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### A group jump reaches its members, and a missing Content-Type is a 415 (v1.0.156)
+
+> **VG-18 — a member could miss the jump it was being told about.** `jumpToIndex` dispatched the
+> `SYNC_CONTENT` push from **inside its own transaction**. A member that answered immediately
+> re-read the group override in a separate transaction, could not see the not-yet-committed row, and
+> resolved the base anchor instead — so it kept playing the old position while the rest of the sales
+> point jumped. It recovered only on its next `/sync`: up to ten minutes for a device in schedule
+> mode, which is the whole failure the feature exists to prevent.
+
+> **VG-09 — a client-side mistake billed as a server fault.** Nothing handled
+> `HttpMediaTypeNotSupportedException`, so a request whose body carried no `Content-Type` fell
+> through to the catch-all: HTTP **500 plus a Telegram alert**. It is reachable by anything that
+> posts without the header — a device whose HTTP client drops it on a retry, a scanner, a health
+> checker — and the device spec's gap G-4 was written around it.
+
+**What changed**
+
+- The jump now publishes a `SyncGroupJumpedEvent` and `SyncGroupJumpPushListener` dispatches it on
+  `AFTER_COMMIT` (with `fallbackExecution`, like the other two push paths). A rolled-back jump — the
+  coherence re-check, a constraint — can no longer push anything at all.
+- `SyncGroupJumpResult.dispatched` is **gone from the wire**. At response time nothing has been sent
+  yet, and the counts taken before the commit were never a delivery figure. `memberCount` still says
+  how many devices the jump was computed for; the frontend never read the counts.
+- `GlobalExceptionHandler` answers **415** for an unsupported or missing `Content-Type`, naming the
+  media type the endpoint consumes, and **406** when the caller's `Accept` excludes everything we
+  produce. Both log at DEBUG: a caller-triggerable outcome must never burn the alert budget.
+
+**Tests:** `SyncGroupJumpPushListenerTest` (new, 4 — including that the listener is annotated
+`AFTER_COMMIT` + `fallbackExecution`, since *when* it runs is the entire fix),
+`SyncGroupPlaybackServiceTest` (the jump publishes the event instead of dispatching, and publishes
+nothing when it throws), `SyncGroupPlaybackControllerTest` (no `dispatched` in the response),
+`GlobalExceptionHandlerTest` (+3: missing header → 415, wrong header → 415 naming JSON, unacceptable
+`Accept` → 406 — none of them forwarding to Telegram).
 
 ### "Urgent upload" now describes what it actually does (v1.0.155)
 

@@ -196,6 +196,50 @@ public class GlobalExceptionHandler {
                 e.getMessage(), correlationId, null);
     }
 
+    // --- 415 Unsupported Media Type / 406 Not Acceptable ---
+
+    /**
+     * A body Spring cannot read because of its {@code Content-Type} — most often because the
+     * client sent none at all (VG-09 / spec gap G-4).
+     *
+     * <p>Without this handler the catch-all turned it into a <b>500 plus a Telegram alert</b>, for
+     * what is a client-side mistake with its own status code. It is reachable by anything that
+     * posts to this API without setting the header: a device whose HTTP client drops it on a
+     * retry, a health checker, a scanner. The device spec told clients to always send it precisely
+     * because this was a 500 — now the answer names the problem instead.
+     *
+     * <p>DEBUG, not WARN: caller-triggerable outcomes must never be able to burn the alert budget.
+     */
+    @ExceptionHandler(org.springframework.web.HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<ErrorResponse> handleUnsupportedMediaType(
+            org.springframework.web.HttpMediaTypeNotSupportedException e) {
+        var correlationId = correlationId();
+        var supported = e.getSupportedMediaTypes().stream().map(Object::toString).toList();
+        log.debug("Unsupported media type [correlationId={}]: {} (supported: {})",
+                correlationId, e.getContentType(), supported);
+        String message = e.getContentType() == null
+                ? "Content-Type header is missing; send %s".formatted(
+                        supported.isEmpty() ? "the media type this endpoint consumes" : String.join(" or ", supported))
+                : "Content-Type '%s' is not supported%s".formatted(e.getContentType(),
+                        supported.isEmpty() ? "" : "; send " + String.join(" or ", supported));
+        return buildResponse(HttpStatus.UNSUPPORTED_MEDIA_TYPE, "Unsupported Media Type",
+                message, correlationId, null);
+    }
+
+    /** The mirror case: the caller's {@code Accept} header excludes everything we can produce. */
+    @ExceptionHandler(org.springframework.web.HttpMediaTypeNotAcceptableException.class)
+    public ResponseEntity<ErrorResponse> handleNotAcceptable(
+            org.springframework.web.HttpMediaTypeNotAcceptableException e) {
+        var correlationId = correlationId();
+        var supported = e.getSupportedMediaTypes().stream().map(Object::toString).toList();
+        log.debug("Not acceptable [correlationId={}] (produces: {})", correlationId, supported);
+        return buildResponse(HttpStatus.NOT_ACCEPTABLE, "Not Acceptable",
+                supported.isEmpty()
+                        ? "This endpoint cannot produce any of the media types in your Accept header"
+                        : "This endpoint produces " + String.join(" or ", supported),
+                correlationId, null);
+    }
+
     /**
      * Time-overlap conflict on assignment create/confirm. Resolves ahead of the generic
      * {@link #handleIllegalState} (it's a more specific type) so the 409 carries a

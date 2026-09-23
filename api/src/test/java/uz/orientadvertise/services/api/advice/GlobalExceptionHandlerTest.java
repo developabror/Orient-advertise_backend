@@ -29,6 +29,7 @@ import uz.orientadvertise.services.service.exception.AssignmentTimeOverlapExcept
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -390,5 +391,51 @@ class GlobalExceptionHandlerTest {
                 .andExpect(jsonPath("$.details.conflicts.length()")
                         .value(org.hamcrest.Matchers.greaterThanOrEqualTo(1)))
                 .andExpect(jsonPath("$.details.conflicts[0].playlistName").value("Summer Promo"));
+    }
+
+    // --- VG-09: a Content-Type problem is the caller's, not a server fault ---
+
+    @Test
+    void missingContentType_returns415_notA500() throws Exception {
+        // The exact shape a device with a sloppy HTTP client sends on a retry. It used to fall
+        // through to the catch-all: HTTP 500 AND a Telegram alert, for a client-side mistake with
+        // its own status code. The spec's gap G-4 was written around this.
+        mockMvc.perform(post("/api/auth/login")
+                        .content("{\"username\":\"admin\",\"password\":\"password\"}"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.status").value(415))
+                .andExpect(jsonPath("$.error").value("Unsupported Media Type"))
+                .andExpect(jsonPath("$.message").value(
+                        org.hamcrest.Matchers.containsString("Content-Type")))
+                .andExpect(jsonPath("$.correlationId").isString());
+        verify(telegramNotifier, never()).broadcastMarkdown(anyString());
+    }
+
+    @Test
+    void wrongContentType_returns415_andNamesWhatIsAccepted() throws Exception {
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.TEXT_PLAIN)
+                        .content("username=admin"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.status").value(415))
+                .andExpect(jsonPath("$.message").value(
+                        org.hamcrest.Matchers.containsString("application/json")));
+        verify(telegramNotifier, never()).broadcastMarkdown(anyString());
+    }
+
+    @Test
+    void unacceptableAcceptHeader_returns406_notA500() throws Exception {
+        // Content negotiation runs on the way OUT, so the request has to succeed first.
+        when(authService.login(any())).thenReturn(
+                new uz.orientadvertise.services.domain.auth.AuthToken("access-jwt", "refresh-id"));
+
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .accept(MediaType.IMAGE_PNG)
+                        .content("{\"username\":\"admin\",\"password\":\"password\"}"))
+                .andExpect(status().isNotAcceptable());
+        // No body: the caller accepts nothing we can serialise, so the envelope cannot be written
+        // either. The status is the whole answer — and, crucially, it is not a 500 with an alert.
+        verify(telegramNotifier, never()).broadcastMarkdown(anyString());
     }
 }

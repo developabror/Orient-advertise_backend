@@ -70,10 +70,10 @@ class SyncGroupPlaybackControllerTest {
 
     @Test
     @WithMockUser(roles = "OPERATOR")
-    void jump_happyPath_returns200WithAnchorAndDispatch() throws Exception {
+    void jump_happyPath_returns200WithTheAnchor() throws Exception {
         when(playbackService.jumpToIndex(eq(5L), eq(6), any()))
                 .thenReturn(new SyncGroupPlaybackService.JumpResultView(
-                        5L, 6, 1_700_000_000_000L, 1_700_000_060_000L, 4, 3, 1, 0));
+                        5L, 6, 1_700_000_000_000L, 1_700_000_060_000L, 4));
 
         mockMvc.perform(post("/api/sync-groups/5/playback/jump")
                         .with(csrf())
@@ -86,9 +86,9 @@ class SyncGroupPlaybackControllerTest {
                 .andExpect(jsonPath("$.activateAtEpochMs").value(1_700_000_060_000L))
                 .andExpect(jsonPath("$.activateAtIso").exists())
                 .andExpect(jsonPath("$.memberCount").value(4))
-                .andExpect(jsonPath("$.dispatched.sent").value(3))
-                .andExpect(jsonPath("$.dispatched.skipped").value(1))
-                .andExpect(jsonPath("$.dispatched.failed").value(0));
+                // VG-18: no fan-out counts — the push happens after the commit, so at response
+                // time nothing has been sent and any number here would be fiction.
+                .andExpect(jsonPath("$.dispatched").doesNotExist());
     }
 
     @Test

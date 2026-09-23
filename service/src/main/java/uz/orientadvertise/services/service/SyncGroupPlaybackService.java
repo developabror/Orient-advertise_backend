@@ -9,11 +9,11 @@ import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
-import uz.orientadvertise.services.domain.content.SyncDispatcher;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.SyncGroup;
@@ -58,7 +58,7 @@ public class SyncGroupPlaybackService {
     private final ContentVersionService contentVersionService;
     private final PlaylistItemRepository playlistItemRepository;
     private final SyncGroupPlaybackOverrideRepository overrideRepository;
-    private final SyncDispatcher syncDispatcher;
+    private final ApplicationEventPublisher eventPublisher;
     private final OperatorScopeResolver operatorScopeResolver;
     private final Duration jumpLead;
 
@@ -68,7 +68,7 @@ public class SyncGroupPlaybackService {
                                     ContentVersionService contentVersionService,
                                     PlaylistItemRepository playlistItemRepository,
                                     SyncGroupPlaybackOverrideRepository overrideRepository,
-                                    SyncDispatcher syncDispatcher,
+                                    ApplicationEventPublisher eventPublisher,
                                     OperatorScopeResolver operatorScopeResolver,
                                     @Value("${app.sync.jump-min-lead:PT5S}") Duration jumpLead) {
         this.groupRepository = groupRepository;
@@ -77,7 +77,7 @@ public class SyncGroupPlaybackService {
         this.contentVersionService = contentVersionService;
         this.playlistItemRepository = playlistItemRepository;
         this.overrideRepository = overrideRepository;
-        this.syncDispatcher = syncDispatcher;
+        this.eventPublisher = eventPublisher;
         this.operatorScopeResolver = operatorScopeResolver;
         this.jumpLead = jumpLead;
     }
@@ -97,8 +97,15 @@ public class SyncGroupPlaybackService {
                                int memberCount, List<PlaybackItemView> items, ActiveJumpView activeJump) {}
 
     /** Result of {@link #jumpToIndex}. */
+    /**
+     * The jump as the operator sees it. It carries no fan-out counts: since VG-18 the push is
+     * dispatched after this transaction commits, so at response time nothing has been sent yet —
+     * and a count taken before the commit was never a delivery figure anyway. Members that are
+     * offline converge on their next heartbeat regardless, which is what makes the push an
+     * accelerator rather than the contract.
+     */
     public record JumpResultView(Long syncGroupId, int index, long anchorEpochMs, long activateAtEpochMs,
-                                 int memberCount, int sent, int skipped, int failed) {}
+                                 int memberCount) {}
 
     @Transactional(readOnly = true)
     public PlaybackView getPlaybackView(Long syncGroupId) {
@@ -172,12 +179,17 @@ public class SyncGroupPlaybackService {
             overrideRepository.save(existing);
         }
 
+        // The push goes out AFTER this transaction commits (VG-18). It used to fire from inside it,
+        // so a member that answered the push immediately re-read the group's override before this
+        // row was visible, got the base anchor, and stayed out of step until its next /sync — up to
+        // ten minutes for a device in schedule mode. Publishing here also means a rolled-back jump
+        // (the coherence re-check, a constraint) can no longer push anything at all.
         List<Long> memberIds = members.stream().map(Device::getId).toList();
-        SyncDispatcher.DispatchResult dispatch = syncDispatcher.dispatchSyncToDevices(memberIds, "sync-group-jump");
+        eventPublisher.publishEvent(new SyncGroupJumpedEvent(syncGroupId, memberIds));
         log.info("Sync group jump [group={} index={} members={} activateAt={} by={}]",
                 syncGroupId, index, members.size(), activateAt, issuedBy);
         return new JumpResultView(syncGroupId, index, anchorEpochMs, activateAt.toEpochMilli(),
-                members.size(), dispatch.sent(), dispatch.skipped(), dispatch.failed());
+                members.size());
     }
 
     // ----- helpers -----
