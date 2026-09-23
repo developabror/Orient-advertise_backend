@@ -63,11 +63,11 @@ public class PlaylistControlService {
      * error: it yields an empty view with a null {@code playlistId}, which the panel renders as
      * "no playlist assigned".
      *
-     * <p>{@code scheduled} means a playback anchor exists, i.e. the device is in synchronised
-     * (group) playback. Per-device transport commands are pointless there — the device answers
+     * <p>{@code scheduled} means a playback anchor exists for the assignment, i.e. the device is in
+     * synchronised (group) playback. Per-device transport commands are pointless there — the device answers
      * {@code PLAYLIST_CONTROL} with {@code FAILED "SCHEDULE_MODE"} — so the UI disables them and
      * points the operator at the sync-group jump. The anchor is only *read* here
-     * ({@link PlaybackScheduleService#find}); creating one is the device sync path's job.
+     * ({@link PlaybackScheduleService#isAnchored}); creating one is the device sync path's job.
      */
     @Transactional(readOnly = true)
     public ActivePlaylistView getActivePlaylist(Long deviceId) {
@@ -87,8 +87,7 @@ public class PlaylistControlService {
                         // default slot, which is what the device plays and what the panel must show.
                         Math.round(s.slotDurationMs() / 1000.0)))
                 .toList();
-        boolean scheduled = playbackScheduleService
-                .find(assignment.getId(), assignment.getVersionNumber()).isPresent();
+        boolean scheduled = playbackScheduleService.isAnchored(assignment.getId());
 
         return new ActivePlaylistView(deviceId, playlist.getId(), playlist.getName(),
                 timeline.loopDurationMs(), scheduled, items);

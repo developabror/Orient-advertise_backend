@@ -34,15 +34,19 @@ public class MinioStorageClient implements StorageClient {
 
     private final MinioClient minioClient;
     private final MinioClient presignClient;
+    /** Short-timeout client for stat-only calls; never for transfers (see MinioConfig). */
+    private final MinioClient metadataClient;
     private final MinioProperties properties;
     private final MinioHealthStatus healthStatus;
 
     public MinioStorageClient(MinioClient minioClient,
                               @Qualifier("minioPresignClient") MinioClient presignClient,
+                              @Qualifier("minioMetadataClient") MinioClient metadataClient,
                               MinioProperties properties,
                               MinioHealthStatus healthStatus) {
         this.minioClient = minioClient;
         this.presignClient = presignClient;
+        this.metadataClient = metadataClient;
         this.properties = properties;
         this.healthStatus = healthStatus;
     }
@@ -116,11 +120,16 @@ public class MinioStorageClient implements StorageClient {
         }
     }
 
+    /**
+     * Existence check via {@code statObject} on the SHORT-timeout metadata client: {@code /sync}
+     * calls this once per file it offers, and on the primary client's 5-minute defaults a
+     * blackholed MinIO would hang the request (VG-07). Three seconds, then a storage failure.
+     */
     @Override
     public boolean exists(String bucket, String objectName) {
         ensureAvailable();
         try {
-            minioClient.statObject(StatObjectArgs.builder()
+            metadataClient.statObject(StatObjectArgs.builder()
                     .bucket(bucket)
                     .object(objectName)
                     .build());

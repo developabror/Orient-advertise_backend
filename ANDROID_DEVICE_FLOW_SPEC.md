@@ -2,7 +2,7 @@
 
 **Audience:** the OrientedTV Android signage client team.
 **Purpose:** everything the device must send, receive, parse, persist and tolerate when it talks to the backend: REST contracts, the WebSocket channel and every frame on it, the MinIO download, timers, limits, failure modes.
-**Backend baseline:** `1.0.150` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.150 in R22–R25 below).
+**Backend baseline:** `1.0.153` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.153 in R22–R28 below).
 **How this was verified:** every statement was checked against the backend source. The wire examples were captured from a live run of `1.0.135` (dev profile, real MinIO and Redis, real ffmpeg transcode, a real WebSocket client) on 2026-09-14. Rules marked *(verified)* were exercised end to end in that run.
 
 Where this document disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md`, or with an earlier revision of this file, **this document wins**. If you built against the previous revision, read the revision notes right below first.
@@ -19,23 +19,15 @@ Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always 
 | R23 | 1.0.146 | A device an admin deleted can register again: the same serial gets **201** as a **new device** (new `deviceId`, new token, default placement, no content until an operator assigns it). It used to fail with 500 forever. | Always persist the `deviceId` **and** token from every `/register` response; never assume the `deviceId` survives a decommission. Keep the local media store. Remove any "decommissioned — stop retrying" logic built for the old 500 (§2, §4). |
 | R24 | 1.0.149 | Every newly processed file is **8-bit 4:2:0 H.264 High** (level picked by the encoder). 10-bit / 4:2:2 uploads used to become High 10 / High 4:2:2, which most hardware decoders reject. | Nothing required. Keep the per-item decoder-failure defence for files processed before 1.0.149 (§6.5). |
 | R25 | 1.0.150 | `ACTION_PENDING` is **pushed as soon as an action is issued** (after commit), not only replayed on connect. | Handle the frame at any time: fetch `GET /actions/pending`, execute, **deduplicate by `actionId`** (it also arrives by heartbeat and replay). The 30–60 s poll while connected is no longer needed (§8.1). |
+| R26 | 1.0.151 | **`PLAYLIST_CONTROL` now really arrives from the dashboard.** The operator device page could never send one before (its panel was broken), so in practice only the external API issued these. The dashboard hides the buttons for a device in synchronised playback, but the external API can still send one at any time. | No wire change. Make sure `PLAYLIST_CONTROL` is implemented as in §8.3 — `PREV`/`NEXT`/`JUMP` with `position` = the 0-based index into your **delivered** list — and that a device following a group anchor answers `FAILED` with `result: "SCHEDULE_MODE"` rather than jumping out of sync. |
+| R27 | 1.0.152 | A reported play is checked against the campaign that was live **when it played**, not the one live now, and is credited to it. A play whose campaign ended is still accepted for 30 minutes afterwards. | Nothing required — and you may drop any "flush before a content switch" special case. Keep `playedAt` accurate to the millisecond and keep flushing promptly (§11). |
+| R28 | 1.0.153 | **A playlist edit now gets its own `activateAt`, in the future** (at least 2 min, more when the edit adds files to download), instead of reusing the assignment's original anchor whose instant had already passed. Every screen on the assignment switches together at that instant, and the loop restarts from the first item. `/sync` also answers **503 in about 3 s** when object storage hangs, rather than eventually. | **Apply the §7.3 formula to EVERY pending version, edits included**: keep playing the live version until `activateAt`, then switch, and keep the old files until you do. Do not special-case an edit as "switch as soon as confirmed" — that is what pulls one screen out of step with the rest of its site (§7.4). |
 
-No other wire change between 1.0.138 and 1.0.150: request/response shapes, auth, timers and limits
+No other wire change between 1.0.138 and 1.0.153: request/response shapes, auth, timers and limits
 are unchanged (the dependency upgrade to Spring Boot 3.5 in 1.0.148 changed nothing on the wire).
 One behaviour change needs no client action but may surprise QA: since 1.0.142, when a short
 "Replace" campaign ends, screens go back to the booking underneath it instead of going blank. This
 arrives as an ordinary content-version change.
-
-### Coming next: planned, not in the backend yet
-
-These fixes are designed but not built. Build the client so it works both before and after them.
-
-| Planned fix | What will change for the device | Build it now like this |
-|---|---|---|
-| Anchor per content version (VG-06) | A playlist edit will get a **fresh anchor** with `activateAt` in the future: at least 2 min, longer when the edit adds files to download. All screens on the assignment switch together at `activateAt`, and the loop starts again from the first item. Today an edit reuses the old anchor, so `activateAt` is already in the past (§7.4, G-14). | Apply the §7.3 formula to **every** pending version, edits included: keep the live version until `activateAt`, then switch. Do **not** special-case edits as "switch as soon as confirmed"; with today's past `activateAt` the formula already switches at once. Keep the old files until the switch (§7.4). |
-| Plays checked against their own time (VG-03) | A play will be checked against the campaign that was live at its `playedAt` (plus a 30 min grace), not the one live now. Plays reported after a campaign switch will stop being rejected. No wire change. | Keep flushing promptly (§11). Nothing else. |
-| `/sync` no longer holds a DB connection while it checks storage (VG-07) | No payload change. A hanging object store will give a 503 after about 3 s instead of a request that hangs for minutes. | Already covered by R22: treat it as any 5xx. |
-| Operator playlist panel (VG-02) | The device page's Prev/Next/Jump controls will start to work, so `PLAYLIST_CONTROL` will actually reach devices from the dashboard. The dashboard will hide them for devices in schedule mode, but the external API can still send them. | Make sure `PLAYLIST_CONTROL` is implemented as in §8.3, including `FAILED` with `result: "SCHEDULE_MODE"`. |
 
 ## Revision notes: corrections to the previous revision
 
@@ -62,7 +54,7 @@ These are behaviour differences between the previous spec and what the backend a
 | R17 | Expired URL → 403/410 | MinIO answers **403**, never 410. `ETag` is not the SHA-256. Send `Accept-Encoding: identity`. | §6.5 |
 | R18 | 10 registrations/hour per IP | The window is a fixed **clock hour**. Attempts that fail with 500 also count. Every box behind one NAT shares the budget. | §4 |
 | R19 | — | `agentTicket` is the **same string on every beat**. Acking `ENDED` after an operator stop returns 409, which is expected. Remote control is **disabled in production** today. | §9 |
-| R20 | Playback rejects bad entries per item | One malformed entry fails the **whole batch** with 400. A `null` field fails the whole batch with 500. Entries for content that is no longer assigned are rejected. | §11 |
+| R20 | Playback rejects bad entries per item | One malformed entry fails the **whole batch** with 400. A `null` field fails the whole batch with 500. Entries are checked against the playlist assigned **at `playedAt`** (since 1.0.152, R27), with a 30-minute grace after a campaign ends. | §11 |
 | R21 | Re-registering an existing serial returns 200 with a fresh token | **Since 1.0.137:** an already-registered serial gets **409** unless an admin clicked *Allow re-registration* for that device in the last hour (then 200 as before, once). Over-long or badly formed `serialNumber`/`deviceName` now get **400** instead of 500. **Client change:** on 409 from `/register`, keep playing cached content and retry every ~5 min with jitter; show "waiting for operator to allow re-registration" in diagnostics. Attempts on a registered serial use a **separate** budget (60/hour per IP), not the 10/hour new-device budget. A heartbeat closes any open window. | §1.6, §2, §4, §13 |
 
 ---
@@ -625,10 +617,11 @@ offsetMs = elapsed − slot.slotStartMs          // seek the media here on join
 
 ### 7.4 `activateAt` in practice
 
-- The anchor is created the first time anyone (a device's `/sync` or the server's readiness monitor) sees an assignment: `activateAt = anchorEpochMs = now + 2 min` (server default).
-- It is **immutable for the life of the assignment.** A later playlist edit produces a new `expectedContentVersion` but **reuses the same anchor and `activateAt`**, which is usually long in the past by then *(verified: after a dwell edit the version changed, the anchor stayed identical, and `loopDurationMs` went 6000 → 5000)*.
-- So "hold the old version until `activateAt`" matters only for a brand-new assignment. For edits, cut over as soon as you are confirmed, and expect the on-screen position to jump because `loopDurationMs` changed. That jump is correct.
-- Get this behaviour from the §7.3 formula (a past `activateAt` switches at once), not from a special case for edits. A planned backend fix gives edits a future `activateAt` (see "Coming next" at the top), and the formula handles that with no client change.
+- The anchor is created the first time anyone (a device's `/sync` or the server's readiness monitor) sees a **content version**: `activateAt = anchorEpochMs = now + lead`. Since backend 1.0.153 the lead is the download the cut-over implies — at least 2 minutes, at most 15, longer the more bytes it adds.
+- It is **immutable for the life of that content version.** A playlist edit produces a new `expectedContentVersion` and therefore a **new anchor with a new, future `activateAt`** — every device on the assignment is handed the same one, so they all switch at that instant.
+- Before 1.0.153 an edit reused the assignment's original anchor, whose instant had long passed, so each screen switched the moment it finished downloading and a multi-screen site drifted apart until the slowest download landed. If you special-cased edits as "switch as soon as confirmed", **remove that** — it now breaks the very sync it used to approximate.
+- Get the behaviour from the §7.3 formula alone: hold the live version until `activateAt`, then switch. A past `activateAt` (a brand-new assignment you are late to) still switches at once, so one rule covers both.
+- Expect the on-screen position to jump at the switch when `loopDurationMs` changed. That jump is correct.
 - Keep the old version's files until the cut-over has happened.
 
 ### 7.5 Operator group jump
@@ -992,7 +985,7 @@ Unknown fields are ignored.
   - `playedAt` more than 30 s ahead of server time;
   - `playedAt` older than the server's playback retention window (`app.retention.playback`, **90 days** by default; the reason string quotes the configured value);
   - unknown `contentFileId`;
-  - `contentFileId` **not in your currently assigned playlist**, when you have one. Report plays promptly, and flush the queue before or right after a content switch, or the old content's plays get rejected.
+  - `contentFileId` **not in the playlist your device was assigned at that `playedAt`** (backend 1.0.152+; before that it was checked against the playlist assigned *now*, so plays from either side of a campaign switch were thrown away). The reason string is now `contentFileId not assigned to device at playedAt: X`. A play is still accepted for up to 30 minutes after its campaign ended — you keep playing the old loop until the cut-over — so an ordinary flush after a switch is safe. Flushing promptly still matters, but you no longer have to flush *before* a switch.
 
 **Whole-request failures:**
 - more than 500 entries → 400 `"Batch size 501 exceeds maximum 500"` *(verified)*;
@@ -1133,7 +1126,7 @@ These are current backend behaviours that are arguably bugs. The client rules ab
 | G-11 | ~~The transcoder does not force `yuv420p` or an H.264 profile.~~ **Fixed in backend v1.0.149:** output is forced to 8-bit 4:2:0 High. | Tolerate decoder failures per item (§6.5). |
 | G-12 | `filesToAdd[].contentType` and `name` describe the original upload, not the served MP4. | Ignore both for decoding (§6.3). |
 | G-13 | The legacy bulk path can issue `ASSIGN_CONTENT`, or REBOOT/SYNC_CONTENT with an arbitrary or null payload. | Tolerant payload parsing; FAILED for unsupported types (§8.2, §8.3). |
-| G-14 | The coordinated cut-over (`activateAt` in the future) happens only for a new assignment; edits reuse the old anchor. **Fix planned** (VG-06, see "Coming next"). | Apply §7.3 to every pending version: today it switches at once, and after the fix it will wait for `activateAt` (§7.4). |
+| G-14 | ~~The coordinated cut-over (`activateAt` in the future) happens only for a new assignment; edits reuse the old anchor.~~ **Fixed in backend v1.0.153:** the anchor is keyed on the content version, so an edit gets its own future cut-over (R28). | Apply §7.3 to every pending version (§7.4). |
 | G-15 | `SYNC_CONTENT` is emitted as a literal string and is not a member of the backend's push-type enum. The wire string is stable and documented here. | None needed. |
 
 ---

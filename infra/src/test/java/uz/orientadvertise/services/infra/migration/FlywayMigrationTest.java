@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class FlywayMigrationTest {
 
     /** Total applied migrations: V1..V48 inclusive (V36 is the Java migration). */
-    private static final int EXPECTED_MIGRATIONS = 52;
+    private static final int EXPECTED_MIGRATIONS = 53;
 
     @Autowired
     private DataSource dataSource;

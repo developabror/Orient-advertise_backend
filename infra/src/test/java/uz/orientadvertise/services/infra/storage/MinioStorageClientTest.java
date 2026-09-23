@@ -31,6 +31,7 @@ class MinioStorageClientTest {
 
     private MinioClient minioClient;
     private MinioClient presignClient;
+    private MinioClient metadataClient;
     private MinioProperties properties;
     private MinioHealthStatus healthStatus;
     private MinioStorageClient storageClient;
@@ -43,7 +44,10 @@ class MinioStorageClientTest {
         properties.setPresignedUrlExpiryMinutes(45);
         healthStatus = new MinioHealthStatus();
         healthStatus.markUp();
-        storageClient = new MinioStorageClient(minioClient, presignClient, properties, healthStatus);
+        // exists() runs on the SHORT-timeout metadata client (VG-07); the same mock stands in for
+        // both here, and a dedicated test below pins which client each call actually uses.
+        metadataClient = minioClient;
+        storageClient = new MinioStorageClient(minioClient, presignClient, metadataClient, properties, healthStatus);
     }
 
     @Test

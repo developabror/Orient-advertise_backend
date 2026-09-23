@@ -17,6 +17,12 @@ public class MinioConfig {
     static final long PROBE_TIMEOUT_MS = 3000L;
 
     /**
+     * Connect/write/read timeout for the metadata client, in milliseconds — see
+     * {@link #minioMetadataClient(MinioProperties)}.
+     */
+    static final long METADATA_TIMEOUT_MS = 3000L;
+
+    /**
      * Primary client — built against {@code app.minio.url}, the address the backend
      * uses to reach MinIO directly (over the docker network in compose). All upload /
      * download / stat / delete calls go through this bean.
@@ -64,6 +70,31 @@ public class MinioConfig {
                 .credentials(properties.getAccessKey(), properties.getSecretKey())
                 .build();
         client.setTimeout(PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS, PROBE_TIMEOUT_MS);
+        return client;
+    }
+
+    /**
+     * Metadata-only client: same internal endpoint as the primary bean, but with the probe's short
+     * timeouts. Used for {@code statObject} existence checks, never for transfers.
+     *
+     * <p>Why. Every {@code /sync} stats each file it is about to offer. On the primary client those
+     * calls inherit minio-java's <b>5-minute</b> OkHttp defaults, so a blackholed MinIO parks the
+     * request — and, before VG-07, the pooled database connection {@code /sync} was holding — for
+     * minutes at a time. Twenty devices taking a new campaign together then drained the pool and
+     * every other request in that window failed. A stat is a few bytes; if it has not answered in
+     * three seconds the store is not healthy, and a 503 is the truthful answer.
+     *
+     * <p>The primary client keeps the long defaults: it carries multi-gigabyte transfers, where
+     * three seconds is nothing. <b>Never</b> use this bean for uploads or downloads.
+     */
+    @Bean("minioMetadataClient")
+    public MinioClient minioMetadataClient(MinioProperties properties) {
+        MinioClient client = MinioClient.builder()
+                .endpoint(properties.getUrl())
+                .region(properties.getRegion())
+                .credentials(properties.getAccessKey(), properties.getSecretKey())
+                .build();
+        client.setTimeout(METADATA_TIMEOUT_MS, METADATA_TIMEOUT_MS, METADATA_TIMEOUT_MS);
         return client;
     }
 

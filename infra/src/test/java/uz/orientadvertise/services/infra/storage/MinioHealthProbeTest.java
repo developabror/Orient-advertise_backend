@@ -195,6 +195,26 @@ class MinioHealthProbeTest {
                 "the upload/download client must keep its long timeouts");
     }
 
+    @Test
+    void metadataClientBean_carriesTheShortTimeouts_forSyncsExistenceChecks() throws Exception {
+        // VG-07: /sync stats every file it offers. On the upload client's 5-minute defaults a
+        // blackholed MinIO parked the request — and, before the phase split, the pooled database
+        // connection with it — so 20 devices taking a campaign together drained the pool.
+        var config = new MinioConfig();
+        var props = new MinioProperties();
+
+        okhttp3.OkHttpClient metadataHttp = httpClientOf(config.minioMetadataClient(props));
+        okhttp3.OkHttpClient uploadHttp = httpClientOf(config.minioClient(props));
+
+        assertEquals((int) MinioConfig.METADATA_TIMEOUT_MS, metadataHttp.connectTimeoutMillis());
+        assertEquals((int) MinioConfig.METADATA_TIMEOUT_MS, metadataHttp.readTimeoutMillis());
+        assertEquals((int) MinioConfig.METADATA_TIMEOUT_MS, metadataHttp.writeTimeoutMillis());
+        assertTrue(MinioConfig.METADATA_TIMEOUT_MS <= 5000,
+                "a stat that takes longer than a few seconds to fail is a hung /sync");
+        assertTrue(uploadHttp.readTimeoutMillis() > MinioConfig.METADATA_TIMEOUT_MS,
+                "transfers must keep their long timeouts — this bean is stat-only");
+    }
+
     /**
      * MinioClient does not extend S3Base in 8.5.x — it wraps a private MinioAsyncClient, which
      * does. Two hops, both private, which is why this lives in a named helper.

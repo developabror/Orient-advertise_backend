@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -55,9 +56,14 @@ class DeviceSyncServiceTest {
         fileStorageService = mock(FileStorageService.class);
         playbackScheduleService = mock(PlaybackScheduleService.class);
         overrideRepository = mock(SyncGroupPlaybackOverrideRepository.class);
+        // /sync drives its own transactions since VG-07 (read-only, then a short write), so the
+        // unit test hands it a manager whose transactions do nothing but run the callback.
+        var txManager = mock(org.springframework.transaction.PlatformTransactionManager.class);
+        when(txManager.getTransaction(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(new org.springframework.transaction.support.SimpleTransactionStatus());
         syncService = new DeviceSyncService(deviceRepository, assignmentService,
                 contentVersionService, playlistItemRepository, fileStorageService, playbackScheduleService,
-                overrideRepository);
+                overrideRepository, txManager);
 
         Field f = DeviceSyncService.class.getDeclaredField("presignedUrlExpiryMinutes");
         f.setAccessible(true);
@@ -322,7 +328,7 @@ class DeviceSyncServiceTest {
 
         syncService.computeSyncPlan(11L, null, Set.of());
 
-        org.mockito.Mockito.verify(device).markSyncPending("v-11");
+        org.mockito.Mockito.verify(deviceRepository).markSyncPending(eq(11L), eq("v-11"), any());
     }
 
     @Test
@@ -346,7 +352,8 @@ class DeviceSyncServiceTest {
 
         syncService.computeSyncPlan(12L, "v-12", Set.of(120L));
 
-        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).markSyncPending(any());
+        org.mockito.Mockito.verify(deviceRepository, org.mockito.Mockito.never())
+                .markSyncPending(any(), any(), any());
     }
 
     @Test
@@ -359,8 +366,9 @@ class DeviceSyncServiceTest {
 
         syncService.computeSyncPlan(15L, "v-15", Set.of(150L));
 
-        org.mockito.Mockito.verify(device).clearSyncPending();
-        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).markSyncPending(any());
+        org.mockito.Mockito.verify(deviceRepository).clearSyncPending(eq(15L), any());
+        org.mockito.Mockito.verify(deviceRepository, org.mockito.Mockito.never())
+                .markSyncPending(any(), any(), any());
     }
 
     @Test
@@ -372,7 +380,8 @@ class DeviceSyncServiceTest {
 
         syncService.computeSyncPlan(16L, "v-16", Set.of(160L));
 
-        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).clearSyncPending();
+        org.mockito.Mockito.verify(deviceRepository, org.mockito.Mockito.never())
+                .clearSyncPending(any(), any());
     }
 
     @Test
@@ -384,8 +393,10 @@ class DeviceSyncServiceTest {
 
         syncService.computeSyncPlan(17L, "v-old", Set.of(170L));
 
-        org.mockito.Mockito.verify(device).markSyncPending("v-17");
-        org.mockito.Mockito.verify(device, org.mockito.Mockito.never()).clearSyncPending();
+        // COALESCE in the statement is what preserves the original syncPendingSince.
+        org.mockito.Mockito.verify(deviceRepository).markSyncPending(eq(17L), eq("v-17"), any());
+        org.mockito.Mockito.verify(deviceRepository, org.mockito.Mockito.never())
+                .clearSyncPending(any(), any());
     }
 
     @Test
@@ -400,7 +411,7 @@ class DeviceSyncServiceTest {
 
         syncService.computeSyncPlan(18L, "v-stale", Set.of(50L));
 
-        org.mockito.Mockito.verify(device).clearSyncPending();
+        org.mockito.Mockito.verify(deviceRepository).clearSyncPending(eq(18L), any());
     }
 
     @Test
@@ -454,7 +465,7 @@ class DeviceSyncServiceTest {
         // Device holds {140} (no add/delete) but its reported version is stale → pure reorder.
         syncService.computeSyncPlan(14L, "v-old", Set.of(140L));
 
-        org.mockito.Mockito.verify(device).markSyncPending("v-new");
+        org.mockito.Mockito.verify(deviceRepository).markSyncPending(eq(14L), eq("v-new"), any());
     }
 
     @Test
@@ -982,7 +993,7 @@ class DeviceSyncServiceTest {
         when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-30");
 
         java.time.Instant activateAt = java.time.Instant.ofEpochMilli(1_719_830_400_000L);
-        when(playbackScheduleService.getOrCreate(eq(300L), eq(1), eq("v-30")))
+        when(playbackScheduleService.getOrCreate(eq(300L), eq(1), eq("v-30"), anyLong()))
                 .thenReturn(new PlaybackSyncSchedule(300L, 1, "v-30", activateAt));
 
         var plan = syncService.computeSyncPlan(30L, null, Set.of());
@@ -1026,7 +1037,7 @@ class DeviceSyncServiceTest {
         when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("u");
         when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-34");
         // Not yet anchored for this device's cycle (no schedule row) — getOrCreate yields nothing.
-        when(playbackScheduleService.getOrCreate(eq(340L), eq(1), eq("v-34"))).thenReturn(null);
+        when(playbackScheduleService.getOrCreate(eq(340L), eq(1), eq("v-34"), anyLong())).thenReturn(null);
 
         var plan = syncService.computeSyncPlan(34L, null, Set.of());
 
@@ -1067,7 +1078,7 @@ class DeviceSyncServiceTest {
         assertEquals(0L, plan.loopDurationMs(), "no deliverable items → loopDurationMs == 0 (no divide-by-zero)");
         assertNull(plan.anchorEpochMs(), "an empty loop is never anchored");
         org.mockito.Mockito.verify(playbackScheduleService, org.mockito.Mockito.never())
-                .getOrCreate(any(), anyInt(), anyString());
+                .getOrCreate(any(), anyInt(), anyString(), anyLong());
     }
 
     @Test
@@ -1149,13 +1160,99 @@ class DeviceSyncServiceTest {
         assertEquals(1_000_000_000_000L, plan.anchorEpochMs(), "override anchor wins over the base schedule");
         assertEquals(1_000_000_005_000L, plan.activateAt());
         org.mockito.Mockito.verify(playbackScheduleService, org.mockito.Mockito.never())
-                .getOrCreate(any(), anyInt(), anyString());
+                .getOrCreate(any(), anyInt(), anyString(), anyLong());
         org.mockito.Mockito.verify(overrideRepository, org.mockito.Mockito.never())
                 .deleteBySyncGroupId(any());
     }
 
     @Test
-    void computeSyncPlan_groupWithStaleOverride_deletesIt_andUsesBaseAnchor() {
+    void computeSyncPlan_afterAPlaylistEdit_anchorsTheNEWContentVersion() {
+        // VG-06: the anchor is keyed on the content hash, so an edit asks for an anchor of its own
+        // instead of reusing the original — whose activateAt is by then long in the past, which is
+        // why screens on one assignment used to cut over one by one as each finished downloading.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(70L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(70L)).thenReturn(Optional.of(device));
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(700L);
+        when(assignment.getVersionNumber()).thenReturn(1);   // bumpVersion() has no callers: always 1
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(7000L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+        ContentFile f = readyFile(71L, "key/71.mp4");
+        PlaylistItem only = item(0, f, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(7000L)).thenReturn(List.of(only));
+        when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("https://minio/x");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-edited");
+        java.time.Instant activateAt = java.time.Instant.now().plusSeconds(120);
+        when(playbackScheduleService.getOrCreate(eq(700L), eq(1), eq("v-edited"), anyLong()))
+                .thenReturn(new PlaybackSyncSchedule(700L, 1, "v-edited", activateAt));
+
+        // The device reports the PREVIOUS version, i.e. it has not applied the edit yet.
+        var plan = syncService.computeSyncPlan(70L, "v-original", Set.of(71L));
+
+        assertEquals(activateAt.toEpochMilli(), plan.activateAt());
+        assertTrue(plan.activateAt() > System.currentTimeMillis(),
+                "an edit's cut-over must be in the future so the whole group flips together");
+    }
+
+    @Test
+    void computeSyncPlan_anchorLead_isAskedForWithTheBytesTheDeviceMustDownload() {
+        // The lead is sized from the download this cut-over implies (VG-06), so /sync has to hand
+        // the byte count over — a 2-minute deadline for a 200 MB clip is a deadline nobody meets.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(80L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(80L)).thenReturn(Optional.of(device));
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(800L);
+        when(assignment.getVersionNumber()).thenReturn(1);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(8000L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+        ContentFile big = readyFile(81L, "key/81.mp4");
+        when(big.getSizeBytes()).thenReturn(200L * 1024 * 1024);
+        PlaylistItem only = item(0, big, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(8000L)).thenReturn(List.of(only));
+        when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("https://minio/x");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-big");
+
+        // NOT a full sync: the device holds other content and is picking up one new, large file.
+        syncService.computeSyncPlan(80L, "v-old", Set.of(99L));
+
+        org.mockito.Mockito.verify(playbackScheduleService)
+                .getOrCreate(eq(800L), eq(1), eq("v-big"), eq(200L * 1024 * 1024));
+    }
+
+    @Test
+    void computeSyncPlan_freshDevice_asksForNoExtraLead() {
+        // A brand-new box pulls the whole playlist; making the rest of the group wait for it would
+        // push every cut-over to the cap.
+        Device device = mock(Device.class);
+        when(device.getId()).thenReturn(90L);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(90L)).thenReturn(Optional.of(device));
+        ContentAssignment assignment = mock(ContentAssignment.class);
+        when(assignment.getId()).thenReturn(900L);
+        when(assignment.getVersionNumber()).thenReturn(1);
+        Playlist playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(9000L);
+        when(assignment.getPlaylist()).thenReturn(playlist);
+        when(assignmentService.resolveForDevice(eq(device), any())).thenReturn(assignment);
+        ContentFile big = readyFile(91L, "key/91.mp4");
+        when(big.getSizeBytes()).thenReturn(500L * 1024 * 1024);
+        PlaylistItem only = item(0, big, 10);
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(9000L)).thenReturn(List.of(only));
+        when(fileStorageService.presignedProcessedUrl(anyString(), anyInt())).thenReturn("https://minio/x");
+        when(contentVersionService.computeForAssignment(assignment)).thenReturn("v-fresh");
+
+        syncService.computeSyncPlan(90L, null, Set.of());   // fullSync
+
+        org.mockito.Mockito.verify(playbackScheduleService).getOrCreate(eq(900L), eq(1), eq("v-fresh"), eq(0L));
+    }
+
+    @Test
+    void computeSyncPlan_groupWithStaleOverride_ignoresIt_andNeverDeletesIt() {
         Device device = mock(Device.class);
         when(device.getId()).thenReturn(50L);
         when(device.getSyncGroupId()).thenReturn("sg-9");
@@ -1186,14 +1283,18 @@ class DeviceSyncServiceTest {
         when(overrideRepository.findBySyncGroupId(9L)).thenReturn(Optional.of(stale));
 
         java.time.Instant activateAt = java.time.Instant.ofEpochMilli(2_000_000_000_000L);
-        when(playbackScheduleService.getOrCreate(eq(500L), eq(3), eq("v-new")))
+        when(playbackScheduleService.getOrCreate(eq(500L), eq(3), eq("v-new"), anyLong()))
                 .thenReturn(new PlaybackSyncSchedule(500L, 3, "v-new", activateAt));
 
         var plan = syncService.computeSyncPlan(50L, null, Set.of());
 
-        org.mockito.Mockito.verify(overrideRepository).deleteBySyncGroupId(9L);
         assertEquals(2_000_000_000_000L, plan.anchorEpochMs(), "stale override ignored → base anchor used");
         assertEquals(2_000_000_000_000L, plan.activateAt());
+        // VG-10: /sync must not touch the shared row. Every member of the group hits this path at
+        // once, and the derived delete they raced on turned a lost race into a 500 + an alert.
+        // Retiring it belongs to the playlist-edit path (SyncGroupOverrideCleaner).
+        org.mockito.Mockito.verify(overrideRepository, org.mockito.Mockito.never())
+                .deleteBySyncGroupId(any());
     }
 
     @Test
@@ -1229,7 +1330,7 @@ class DeviceSyncServiceTest {
         when(overrideRepository.findBySyncGroupId(9L)).thenReturn(Optional.of(otherJump));
 
         java.time.Instant activateAt = java.time.Instant.ofEpochMilli(3_000_000_000_000L);
-        when(playbackScheduleService.getOrCreate(eq(600L), eq(1), eq("v-600")))
+        when(playbackScheduleService.getOrCreate(eq(600L), eq(1), eq("v-600"), anyLong()))
                 .thenReturn(new PlaybackSyncSchedule(600L, 1, "v-600", activateAt));
 
         var plan = syncService.computeSyncPlan(60L, null, Set.of());

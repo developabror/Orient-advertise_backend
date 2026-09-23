@@ -55,16 +55,32 @@ public final class PlaybackSlotTimeline {
      * inclusion filter; each item's content file must be non-null.
      */
     public static Timeline of(List<PlaylistItem> includedInOrder) {
+        return ofInputs(includedInOrder.stream().map(it -> {
+            ContentFile f = it.getContentFile();
+            return new Input(it.getPosition(), f.getId(), f.getName(),
+                    it.getDurationSeconds() != null ? it.getDurationSeconds() : f.getDurationSeconds());
+        }).toList());
+    }
+
+    /**
+     * One item's timeline inputs, free of JPA. {@code effectiveSeconds} is the per-item dwell if set,
+     * else the file's own length, else null (the default slot applies).
+     */
+    public record Input(int position, Long fileId, String title, Integer effectiveSeconds) {}
+
+    /**
+     * Same math over detached data. {@code /sync} builds its plan OUTSIDE any transaction since
+     * VG-07, so nothing there may touch a lazy association — it reads the playlist into
+     * {@link Input}s while the read transaction is open and lays out the loop afterwards.
+     */
+    public static Timeline ofInputs(List<Input> includedInOrder) {
         List<Slot> slots = new ArrayList<>(includedInOrder.size());
         int index = 0;
         long slotStartMs = 0L;
-        for (PlaylistItem it : includedInOrder) {
-            ContentFile f = it.getContentFile();
-            Integer effective = it.getDurationSeconds() != null
-                    ? it.getDurationSeconds() : f.getDurationSeconds();
-            long slotDurationMs = slotDurationMs(effective, f.getId());
-            slots.add(new Slot(index++, it.getPosition(), f.getId(), f.getName(),
-                    effective, slotStartMs, slotDurationMs));
+        for (Input it : includedInOrder) {
+            long slotDurationMs = slotDurationMs(it.effectiveSeconds(), it.fileId());
+            slots.add(new Slot(index++, it.position(), it.fileId(), it.title(),
+                    it.effectiveSeconds(), slotStartMs, slotDurationMs));
             slotStartMs += slotDurationMs;
         }
         return new Timeline(List.copyOf(slots), slotStartMs);

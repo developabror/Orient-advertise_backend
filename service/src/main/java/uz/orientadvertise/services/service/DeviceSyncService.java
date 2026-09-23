@@ -3,7 +3,7 @@ package uz.orientadvertise.services.service;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -14,7 +14,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import uz.orientadvertise.services.common.exception.ResourceNotFoundException;
 import uz.orientadvertise.services.common.exception.StorageUnavailableException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
@@ -58,6 +60,10 @@ public class DeviceSyncService {
     private final FileStorageService fileStorageService;
     private final PlaybackScheduleService playbackScheduleService;
     private final SyncGroupPlaybackOverrideRepository overrideRepository;
+    /** Phase 1 of {@code /sync}: load everything, hold the connection for nothing else. */
+    private final TransactionTemplate readTx;
+    /** Phase 3 of {@code /sync}: the few writes, opened only when there are any. */
+    private final TransactionTemplate writeTx;
 
     /**
      * Sync URLs are signed for longer than ad-hoc download URLs because devices over
@@ -72,7 +78,8 @@ public class DeviceSyncService {
                               PlaylistItemRepository playlistItemRepository,
                               FileStorageService fileStorageService,
                               PlaybackScheduleService playbackScheduleService,
-                              SyncGroupPlaybackOverrideRepository overrideRepository) {
+                              SyncGroupPlaybackOverrideRepository overrideRepository,
+                              PlatformTransactionManager transactionManager) {
         this.deviceRepository = deviceRepository;
         this.assignmentService = assignmentService;
         this.contentVersionService = contentVersionService;
@@ -80,24 +87,49 @@ public class DeviceSyncService {
         this.fileStorageService = fileStorageService;
         this.playbackScheduleService = playbackScheduleService;
         this.overrideRepository = overrideRepository;
+        // Explicit templates, NOT @Transactional on the phase methods: a @Transactional method
+        // called from the same class goes through no proxy and gets no transaction at all — a trap
+        // this codebase has been bitten by before.
+        this.readTx = new TransactionTemplate(transactionManager);
+        this.readTx.setReadOnly(true);
+        this.writeTx = new TransactionTemplate(transactionManager);
     }
 
-    @Transactional
+    /**
+     * The device's sync plan, computed in three phases so <b>one pooled database connection is held
+     * at a time, and never across a storage call</b> (VG-07).
+     *
+     * <ol>
+     *   <li><b>read-only transaction</b> — device, assignment, playlist, expected version, override;
+     *       everything is copied into immutable records, so no JPA entity (and no lazy association)
+     *       escapes;</li>
+     *   <li><b>no transaction</b> — the per-file {@code statObject} and presign, then the plan;</li>
+     *   <li><b>short write transaction</b>, opened only when there is something to write — the
+     *       anchor and the in-flight marker.</li>
+     * </ol>
+     *
+     * <p>It used to be one {@code @Transactional} method: it held its connection through every
+     * {@code statObject} (on minio-java's 5-minute defaults) and then needed a SECOND connection for
+     * the anchor insert, which ran {@code REQUIRES_NEW}. Twenty devices taking a new campaign
+     * together therefore drained the 20-connection pool for its 10-second timeout: those devices
+     * played unsynced, every other request in that window failed with 500, and a hanging MinIO could
+     * pin the pool for minutes.
+     */
     public SyncPlan computeSyncPlan(Long deviceId, String currentVersion, Set<Long> currentFileIds) {
-        var device = deviceRepository.findByIdAndDeletedAtIsNull(deviceId)
-                .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
-
         // Null version = fresh device; ignore any stale currentFileIds the caller sent.
         boolean fullSync = currentVersion == null;
         Set<Long> deviceHeld = fullSync || currentFileIds == null
                 ? Set.of()
                 : Set.copyOf(currentFileIds);
 
+        // ---- PHASE 1: read-only transaction -------------------------------------------------
+        SyncContext ctx = readTx.execute(status -> loadSyncContext(deviceId));
+        Objects.requireNonNull(ctx, "sync context");
+
         Instant now = Instant.now();
         Instant expiresAt = now.plus(Duration.ofMinutes(presignedUrlExpiryMinutes));
 
-        ContentAssignment assignment = assignmentService.resolveForDevice(device, now);
-        if (assignment == null || assignment.getPlaylist() == null) {
+        if (!ctx.hasAssignment()) {
             // No active assignment (window expired, all matching assignments excluded, or
             // none exist) — purge everything the device holds (blank screen).
             //
@@ -112,7 +144,10 @@ public class DeviceSyncService {
                     deviceId, deviceHeld.size());
             // No expected version ⇒ nothing a confirm could ever match. A marker armed for an
             // assignment that has since lapsed would otherwise only trip SYNC_TIMEOUT.
-            clearStalePending(device);
+            if (ctx.syncPending()) {
+                writeTx.executeWithoutResult(status ->
+                        deviceRepository.clearSyncPending(deviceId, Instant.now()));
+            }
             // No content ⇒ no loop: still echo syncGroupId, but no anchor/schedule (device stays idle).
             return new SyncPlan(deviceId, null, fullSync,
                     List.of(),
@@ -120,23 +155,10 @@ public class DeviceSyncService {
                     List.of(),
                     presignedUrlExpiryMinutes,
                     expiresAt,
-                    device.getSyncGroupId(), null, 0L, null);
+                    ctx.syncGroupWireId(), null, 0L, null);
         }
 
-        var items = playlistItemRepository.findByPlaylistIdOrderByPositionAsc(assignment.getPlaylist().getId());
-
-        // Deliverable base set = items whose content is READY with a processed object key.
-        // The SAME predicate ({@link #isDeliverable}) defines the order here, the /playlist view,
-        // and the JUMP index range in PlaylistControlService — so the three can never drift.
-        var orderedReadyFiles = items.stream()
-                .filter(DeviceSyncService::isDeliverable)
-                .map(PlaylistItem::getContentFile)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-
-        Set<Long> expectedIds = orderedReadyFiles.stream()
-                .map(ContentFile::getId)
-                .collect(Collectors.toUnmodifiableSet());
-
+        // ---- PHASE 2: no transaction — storage I/O and the plan ------------------------------
         // Per-file URL generation is isolated: a missing object or signing failure on ONE
         // file must not block the others, so those files are simply omitted from filesToAdd
         // (storage inconsistency is logged for ops). A storage OUTAGE is the opposite case and
@@ -144,11 +166,18 @@ public class DeviceSyncService {
         // fact about one file, and answering 200 with a short list would have the device apply an
         // incomplete plan as if it were correct. Note this runs BEFORE filesToDelete is computed,
         // so an outage can never produce a delete instruction either.
-        List<SyncFileToAdd> filesToAdd = orderedReadyFiles.stream()
-                .filter(f -> !deviceHeld.contains(f.getId()))
+        // One entry per FILE (a clip scheduled twice is downloaded once), in first-appearance order.
+        var distinctFiles = new LinkedHashMap<Long, DeliverableFile>();
+        ctx.deliverables().forEach(f -> distinctFiles.putIfAbsent(f.fileId(), f));
+        List<SyncFileToAdd> filesToAdd = distinctFiles.values().stream()
+                .filter(f -> !deviceHeld.contains(f.fileId()))
                 .map(this::tryBuildFileToAdd)
                 .filter(Objects::nonNull)
                 .toList();
+
+        Set<Long> expectedIds = ctx.deliverables().stream()
+                .map(DeliverableFile::fileId)
+                .collect(Collectors.toUnmodifiableSet());
 
         List<Long> filesToDelete = deviceHeld.stream()
                 .filter(id -> !expectedIds.contains(id))
@@ -177,82 +206,86 @@ public class DeviceSyncService {
         // `playlistOrder` (same deliverable-filtered iteration, same `index`), so a device never
         // holds a slot for a file it won't play, or vice versa. The slot MATH is shared with the
         // group-jump service via {@link PlaybackSlotTimeline} so a jump's slotStart[index] matches.
-        List<PlaylistItem> deliverableOrdered = items.stream()
-                .filter(it -> {
-                    ContentFile f = it.getContentFile();
-                    return f != null && deliverableFileIds.contains(f.getId());
-                })
-                .toList();
-        PlaybackSlotTimeline.Timeline timeline = PlaybackSlotTimeline.of(deliverableOrdered);
+        PlaybackSlotTimeline.Timeline timeline = PlaybackSlotTimeline.ofInputs(
+                ctx.deliverables().stream()
+                        .filter(f -> deliverableFileIds.contains(f.fileId()))
+                        .map(DeliverableFile::toTimelineInput)
+                        .toList());
         List<PlaylistEntry> playlistOrder = timeline.slots().stream()
                 .map(s -> new PlaylistEntry(s.index(), s.position(), s.fileId(), s.effectiveSeconds(),
                         s.slotStartMs(), s.slotDurationMs()))
                 .toList();
         long loopDurationMs = timeline.loopDurationMs(); // Σ slotDurationMs (0 when nothing is deliverable)
 
-        String expectedVersion = contentVersionService.computeForAssignment(assignment);
-
-        // Anchor the group's shared cut-over/loop T0 for this version (lazy, immutable per version).
-        // An operator "group jump" re-anchors it via a MUTABLE per-sync-group override (V42) that
-        // takes precedence over the base immutable per-version anchor (V40) while the group stays on
-        // the same (assignment, version, contentVersion); a version change makes the override stale
-        // and it is cleaned up here, then the base anchor is used.
-        // Best-effort: if the anchor can't be obtained, the device simply free-runs this cycle and
-        // re-anchors on its next /sync — the schedule block is additive and must never fail the sync.
-        String syncGroupId = device.getSyncGroupId();
-        Long anchorEpochMs = null;
-        Long activateAtEpochMs = null;
-        if (expectedVersion != null && !playlistOrder.isEmpty()) {
-            try {
-                // The NUMERIC sync-group id (nullable) — NOT device.getSyncGroupId() (the sg-/fac-
-                // wire string). An override applies only to devices in an EXPLICIT sync group;
-                // facility/region-grouped devices have no numeric key and use the base anchor.
-                Long groupId = device.getSyncGroup() != null ? device.getSyncGroup().getId() : null;
-                Optional<SyncGroupPlaybackOverride> override = groupId == null
-                        ? Optional.empty()
-                        : overrideRepository.findBySyncGroupId(groupId);
-                if (override.isPresent() && overrideMatches(override.get(), assignment, expectedVersion)) {
-                    // Operator group-jump re-anchor wins over the base per-version anchor.
-                    anchorEpochMs = override.get().getAnchorEpochMs();
-                    activateAtEpochMs = override.get().getActivateAtEpochMs();
-                } else {
-                    // Clean up a genuinely stale override ONLY when THIS device is still on the
-                    // assignment the jump was written for but its content moved on (a playlist/dwell
-                    // edit — contentVersion is a pure function of the assignment, so EVERY member on
-                    // that assignment agrees, making the mismatch a group-wide signal). A device that
-                    // has drifted to a DIFFERENT assignment (e.g. a higher-priority subset assignment)
-                    // must NOT delete the shared override — that would cancel the jump for members
-                    // still on the original assignment; it just uses the base anchor for itself.
-                    if (override.isPresent() && override.get().getAssignmentId().equals(assignment.getId())) {
-                        overrideRepository.deleteBySyncGroupId(groupId);
-                    }
-                    var schedule = playbackScheduleService.getOrCreate(
-                            assignment.getId(), assignment.getVersionNumber(), expectedVersion);
-                    if (schedule != null) {
-                        anchorEpochMs = schedule.getAnchorEpochMs();
-                        activateAtEpochMs = schedule.getActivateAtEpochMs();
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("Playback anchor/override unavailable [device={}, assignment={}]: {} — "
-                        + "device free-runs this cycle", deviceId, assignment.getId(), e.getMessage());
-            }
-        }
+        String expectedVersion = ctx.expectedVersion();
 
         // Mark a sync in-flight when there's work: files to add/delete OR a pure REORDER (the
         // version changed with no file delta). Arming on a reorder lets SyncTimeoutMonitor
         // escalate a dropped reorder push, and makes confirmSync validate against a STORED
-        // expected version (killing a back-to-back reorder race). markSyncPending preserves
+        // expected version (killing a back-to-back reorder race). The marker preserves
         // syncPendingSince across re-syncs so the 30-minute window anchors to the FIRST plan.
         boolean versionChanged = expectedVersion != null && !expectedVersion.equals(currentVersion);
         boolean hasWork = !filesToAdd.isEmpty() || !filesToDelete.isEmpty() || versionChanged;
-        if (hasWork && expectedVersion != null) {
-            device.markSyncPending(expectedVersion);
-        } else if (!hasWork) {
-            // The device already holds the expected state (e.g. its confirm was lost), so an
-            // in-flight marker left from an earlier plan is stale — clear it before
-            // SyncTimeoutMonitor escalates a sync that has in fact completed.
-            clearStalePending(device);
+
+        // An operator "group jump" re-anchors the loop via a MUTABLE per-sync-group override (V42)
+        // that takes precedence over the base per-content-version anchor (V40/V53) while the group
+        // stays on the same (assignment, version, contentVersion). A stale override is simply
+        // ignored here — clearing it belongs to the playlist-edit path (SyncGroupOverrideCleaner),
+        // not to /sync, where concurrent members raced each other into 500s (VG-10).
+        Long anchorEpochMs = null;
+        Long activateAtEpochMs = null;
+        boolean anchorNeeded = false;
+        if (expectedVersion != null && !playlistOrder.isEmpty()) {
+            if (ctx.overrideApplies()) {
+                anchorEpochMs = ctx.overrideAnchorEpochMs();
+                activateAtEpochMs = ctx.overrideActivateAtEpochMs();
+            } else {
+                anchorNeeded = true;
+            }
+        }
+
+        // ---- PHASE 3: short write transaction, only when there is something to write ----------
+        boolean marking = hasWork && expectedVersion != null;
+        boolean clearing = !hasWork && ctx.syncPending();
+        if (anchorNeeded || marking || clearing) {
+            // The lead the cut-over needs is the download it implies — but never a fresh device's
+            // full pull: the anchor belongs to the whole group, and one new box must not push the
+            // others' cut-over a quarter of an hour out.
+            long newBytes = fullSync ? 0L
+                    : filesToAdd.stream().mapToLong(SyncFileToAdd::sizeBytes).sum();
+            final boolean wantAnchor = anchorNeeded;
+            long[] anchor = writeTx.execute(status -> {
+                long[] found = null;
+                if (wantAnchor) {
+                    // Best-effort: if the anchor can't be obtained, the device simply free-runs this
+                    // cycle and re-anchors on its next /sync — the schedule block is additive and
+                    // must never fail the sync.
+                    try {
+                        var schedule = playbackScheduleService.getOrCreate(
+                                ctx.assignmentId(), ctx.versionNumber(), expectedVersion, newBytes);
+                        if (schedule != null) {
+                            found = new long[] {schedule.getAnchorEpochMs(), schedule.getActivateAtEpochMs()};
+                        }
+                    } catch (Exception e) {
+                        log.warn("Playback anchor unavailable [device={}, assignment={}]: {} — "
+                                + "device free-runs this cycle", deviceId, ctx.assignmentId(), e.getMessage());
+                    }
+                }
+                Instant writeAt = Instant.now();
+                if (marking) {
+                    deviceRepository.markSyncPending(deviceId, expectedVersion, writeAt);
+                } else if (clearing) {
+                    // The device already holds the expected state (e.g. its confirm was lost), so an
+                    // in-flight marker left from an earlier plan is stale — clear it before
+                    // SyncTimeoutMonitor escalates a sync that has in fact completed.
+                    deviceRepository.clearSyncPending(deviceId, writeAt);
+                }
+                return found;
+            });
+            if (anchor != null) {
+                anchorEpochMs = anchor[0];
+                activateAtEpochMs = anchor[1];
+            }
         }
 
         log.debug("Sync [device={}] full={} expectedVersion={} +{} -{} order={}",
@@ -262,7 +295,86 @@ public class DeviceSyncService {
         return new SyncPlan(deviceId, expectedVersion, fullSync,
                 filesToAdd, filesToDelete, playlistOrder,
                 presignedUrlExpiryMinutes, expiresAt,
-                syncGroupId, anchorEpochMs, loopDurationMs, activateAtEpochMs);
+                ctx.syncGroupWireId(), anchorEpochMs, loopDurationMs, activateAtEpochMs);
+    }
+
+    /**
+     * Phase 1: everything {@code /sync} needs from the database, as detached records.
+     *
+     * <p>Runs inside the read-only transaction and must leave NO entity behind — the caller uses
+     * this outside any session, where a lazy association would throw.
+     */
+    private SyncContext loadSyncContext(Long deviceId) {
+        var device = deviceRepository.findByIdAndDeletedAtIsNull(deviceId)
+                .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
+
+        String syncGroupWireId = device.getSyncGroupId();
+        boolean syncPending = device.getSyncPendingSince() != null;
+
+        ContentAssignment assignment = assignmentService.resolveForDevice(device, Instant.now());
+        if (assignment == null || assignment.getPlaylist() == null) {
+            return SyncContext.noAssignment(syncGroupWireId, syncPending);
+        }
+
+        // Deliverable base set = items whose content is READY with a processed object key.
+        // The SAME predicate ({@link #isDeliverable}) defines the order here, the /playlist view,
+        // and the JUMP index range in PlaylistControlService — so the three can never drift.
+        // EVERY deliverable item is kept, repeats included: a playlist may schedule one clip twice
+        // and the play order must carry both slots. The download list dedupes by file id instead.
+        var deliverables = new java.util.ArrayList<DeliverableFile>();
+        for (PlaylistItem it : playlistItemRepository
+                .findByPlaylistIdOrderByPositionAsc(assignment.getPlaylist().getId())) {
+            if (!isDeliverable(it)) {
+                continue;
+            }
+            ContentFile f = it.getContentFile();
+            deliverables.add(new DeliverableFile(f.getId(), f.getName(), f.getContentType(),
+                    f.getSizeBytes(), f.getDurationSeconds(), f.getChecksum(),
+                    f.getProcessedStorageKey(), it.getPosition(),
+                    it.getDurationSeconds() != null ? it.getDurationSeconds() : f.getDurationSeconds()));
+        }
+
+        String expectedVersion = contentVersionService.computeForAssignment(assignment);
+
+        // The NUMERIC sync-group id (nullable) — NOT device.getSyncGroupId() (the sg-/fac- wire
+        // string). An override applies only to devices in an EXPLICIT sync group; facility/region-
+        // grouped devices have no numeric key and use the base anchor.
+        Long groupId = device.getSyncGroup() != null ? device.getSyncGroup().getId() : null;
+        Optional<SyncGroupPlaybackOverride> override = groupId == null
+                ? Optional.empty()
+                : overrideRepository.findBySyncGroupId(groupId);
+        boolean overrideApplies = override.isPresent()
+                && overrideMatches(override.get(), assignment, expectedVersion);
+
+        return new SyncContext(syncGroupWireId, syncPending, true,
+                assignment.getId(), assignment.getVersionNumber(), expectedVersion,
+                assignment.getPlaylist().getId(), assignment.getPlaylist().getName(),
+                List.copyOf(deliverables), overrideApplies,
+                overrideApplies ? override.get().getAnchorEpochMs() : null,
+                overrideApplies ? override.get().getActivateAtEpochMs() : null);
+    }
+
+    /** One deliverable file, detached from JPA so the storage phase can run outside a transaction. */
+    private record DeliverableFile(Long fileId, String name, String contentType, long sizeBytes,
+                                   Integer durationSeconds, String checksum, String processedKey,
+                                   int position, Integer effectiveSeconds) {
+
+        PlaybackSlotTimeline.Input toTimelineInput() {
+            return new PlaybackSlotTimeline.Input(position, fileId, name, effectiveSeconds);
+        }
+    }
+
+    /** Everything phase 1 read, with no entity attached. */
+    private record SyncContext(String syncGroupWireId, boolean syncPending, boolean hasAssignment,
+                               Long assignmentId, int versionNumber, String expectedVersion,
+                               Long playlistId, String playlistName,
+                               List<DeliverableFile> deliverables, boolean overrideApplies,
+                               Long overrideAnchorEpochMs, Long overrideActivateAtEpochMs) {
+
+        static SyncContext noAssignment(String syncGroupWireId, boolean syncPending) {
+            return new SyncContext(syncGroupWireId, syncPending, false, null, 0, null, null, null,
+                    List.of(), false, null, null);
+        }
     }
 
     /**
@@ -370,35 +482,35 @@ public class DeviceSyncService {
      * {@code MinioStorageClient.generatePresignedUrl}); the re-throw is there so the rule reads the
      * same at both call sites and cannot rot if that ever changes.
      */
-    private SyncFileToAdd tryBuildFileToAdd(ContentFile f) {
-        String key = f.getProcessedStorageKey();
+    private SyncFileToAdd tryBuildFileToAdd(DeliverableFile f) {
+        String key = f.processedKey();
         try {
             if (!fileStorageService.processedObjectExists(key)) {
                 log.warn("Storage inconsistency: content_file id={} (key={}) is READY in DB but missing from MinIO — excluding from sync",
-                        f.getId(), key);
+                        f.fileId(), key);
                 return null;
             }
         } catch (StorageUnavailableException e) {
             throw e;
         } catch (ResourceNotFoundException e) {
             log.warn("Storage inconsistency: content_file id={} (key={}) is READY in DB but missing from MinIO — excluding from sync",
-                    f.getId(), key);
+                    f.fileId(), key);
             return null;
         } catch (Exception e) {
             log.warn("Storage existence check failed for content_file id={} (key={}): {} — excluding from sync",
-                    f.getId(), key, e.getMessage());
+                    f.fileId(), key, e.getMessage());
             return null;
         }
 
         try {
             String url = fileStorageService.presignedProcessedUrl(key, presignedUrlExpiryMinutes);
-            return new SyncFileToAdd(f.getId(), f.getName(), f.getContentType(), f.getSizeBytes(),
-                    f.getDurationSeconds(), f.getChecksum(), url);
+            return new SyncFileToAdd(f.fileId(), f.name(), f.contentType(), f.sizeBytes(),
+                    f.durationSeconds(), f.checksum(), url);
         } catch (StorageUnavailableException e) {
             throw e;
         } catch (Exception e) {
             log.warn("Presigned URL generation failed for content_file id={} (key={}): {} — excluding from sync",
-                    f.getId(), key, e.getMessage());
+                    f.fileId(), key, e.getMessage());
             return null;
         }
     }
@@ -416,54 +528,50 @@ public class DeviceSyncService {
      * because this endpoint always serves the latest server-side state, devices that
      * re-poll naturally pick up changes without disrupting the in-progress item.
      */
-    @Transactional(readOnly = true)
     public PlaylistView getPlaylistView(Long deviceId) {
-        var device = deviceRepository.findByIdAndDeletedAtIsNull(deviceId)
-                .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
-
-        ContentAssignment assignment = assignmentService.resolveForDevice(device, Instant.now());
-        if (assignment == null || assignment.getPlaylist() == null) {
+        // Same phase split as computeSyncPlan (VG-07): read the playlist under a read-only
+        // transaction, then presign OUTSIDE it. This endpoint re-signs every item, so on the old
+        // single-transaction shape it held a pooled connection through one storage round trip per
+        // item.
+        SyncContext ctx = readTx.execute(status -> loadSyncContext(deviceId));
+        Objects.requireNonNull(ctx, "playlist context");
+        if (!ctx.hasAssignment()) {
             return new PlaylistView(deviceId, null, null, null, 0, List.of());
         }
-
-        var playlist = assignment.getPlaylist();
-        var items = playlistItemRepository.findByPlaylistIdOrderByPositionAsc(playlist.getId());
 
         var entries = new java.util.ArrayList<PlaylistViewItem>();
         int totalDurationSeconds = 0;
         int index = 0;
-        for (PlaylistItem it : items) {
+        var seenInView = new HashSet<Long>();
+        for (DeliverableFile f : ctx.deliverables()) {
             // Same deliverable base set as /sync (shared predicate). /playlist is a stateless
             // freshness snapshot: it re-presigns every item, so a transient signing/storage
             // failure drops the item here. (Unlike /sync it has no notion of "held" bytes, so a
             // held file the server can't currently serve is shown only by /sync — the documented
             // policy divergence.) Order + contiguous index derive from the shared base set, so
             // they never drift from /sync for the common (non-held) case.
-            if (!isDeliverable(it)) {
-                continue;
-            }
-            ContentFile f = it.getContentFile();
+            // /playlist lists each FILE once (its historical shape), unlike /sync's play order.
+            if (!seenInView.add(f.fileId())) continue;
             SyncFileToAdd addable = tryBuildFileToAdd(f);
             if (addable == null) continue;
 
-            Integer duration = it.getDurationSeconds() != null ? it.getDurationSeconds() : f.getDurationSeconds();
+            Integer duration = f.effectiveSeconds();
             entries.add(new PlaylistViewItem(
                     index++,
-                    it.getPosition(),
-                    f.getId(),
-                    f.getName(),
-                    f.getContentType(),
+                    f.position(),
+                    f.fileId(),
+                    f.name(),
+                    f.contentType(),
                     addable.presignedUrl(),
                     duration,
-                    f.getChecksum(),
-                    f.getSizeBytes()));
+                    f.checksum(),
+                    f.sizeBytes()));
             if (duration != null) {
                 totalDurationSeconds += duration;
             }
         }
 
-        String version = contentVersionService.computeForAssignment(assignment);
-        return new PlaylistView(deviceId, playlist.getId(), playlist.getName(), version,
+        return new PlaylistView(deviceId, ctx.playlistId(), ctx.playlistName(), ctx.expectedVersion(),
                 totalDurationSeconds, entries);
     }
 

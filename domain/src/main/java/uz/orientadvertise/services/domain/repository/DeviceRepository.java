@@ -218,4 +218,30 @@ public interface DeviceRepository extends JpaRepository<Device, Long> {
     @Query("UPDATE Device d SET d.reregistrationAllowedUntil = NULL " +
            "WHERE d.id = :id AND d.reregistrationAllowedUntil > :now")
     int claimReregistrationWindow(@Param("id") Long id, @Param("now") Instant now);
+
+    /**
+     * Arm the in-flight sync marker for one device. {@code COALESCE} preserves an existing
+     * {@code syncPendingSince}, so the 30-minute SYNC_TIMEOUT window keeps measuring from the FIRST
+     * plan of the cycle rather than restarting on every re-sync — the same rule as
+     * {@code Device.markSyncPending()}, expressed as one statement.
+     *
+     * <p>A statement rather than entity dirty-checking because {@code /sync} no longer runs inside a
+     * single transaction (VG-07): its write phase is a short transaction of its own, opened only when
+     * there is something to write, and it holds no {@link Device} entity to flush.
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE Device d SET d.syncPendingVersion = :expectedVersion, "
+           + "d.syncPendingSince = COALESCE(d.syncPendingSince, :now), d.updatedAt = :now "
+           + "WHERE d.id = :id")
+    int markSyncPending(@Param("id") Long id, @Param("expectedVersion") String expectedVersion,
+                        @Param("now") Instant now);
+
+    /**
+     * Clear the in-flight sync marker, but only when one is actually set — clearing unconditionally
+     * would bump {@code updatedAt} on every no-op {@code /sync} and write the row for nothing.
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE Device d SET d.syncPendingVersion = NULL, d.syncPendingSince = NULL, "
+           + "d.updatedAt = :now WHERE d.id = :id AND d.syncPendingSince IS NOT NULL")
+    int clearSyncPending(@Param("id") Long id, @Param("now") Instant now);
 }

@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.152`
+`1.0.153`
 
 ## Architecture
 
@@ -1302,6 +1302,70 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### `/sync` stops holding the pool, and a playlist edit cuts over as a group (v1.0.153)
+
+Three findings that all live in the same block of `DeviceSyncService`, fixed together because they
+depend on each other.
+
+> **VG-07 — `/sync` could deadlock the connection pool.** The whole endpoint was one
+> `@Transactional` method. Inside it, every file it offered was checked against object storage
+> (`statObject`) on the primary MinIO client, which carries minio-java's **5-minute** defaults — so a
+> blackholed store parked the request *and* the pooled database connection it was holding. Worse, the
+> anchor insert ran `REQUIRES_NEW`, so each call needed a **second** connection while still holding
+> the first. Twenty devices taking a new campaign at once therefore exhausted the pool of 20 for its
+> 10-second timeout: those devices played unsynced, and every other request in that window — heartbeats,
+> the dashboard — failed with 500.
+
+> **VG-06 — the coordinated cut-over never worked for an edit.** The anchor was keyed on
+> `(assignment_id, version_number)`, and `ContentAssignment.bumpVersion()` has no callers, so the
+> number is always 1. After any playlist edit the lookup returned the ORIGINAL row, whose `activateAt`
+> was long past — so each screen flipped the moment it finished downloading. Every multi-screen site
+> and every sync group showed different content until the slowest download landed.
+
+> **VG-10 — group members raced to delete one row.** `/sync` retired a stale group-jump override with
+> a Spring Data derived delete, which loads the row and removes it at commit, outside the method's
+> try/catch. When members of a group synced together after an edit, all but one hit an optimistic-lock
+> failure on a DELETE matching 0 rows: HTTP 500 plus a Telegram alert, for a device whose sync was fine.
+
+**What changed**
+
+- **`/sync` runs in three phases** (`TransactionTemplate`, not `@Transactional` — a self-invoked
+  annotation gets no transaction at all): a read-only transaction that copies everything it needs into
+  immutable records, **no transaction at all** for the storage checks and presigning, then a short write
+  transaction opened only when there is something to write. One connection at a time, never across a
+  storage call. `getPlaylistView` is split the same way.
+- **A `minioMetadataClient` bean** with 3-second timeouts serves `exists()`; transfers keep the long
+  defaults. A hanging store now gives the documented 503 in about three seconds.
+- **The anchor is keyed on the content version** (`V53`, `uq_playback_sched_cv`), so an edit anchors
+  its own future cut-over and every member of the group flips together. `version_number` is kept and
+  still written. The insert is `ON CONFLICT DO NOTHING` **in the caller's transaction**, which is what
+  let the `REQUIRES_NEW` writer bean (`PlaybackScheduleWriter`) go; a lost race writes 0 rows, raises
+  nothing, and re-reads the winner's row.
+- **The cut-over lead is sized from the download it implies:** `1.5 x newBytes /
+  app.sync.activation-assumed-bytes-per-sec` (new property, default 1 MB/s), clamped to
+  `[activation-min-lead, activation-max-lead-cap]` = 2–15 min. A reorder or dwell edit downloads
+  nothing and gets the 2-minute floor; a fresh device's full pull is excluded, so one new box cannot
+  push the group's cut-over to the cap.
+- **The sync-pending marker is a targeted UPDATE** (`COALESCE(sync_pending_since, :now)`), because the
+  write phase holds no `Device` entity to dirty-check.
+- **A stale override is retired once, by the edit** (`SyncGroupOverrideCleaner`, AFTER_COMMIT +
+  REQUIRES_NEW + `fallbackExecution`), with a bulk `DELETE … WHERE assignment_id IN`. `/sync` only
+  ignores one, which it already did safely.
+
+**Operator-visible:** a playlist edit now takes at least 2 minutes to reach the screens (longer when it
+adds a large file), and they all change together. **Device-visible:** an edit's `activateAt` is in the
+future, so the client must apply the §7.3 formula to every pending version — `ANDROID_DEVICE_FLOW_SPEC.md`
+R28, §7.4 and G-14 are updated.
+
+**Tests:** `DeviceSyncConnectionPoolIntegrationTest` (new; 8 concurrent syncs against the test
+profile's 3-connection pool, storage stubbed to sleep 500 ms and to assert no transaction is open,
+all sharing one anchor), `PlaybackScheduleServiceTest` (rewritten for the content-version key and the
+lead formula), `PlaybackSyncSchedulePersistenceTest` (+4: two content versions of one assignment both
+anchor, `insertIfAbsent` returns 1 then 0), `DeviceSyncServiceTest` (+3, and the marker/override
+assertions rewritten), `SyncGroupOverrideCleanerTest` (new), `MinioHealthProbeTest` (+1 for the new
+client's timeouts). Mutation-checked: putting the storage calls back inside a transaction fails the
+pool test with "storage was called while a database transaction was open".
 
 ### Plays are credited to the campaign that was on screen when they played (v1.0.152)
 

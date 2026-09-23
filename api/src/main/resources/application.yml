@@ -116,8 +116,14 @@ app:
     # activation-max-lead-cap: the ceiling on that lead, and the readiness poll's look-back window
     #   (a straggler past this still joins at the live position). The two are the same value on
     #   purpose: a pending cut-over must stay inside the window the poll reports on.
+    # activation-assumed-bytes-per-sec: the link speed the lead assumes when a cut-over has files to
+    #   download; the lead is 1.5 x newBytes / this, clamped to [min-lead, max-lead-cap]. ~1 MB/s is
+    #   a deliberately pessimistic retail-Wi-Fi figure. RAISE it only if the fleet is on good links —
+    #   too high and screens are told to cut over before the slowest of them has the file, which is
+    #   exactly the drift VG-06 fixed. ISO-8601 Durations, mirroring the @Scheduled poll style.
     activation-min-lead: ${APP_SYNC_ACTIVATION_MIN_LEAD:PT2M}
     activation-max-lead-cap: ${APP_SYNC_ACTIVATION_MAX_LEAD_CAP:PT15M}
+    activation-assumed-bytes-per-sec: ${APP_SYNC_ACTIVATION_ASSUMED_BYTES_PER_SEC:1048576}
     activation-poll-interval: ${APP_SYNC_ACTIVATION_POLL_INTERVAL:PT1M}
     # jump-min-lead: coordinated cut-over lead for an operator "jump the whole sync group to item N".
     # Unlike a version cut-over (activation-min-lead) a jump needs NO download — every member already

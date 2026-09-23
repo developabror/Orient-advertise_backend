@@ -45,8 +45,7 @@ class PlaylistControlServiceTest {
         playlistItemRepository = mock(PlaylistItemRepository.class);
         remoteActionService = mock(RemoteActionService.class);
         playbackScheduleService = mock(PlaybackScheduleService.class);
-        when(playbackScheduleService.find(any(), org.mockito.ArgumentMatchers.anyInt()))
-                .thenReturn(Optional.empty());
+        when(playbackScheduleService.isAnchored(any())).thenReturn(false);
         service = new PlaylistControlService(deviceRepository, assignmentService,
                 playlistItemRepository, remoteActionService, playbackScheduleService);
     }
@@ -326,15 +325,16 @@ class PlaylistControlServiceTest {
         PlaylistItem only = deliverableItem(0, 10);
         when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(93L)).thenReturn(List.of(only));
         when(assignmentService.resolveForDevice(eq(d), any())).thenReturn(assignment);
-        var anchor = mock(uz.orientadvertise.services.domain.model.PlaybackSyncSchedule.class);
-        when(playbackScheduleService.find(240L, 3)).thenReturn(Optional.of(anchor));
+        when(playbackScheduleService.isAnchored(240L)).thenReturn(true);
 
         var view = service.getActivePlaylist(24L);
 
         assertTrue(view.scheduled(), "an existing anchor means synchronised playback");
-        verify(playbackScheduleService).find(240L, 3);
-        // Reading the panel must never arm a cut-over: getOrCreate writes, find does not.
-        verify(playbackScheduleService, org.mockito.Mockito.never()).getOrCreate(any(), org.mockito.ArgumentMatchers.anyInt(), any());
+        verify(playbackScheduleService).isAnchored(240L);
+        // Reading the panel must never arm a cut-over: getOrCreate writes, isAnchored does not.
+        verify(playbackScheduleService, org.mockito.Mockito.never())
+                .getOrCreate(any(), org.mockito.ArgumentMatchers.anyInt(), any(),
+                        org.mockito.ArgumentMatchers.anyLong());
     }
 
     private static PlaylistItem deliverableItem() {
