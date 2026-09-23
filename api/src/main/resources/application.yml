@@ -68,6 +68,13 @@ app:
     refresh-cookie-samesite: ${REFRESH_COOKIE_SAMESITE:Strict}
   playback:
     max-clock-skew-seconds: 30
+    # How long after a campaign ended its plays are still credited to it. A device keeps playing
+    # the old loop until it has downloaded the new one and reached the shared cut-over, and it
+    # then flushes those plays late — without this window they would be thrown away and the
+    # advertiser under-billed (VG-03). Sized as the activation lead cap (15 min) + the device's
+    # flush interval (5 min) + margin. Raising it credits older plays to a finished campaign;
+    # lowering it below the lead cap starts discarding real plays again.
+    assignment-grace: ${APP_PLAYBACK_ASSIGNMENT_GRACE:PT30M}
   # Nightly retention cleanup (RetentionCleanupService, 02:00 Asia/Karachi). Each table drains
   # against its OWN window — one shared 90 days let the cheapest table set the price for the
   # most expensive one.
@@ -105,8 +112,10 @@ app:
     # Synchronized multi-device playback (Variant A) — coordinated cut-over timing.
     # activation-min-lead: how far ahead of "now" the shared activateAt (== loop anchor) is set when
     #   a content version is first activated. Devices download during this lead and flip together.
-    # activation-max-lead-cap: bounds the readiness poll's look-back window (a straggler past this
-    #   still joins at the live position). ISO-8601 Durations, mirroring the @Scheduled poll style.
+    #   It is the FLOOR since V53/VG-06 — enough for an edit that downloads nothing (reorder, dwell).
+    # activation-max-lead-cap: the ceiling on that lead, and the readiness poll's look-back window
+    #   (a straggler past this still joins at the live position). The two are the same value on
+    #   purpose: a pending cut-over must stay inside the window the poll reports on.
     activation-min-lead: ${APP_SYNC_ACTIVATION_MIN_LEAD:PT2M}
     activation-max-lead-cap: ${APP_SYNC_ACTIVATION_MAX_LEAD_CAP:PT15M}
     activation-poll-interval: ${APP_SYNC_ACTIVATION_POLL_INTERVAL:PT1M}

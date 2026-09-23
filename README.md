@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.151`
+`1.0.152`
 
 ## Architecture
 
@@ -1302,6 +1302,45 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### Plays are credited to the campaign that was on screen when they played (v1.0.152)
+
+> **VG-03 (review LOGIC-17).** Every entry in a playback batch was checked against the campaign
+> resolved **now** (`resolveForDevice(device, Instant.now())`), not at its `playedAt`, and the row was
+> written with `assignment_id = NULL`. A device flushes minutes after the fact and keeps playing the
+> old loop until it has downloaded the new one, so every campaign switch discarded that trailing
+> window of the old campaign's plays — and a device offline across a switch lost all of them. The
+> plays were rejected as "not assigned to device", i.e. as forgery. Advertiser proof-of-play
+> undercounted, which is what the invoices are built from.
+
+**What changed:** a batch now loads the device's campaign *history* once — every CONFIRMED assignment
+targeting its region/facility/group whose window overlaps the batch's span, including rows soft-deleted
+inside it (`findHistoricalCandidates`) — plus the device's exclusions and each candidate playlist's
+files. Each entry is then judged at its own `playedAt`: the winner among the campaigns live at that
+instant decides (same `PRECEDENCE` the device resolves with), and if the winner doesn't hold that clip,
+the campaign that most recently stopped applying to *this device* and did hold it is credited, within
+`app.playback.assignment-grace` (default 30 min = the 15-minute activation lead cap + the 5-minute
+flush + margin). Only then is the entry refused. A device that nothing ever targeted still has its
+plays kept and unattributed, as before.
+
+Re-resolving at `playedAt` would not have been enough: the live path filters `deleted_at IS NULL` and
+ignores when an exclusion was written, so a cancelled, replaced or narrowed campaign would still
+vanish. `ContentAssignment` gained `effectiveEnd()` and `wasLiveAt`/`wasLiveDuring` — the historical
+twin of `PRECEDENCE`, in the same place, so the rule has one home. Every accepted play now carries its
+`assignment_id`; the column and its FK have existed since V11, so **no migration**. Dedup is unchanged
+(`uq_playback_dedup` ignores the campaign), and no report reads the column yet.
+
+**Known limit:** playlist membership has no history (items are hard-deleted), so a play of a clip that
+was removed from the playlist, or from a device that changed region, is still refused if it arrives
+after the change. V53's per-version anchor rows are the natural place to fix that later.
+
+**Tests:** `PlaybackLogBatchTest` (+6, including the switch-window repro that asserts the captured
+`assignment_id`s), `ContentAssignmentHistoricalCandidatesTest` (new, H2 under the full schema: keeps a
+campaign soft-deleted mid-window, drops one deleted before it, drops DRAFTs and non-overlapping
+windows, targets region/facility/group, and a device with no facility or group), and
+`PlaybackLogDedupInsertTest` (+1: the id persists and does not widen the dedup key). Mutation-checked:
+dropping the attribution, and judging at `now` instead of `playedAt`, each fail exactly the tests
+written for them.
 
 ### The device page's playlist panel works again (v1.0.151)
 

@@ -26,6 +26,7 @@ import uz.orientadvertise.services.domain.repository.PlaybackLogRepository;
 import uz.orientadvertise.services.infra.TestApplication;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -50,6 +51,8 @@ class PlaybackLogDedupInsertTest {
     private static final long CONTENT = 90L;
     private static final long OTHER_CONTENT = 91L;
     private static final long MISSING_DEVICE = 999_999L;
+    private static final long ASSIGNMENT = 700L;
+    private static final long OTHER_ASSIGNMENT = 701L;
 
     private static TimeZone originalTimeZone;
 
@@ -106,6 +109,15 @@ class PlaybackLogDedupInsertTest {
                     + "VALUES (" + CONTENT + ", 500, 'Dedup Clip', 'video/mp4', 1000, 'key-dedup')");
             s.execute("INSERT INTO content_file (id, project_id, name, content_type, size_bytes, storage_key) "
                     + "VALUES (" + OTHER_CONTENT + ", 500, 'Other Clip', 'video/mp4', 1000, 'key-other')");
+            // Two campaigns to attribute plays to (VG-03): assignment_id has an FK since V11.
+            s.execute("INSERT INTO playlist (id, project_id, name, created_at, updated_at) "
+                    + "VALUES (500, 500, 'Dedup Playlist', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            for (long id : new long[] {ASSIGNMENT, OTHER_ASSIGNMENT}) {
+                s.execute("INSERT INTO content_assignment (id, playlist_id, target_type, target_id, "
+                        + "priority, start_time, end_time, status, version_number, created_at, updated_at) "
+                        + "VALUES (" + id + ", 500, 'REGION', 500, 1, CURRENT_TIMESTAMP, "
+                        + "CURRENT_TIMESTAMP + 1, 'CONFIRMED', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+            }
         }
 
         Instant base = Instant.now().truncatedTo(ChronoUnit.MILLIS).minusSeconds(600);
@@ -231,6 +243,30 @@ class PlaybackLogDedupInsertTest {
         Integer again = new TransactionTemplate(txManager).execute(s ->
                 repository.insertIgnoringDuplicate(DEVICE, CONTENT, null, t1, null, Instant.now()));
         assertEquals(0, again);
+    }
+
+    /**
+     * VG-03: every accepted play now carries the campaign that was live when it played, so the
+     * column the schema has had since V11 stops being uniformly NULL. Dedup must ignore it — the
+     * same play re-sent with a different campaign is still the same play, not a second one.
+     */
+    @Test
+    void assignmentIdPersists_andDoesNotWidenTheDedupKey() {
+        Integer first = new TransactionTemplate(txManager).execute(s ->
+                repository.insertIgnoringDuplicate(DEVICE, CONTENT, ASSIGNMENT, t1, 30, Instant.now()));
+        assertEquals(1, first);
+
+        var row = repository.findByContentFileIdOrderByPlayedAtDesc(CONTENT).get(0);
+        assertNotNull(row.getAssignment(), "the attributed campaign must persist");
+        assertEquals(ASSIGNMENT, row.getAssignment().getId());
+
+        Integer again = new TransactionTemplate(txManager).execute(s ->
+                repository.insertIgnoringDuplicate(DEVICE, CONTENT, OTHER_ASSIGNMENT, t1, 30, Instant.now()));
+        assertEquals(0, again, "a different assignment_id is still the same (device, content, playedAt)");
+        assertEquals(1, rowCount());
+        assertEquals(ASSIGNMENT,
+                repository.findByContentFileIdOrderByPlayedAtDesc(CONTENT).get(0).getAssignment().getId(),
+                "the first attribution stands; ON CONFLICT DO NOTHING must not overwrite it");
     }
 
     @Test

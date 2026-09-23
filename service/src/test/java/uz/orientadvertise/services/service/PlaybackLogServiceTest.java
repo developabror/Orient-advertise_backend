@@ -10,6 +10,8 @@ import org.springframework.dao.DataIntegrityViolationException;
 import uz.orientadvertise.services.domain.model.ContentAssignment;
 import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Device;
+import uz.orientadvertise.services.domain.repository.ContentAssignmentExclusionRepository;
+import uz.orientadvertise.services.domain.repository.ContentAssignmentRepository;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.PlaybackLogRepository;
@@ -52,8 +54,8 @@ class PlaybackLogServiceTest {
     /** resolveForDevice defaults to null → no assignment → the batch assignment-check is skipped. */
     private PlaybackLogService serviceWith(RetentionProperties retention) {
         return new PlaybackLogService(repository, deviceRepository, contentFileRepository,
-                mock(ContentAssignmentService.class), mock(PlaylistItemRepository.class),
-                retention, 30);
+                mock(ContentAssignmentRepository.class), mock(ContentAssignmentExclusionRepository.class),
+                mock(PlaylistItemRepository.class), retention, 30, Duration.ofMinutes(30));
     }
 
     /**

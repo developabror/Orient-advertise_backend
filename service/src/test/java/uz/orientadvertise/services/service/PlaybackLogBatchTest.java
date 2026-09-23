@@ -15,6 +15,10 @@ import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.Playlist;
 import uz.orientadvertise.services.domain.model.PlaylistItem;
+import uz.orientadvertise.services.domain.model.ContentAssignmentExclusion;
+import uz.orientadvertise.services.domain.model.Region;
+import uz.orientadvertise.services.domain.repository.ContentAssignmentExclusionRepository;
+import uz.orientadvertise.services.domain.repository.ContentAssignmentRepository;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.PlaybackLogRepository;
@@ -34,10 +38,14 @@ import static org.mockito.Mockito.when;
 
 class PlaybackLogBatchTest {
 
+    /** Matches the shipped default (`app.playback.assignment-grace`). */
+    private static final Duration GRACE = Duration.ofMinutes(30);
+
     private PlaybackLogRepository repository;
     private DeviceRepository deviceRepository;
     private ContentFileRepository contentFileRepository;
-    private ContentAssignmentService assignmentService;
+    private ContentAssignmentRepository assignmentRepository;
+    private ContentAssignmentExclusionRepository exclusionRepository;
     private PlaylistItemRepository playlistItemRepository;
     private PlaybackLogService service;
     private Device device;
@@ -48,13 +56,18 @@ class PlaybackLogBatchTest {
         repository = mock(PlaybackLogRepository.class);
         deviceRepository = mock(DeviceRepository.class);
         contentFileRepository = mock(ContentFileRepository.class);
-        assignmentService = mock(ContentAssignmentService.class);
+        assignmentRepository = mock(ContentAssignmentRepository.class);
+        exclusionRepository = mock(ContentAssignmentExclusionRepository.class);
         playlistItemRepository = mock(PlaylistItemRepository.class);
         service = new PlaybackLogService(repository, deviceRepository, contentFileRepository,
-                assignmentService, playlistItemRepository, new RetentionProperties(), 30);
+                assignmentRepository, exclusionRepository, playlistItemRepository,
+                new RetentionProperties(), 30, GRACE);
 
         device = mock(Device.class);
         when(device.getId()).thenReturn(1L);
+        var region = mock(Region.class);
+        when(region.getId()).thenReturn(7L);
+        when(device.getRegion()).thenReturn(region);
         contentFile = mock(ContentFile.class);
         when(contentFile.getId()).thenReturn(10L);
 
@@ -100,23 +113,15 @@ class PlaybackLogBatchTest {
 
     @Test
     void recordBatch_rejectsContentNotInAssignedPlaylist() {
-        // Device is assigned a playlist containing only content 10. An entry reporting
-        // playback of content 99 (not in the playlist) is rejected as analytics-forgery,
-        // while the in-playlist entry is accepted.
-        var playlist = mock(Playlist.class);
-        when(playlist.getId()).thenReturn(500L);
-        var assignment = mock(ContentAssignment.class);
-        when(assignment.getPlaylist()).thenReturn(playlist);
-        when(assignmentService.resolveForDevice(any(), any())).thenReturn(assignment);
-        var item = mock(PlaylistItem.class);
-        when(item.getContentFile()).thenReturn(contentFile); // content id 10
-        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(500L)).thenReturn(List.of(item));
-
-        var other = mock(ContentFile.class);
-        when(other.getId()).thenReturn(99L);
-        when(contentFileRepository.findById(99L)).thenReturn(Optional.of(other));
-
+        // Device plays a playlist containing only content 10. An entry claiming content 99 is
+        // rejected as analytics-forgery, while the in-playlist entry is accepted and attributed.
         var now = Instant.now();
+        var assignment = confirmedAssignment(700L, 500L, now.minus(Duration.ofHours(2)),
+                now.plus(Duration.ofHours(2)), now.minus(Duration.ofHours(2)));
+        stubCandidates(assignment);
+        stubPlaylistFiles(500L, 10L);
+        stubContentFile(99L);
+
         var result = service.recordBatch(1L, List.of(
                 new PlaybackEntry(10L, now, 30),   // assigned → accepted
                 new PlaybackEntry(99L, now, 30))); // not assigned → rejected
@@ -124,6 +129,192 @@ class PlaybackLogBatchTest {
         assertEquals(1, result.created());
         assertEquals(1, result.rejected());
         assertTrue(result.rejections().stream().anyMatch(r -> r.reason().contains("not assigned")));
+        assertEquals(List.of(700L), attributedAssignmentIds());
+    }
+
+    // ----- VG-03: a play belongs to the campaign that was live when it PLAYED -----
+
+    @Test
+    void playsAroundACampaignSwitch_areKeptAndCreditedToTheRightCampaign() {
+        // THE BUG REPRO. Campaign A (file 10) is replaced by B (file 99) at T. The device keeps
+        // playing A's clip for a couple of minutes — it has to download B first — then flushes
+        // everything at once. The old code checked every entry against the campaign live NOW, so
+        // both of A's plays were thrown away and nothing was attributed: an advertiser undercount.
+        var now = Instant.now();
+        var switchAt = now.minus(Duration.ofHours(3));
+        var a = confirmedAssignment(100L, 500L, switchAt.minus(Duration.ofHours(2)), switchAt,
+                switchAt.minus(Duration.ofHours(2)));           // truncated by the Replace
+        var b = confirmedAssignment(200L, 600L, switchAt, now.plus(Duration.ofHours(1)), switchAt);
+        stubCandidates(a, b);
+        stubPlaylistFiles(500L, 10L);
+        stubPlaylistFiles(600L, 99L);
+        stubContentFile(99L);
+
+        var result = service.recordBatch(1L, List.of(
+                new PlaybackEntry(10L, switchAt.minus(Duration.ofMinutes(10)), 30),  // A was live
+                new PlaybackEntry(10L, switchAt.plus(Duration.ofMinutes(2)), 30),    // still on A
+                new PlaybackEntry(99L, switchAt.plus(Duration.ofMinutes(5)), 30)));  // switched
+
+        assertEquals(3, result.created());
+        assertEquals(0, result.rejected());
+        assertEquals(List.of(100L, 100L, 200L), attributedAssignmentIds());
+    }
+
+    @Test
+    void aPlayLongAfterTheSwitch_isStillRejected() {
+        // The grace window is not a free pass: hours later the device cannot honestly still be
+        // playing the old campaign, so a claim for its clip is forgery again.
+        var now = Instant.now();
+        var switchAt = now.minus(Duration.ofHours(3));
+        var a = confirmedAssignment(100L, 500L, switchAt.minus(Duration.ofHours(2)), switchAt,
+                switchAt.minus(Duration.ofHours(2)));
+        var b = confirmedAssignment(200L, 600L, switchAt, now.plus(Duration.ofHours(1)), switchAt);
+        stubCandidates(a, b);
+        stubPlaylistFiles(500L, 10L);
+        stubPlaylistFiles(600L, 99L);
+
+        var result = service.recordBatch(1L, List.of(
+                new PlaybackEntry(10L, switchAt.plus(Duration.ofHours(2)), 30)));
+
+        assertEquals(0, result.created());
+        assertEquals(1, result.rejected());
+    }
+
+    @Test
+    void aPlayFromBeforeACancel_isKept() {
+        // Cancelling soft-deletes the row, and the live resolver filters those out — so without
+        // history the device's last flush of a cancelled campaign would be discarded wholesale.
+        var now = Instant.now();
+        var cancelledAt = now.minus(Duration.ofMinutes(20));
+        var cancelled = confirmedAssignment(300L, 500L, now.minus(Duration.ofHours(4)),
+                now.plus(Duration.ofHours(4)), now.minus(Duration.ofHours(4)));
+        setField(cancelled, "deletedAt", cancelledAt);
+        stubCandidates(cancelled);
+        stubPlaylistFiles(500L, 10L);
+
+        var result = service.recordBatch(1L, List.of(
+                new PlaybackEntry(10L, cancelledAt.minus(Duration.ofMinutes(1)), 30)));
+
+        assertEquals(1, result.created());
+        assertEquals(List.of(300L), attributedAssignmentIds());
+    }
+
+    @Test
+    void aPlayFromBeforeAnExclusion_isKept_andOneLongAfterIsNot() {
+        // Taking a device off an assignment (a partial-device Replace writes exclusions) applies
+        // from the moment it is written — it must not erase what the device played before it.
+        var now = Instant.now();
+        var excludedAt = now.minus(Duration.ofHours(2));
+        var assignment = confirmedAssignment(400L, 500L, now.minus(Duration.ofHours(6)),
+                now.plus(Duration.ofHours(6)), now.minus(Duration.ofHours(6)));
+        stubCandidates(assignment);
+        stubPlaylistFiles(500L, 10L);
+        stubExclusion(assignment, excludedAt);
+
+        var result = service.recordBatch(1L, List.of(
+                new PlaybackEntry(10L, excludedAt.minus(Duration.ofMinutes(1)), 30),
+                new PlaybackEntry(10L, excludedAt.plus(Duration.ofHours(1)), 30)));
+
+        assertEquals(1, result.created());
+        assertEquals(1, result.rejected());
+        assertEquals(List.of(400L), attributedAssignmentIds());
+    }
+
+    @Test
+    void whenNothingEverTargetedTheDevice_playsAreKeptUnattributed() {
+        // Unchanged behaviour: with no campaign to check against we cannot validate, so the
+        // report is kept rather than silently dropped — but it carries no assignment.
+        var now = Instant.now();
+        stubCandidates();
+
+        var result = service.recordBatch(1L, List.of(new PlaybackEntry(10L, now, 30)));
+
+        assertEquals(1, result.created());
+        assertEquals(0, result.rejected());
+        assertEquals(java.util.Collections.singletonList(null), attributedAssignmentIds());
+    }
+
+    @Test
+    void theHistoryIsLoadedOncePerBatch_notPerEntry() {
+        var now = Instant.now();
+        var assignment = confirmedAssignment(100L, 500L, now.minus(Duration.ofHours(2)),
+                now.plus(Duration.ofHours(2)), now.minus(Duration.ofHours(2)));
+        stubCandidates(assignment);
+        stubPlaylistFiles(500L, 10L);
+
+        var entries = new ArrayList<PlaybackEntry>();
+        for (int i = 0; i < 50; i++) {
+            entries.add(new PlaybackEntry(10L, now.minusSeconds(i + 1), 30));
+        }
+        service.recordBatch(1L, entries);
+
+        verify(assignmentRepository, times(1))
+                .findHistoricalCandidates(any(), any(), any(), any(), any());
+        verify(exclusionRepository, times(1)).findByDeviceId(1L);
+        verify(playlistItemRepository, times(1)).findByPlaylistIdOrderByPositionAsc(500L);
+    }
+
+    /** A real (not mocked) assignment: {@code wasLiveDuring} is the rule under test here. */
+    private static ContentAssignment confirmedAssignment(Long id, Long playlistId, Instant start,
+                                                         Instant end, Instant confirmedAt) {
+        var playlist = mock(Playlist.class);
+        when(playlist.getId()).thenReturn(playlistId);
+        var assignment = new ContentAssignment(playlist, ContentAssignment.TargetType.REGION, 7L,
+                start, end);
+        setField(assignment, "id", id);
+        setField(assignment, "createdAt", confirmedAt);
+        setField(assignment, "confirmedAt", confirmedAt);
+        return assignment;
+    }
+
+    private static void setField(Object target, String name, Object value) {
+        try {
+            var f = target.getClass().getDeclaredField(name);
+            f.setAccessible(true);
+            f.set(target, value);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void stubCandidates(ContentAssignment... assignments) {
+        when(assignmentRepository.findHistoricalCandidates(any(), any(), any(), any(), any()))
+                .thenReturn(List.of(assignments));
+    }
+
+    private void stubPlaylistFiles(Long playlistId, Long... fileIds) {
+        var items = new ArrayList<PlaylistItem>();
+        for (Long fileId : fileIds) {
+            var file = mock(ContentFile.class);
+            when(file.getId()).thenReturn(fileId);
+            var item = mock(PlaylistItem.class);
+            when(item.getContentFile()).thenReturn(file);
+            items.add(item);
+        }
+        when(playlistItemRepository.findByPlaylistIdOrderByPositionAsc(playlistId))
+                .thenReturn(List.copyOf(items));
+    }
+
+    private void stubExclusion(ContentAssignment assignment, Instant createdAt) {
+        var exclusion = mock(ContentAssignmentExclusion.class);
+        when(exclusion.getAssignment()).thenReturn(assignment);
+        when(exclusion.getCreatedAt()).thenReturn(createdAt);
+        when(exclusionRepository.findByDeviceId(1L)).thenReturn(List.of(exclusion));
+    }
+
+    private void stubContentFile(Long fileId) {
+        var file = mock(ContentFile.class);
+        when(file.getId()).thenReturn(fileId);
+        when(contentFileRepository.findById(fileId)).thenReturn(Optional.of(file));
+    }
+
+    /** The assignment id written with each accepted play, in order. */
+    private List<Long> attributedAssignmentIds() {
+        var captor = org.mockito.ArgumentCaptor.forClass(Long.class);
+        verify(repository, org.mockito.Mockito.atLeastOnce()).insertIgnoringDuplicate(
+                anyLong(), anyLong(), captor.capture(), any(Instant.class), nullable(Integer.class),
+                any(Instant.class));
+        return captor.getAllValues();
     }
 
     @Test

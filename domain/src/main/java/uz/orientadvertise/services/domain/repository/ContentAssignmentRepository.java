@@ -60,6 +60,36 @@ public interface ContentAssignmentRepository extends JpaRepository<ContentAssign
     List<ContentAssignment> findActiveAtTime(@Param("now") Instant now);
 
     /**
+     * Every assignment that could have been driving ONE device during {@code [from, to]} — the
+     * question a play reported after the fact asks. Unordered; the caller picks per play with
+     * {@link ContentAssignment#wasLiveAt} and {@link ContentAssignment#PRECEDENCE}.
+     *
+     * <p>Deliberately unlike {@link #findActiveAtTime} in two ways, and both matter:
+     * <ul>
+     *   <li>it keeps rows <b>deleted after {@code from}</b> — a cancel soft-deletes and a
+     *       "Replace" truncates, so filtering {@code deletedAt IS NULL} would erase exactly the
+     *       campaign a late-flushed play belongs to;</li>
+     *   <li>it matches the <b>window against a range</b>, not an instant.</li>
+     * </ul>
+     *
+     * <p>Targeting is done here rather than in memory so a busy fleet's unrelated campaigns never
+     * reach the JVM. A null {@code facilityId} / {@code deviceGroupId} (a device with no facility
+     * or group) simply matches nothing on that branch, which is what an unplaced device means.
+     */
+    @Query("SELECT ca FROM ContentAssignment ca "
+           + "WHERE ca.status = 'CONFIRMED' "
+           + "AND ca.startTime <= :to AND ca.endTime > :from "
+           + "AND (ca.deletedAt IS NULL OR ca.deletedAt > :from) "
+           + "AND ((ca.targetType = 'REGION' AND ca.targetId = :regionId) "
+           + "  OR (ca.targetType = 'FACILITY' AND ca.targetId = :facilityId) "
+           + "  OR (ca.targetType = 'DEVICE_GROUP' AND ca.targetId = :deviceGroupId))")
+    List<ContentAssignment> findHistoricalCandidates(@Param("regionId") Long regionId,
+                                                     @Param("facilityId") Long facilityId,
+                                                     @Param("deviceGroupId") Long deviceGroupId,
+                                                     @Param("from") Instant from,
+                                                     @Param("to") Instant to);
+
+    /**
      * Active assignments that reference a specific playlist. Drives the playlist-
      * mutation instant-push path ({@code PlaylistReorderedSyncPushListener}) — when
      * an operator edits a playlist, every device currently bound to it via an

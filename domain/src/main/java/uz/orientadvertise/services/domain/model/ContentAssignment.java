@@ -11,6 +11,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
 
@@ -206,6 +207,44 @@ public class ContentAssignment {
     public Instant effectiveConfirmedAt() {
         return confirmedAt != null ? confirmedAt : createdAt;
     }
+
+    /**
+     * When this assignment stopped (or will stop) driving devices: its {@code endTime}, or its
+     * deletion if that came first. Cancelling and "Replace" both act through these two fields —
+     * a cancel soft-deletes, a Replace truncates {@code endTime} — so one instant covers both.
+     */
+    public Instant effectiveEnd() {
+        return deletedAt != null && deletedAt.isBefore(endTime) ? deletedAt : endTime;
+    }
+
+    /**
+     * True when this assignment was really driving devices at {@code t} — the question a play
+     * reported <em>after the fact</em> has to answer, since {@code deletedAt IS NULL} (what
+     * {@code findActiveAtTime} filters on) only describes it now.
+     *
+     * <p>Device-independent: targeting and per-device exclusions are the caller's half (see
+     * {@code PlaybackLogService}). {@code confirmSkew} tolerates a device clock running slightly
+     * ahead of the server's confirm stamp, the same allowance the playback endpoint gives
+     * {@code playedAt}.
+     *
+     * <p>This is the historical twin of {@link #PRECEDENCE}: that decides who wins among the
+     * assignments live at an instant, this decides which ones were live at all.
+     */
+    public boolean wasLiveAt(Instant t, Duration confirmSkew) {
+        return wasLiveDuring(t, t, confirmSkew);
+    }
+
+    /**
+     * True when this assignment was driving devices at <em>some</em> instant in {@code [from, to]}.
+     * Same rule as {@link #wasLiveAt} widened to an interval, which is what a grace window needs:
+     * a play flushed shortly after a campaign switch belongs to the campaign that just ended.
+     */
+    public boolean wasLiveDuring(Instant from, Instant to, Duration confirmSkew) {
+        if (startTime.isAfter(to) || !effectiveEnd().isAfter(from)) return false;
+        Instant confirmed = effectiveConfirmedAt();
+        return confirmed == null || !confirmed.isAfter(to.plus(confirmSkew));
+    }
+
     public Instant getDeletedAt() { return deletedAt; }
     public boolean isDeleted() { return deletedAt != null; }
 

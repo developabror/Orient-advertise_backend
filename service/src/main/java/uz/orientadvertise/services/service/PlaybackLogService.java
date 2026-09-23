@@ -18,6 +18,8 @@ import uz.orientadvertise.services.domain.model.ContentFile;
 import uz.orientadvertise.services.domain.model.Device;
 import uz.orientadvertise.services.domain.model.PlaybackLog;
 import uz.orientadvertise.services.domain.model.PlaylistItem;
+import uz.orientadvertise.services.domain.repository.ContentAssignmentExclusionRepository;
+import uz.orientadvertise.services.domain.repository.ContentAssignmentRepository;
 import uz.orientadvertise.services.domain.repository.ContentFileRepository;
 import uz.orientadvertise.services.domain.repository.DeviceRepository;
 import uz.orientadvertise.services.domain.repository.PlaybackLogRepository;
@@ -33,25 +35,31 @@ public class PlaybackLogService {
     private final PlaybackLogRepository repository;
     private final DeviceRepository deviceRepository;
     private final ContentFileRepository contentFileRepository;
-    private final ContentAssignmentService assignmentService;
+    private final ContentAssignmentRepository assignmentRepository;
+    private final ContentAssignmentExclusionRepository exclusionRepository;
     private final PlaylistItemRepository playlistItemRepository;
     private final RetentionProperties retentionProperties;
     private final Duration maxClockSkew;
+    private final Duration assignmentGrace;
 
     public PlaybackLogService(PlaybackLogRepository repository,
                               DeviceRepository deviceRepository,
                               ContentFileRepository contentFileRepository,
-                              ContentAssignmentService assignmentService,
+                              ContentAssignmentRepository assignmentRepository,
+                              ContentAssignmentExclusionRepository exclusionRepository,
                               PlaylistItemRepository playlistItemRepository,
                               RetentionProperties retentionProperties,
-                              @Value("${app.playback.max-clock-skew-seconds:30}") int maxClockSkewSeconds) {
+                              @Value("${app.playback.max-clock-skew-seconds:30}") int maxClockSkewSeconds,
+                              @Value("${app.playback.assignment-grace:PT30M}") Duration assignmentGrace) {
         this.repository = repository;
         this.deviceRepository = deviceRepository;
         this.contentFileRepository = contentFileRepository;
-        this.assignmentService = assignmentService;
+        this.assignmentRepository = assignmentRepository;
+        this.exclusionRepository = exclusionRepository;
         this.playlistItemRepository = playlistItemRepository;
         this.retentionProperties = retentionProperties;
         this.maxClockSkew = Duration.ofSeconds(maxClockSkewSeconds);
+        this.assignmentGrace = assignmentGrace;
     }
 
     /**
@@ -142,11 +150,9 @@ public class PlaybackLogService {
         var device = deviceRepository.findByIdAndDeletedAtIsNull(deviceId)
                 .orElseThrow(() -> new ResourceNotFoundException("Device", deviceId));
 
-        // Defense in depth (analytics-forgery): when the device has a resolved assignment,
-        // only accept playback for content actually in its assigned playlist. If no
-        // assignment resolves we can't validate, so we don't reject (pre-existing behavior).
-        Set<Long> assignedFileIds = resolveAssignedContentFileIds(device);
-        boolean enforceAssigned = !assignedFileIds.isEmpty();
+        // Which campaign was on screen when each entry was PLAYED — not which is on now. A batch
+        // routinely arrives minutes after the fact and can straddle a campaign switch (VG-03).
+        var history = loadHistory(device, entries);
 
         // Cache content files per request so a batch with 500 events for the same 5
         // playlist items doesn't issue 500 lookups.
@@ -176,10 +182,15 @@ public class PlaybackLogService {
                 continue;
             }
 
-            if (enforceAssigned && !assignedFileIds.contains(entry.contentFileId())) {
+            // Attribute the play to the campaign that was live at playedAt. A null playedAt is
+            // left to record() to refuse, exactly as before.
+            Attribution attribution = entry.playedAt() == null
+                    ? Attribution.unknown()
+                    : history.attribute(entry.contentFileId(), entry.playedAt());
+            if (attribution.rejected()) {
                 rejected++;
                 rejections.add(new EntryRejection(i,
-                        "contentFileId not assigned to device: " + entry.contentFileId()));
+                        "contentFileId not assigned to device at playedAt: " + entry.contentFileId()));
                 continue;
             }
 
@@ -193,7 +204,8 @@ public class PlaybackLogService {
                 continue;
             }
 
-            var result = record(device, file, null, entry.playedAt(), entry.durationSeconds());
+            var result = record(device, file, attribution.assignment(), entry.playedAt(),
+                    entry.durationSeconds());
             if (result instanceof PlaybackLogResult.Created) {
                 created++;
                 if (key != null) seenInRequest.add(key);
@@ -212,20 +224,128 @@ public class PlaybackLogService {
     }
 
     /**
-     * Content file ids in the device's currently-resolved assigned playlist, or an empty
-     * set when no assignment resolves (caller then skips the assignment check).
+     * Load every assignment that could have been driving this device across the batch's span,
+     * with the per-device facts the plays are judged against: the device's exclusions and each
+     * candidate playlist's content files. One query each, whatever the batch size.
      */
-    private Set<Long> resolveAssignedContentFileIds(Device device) {
-        var assignment = assignmentService.resolveForDevice(device, Instant.now());
-        if (assignment == null || assignment.getPlaylist() == null) {
-            return Set.of();
+    private DeviceHistory loadHistory(Device device, List<PlaybackEntry> entries) {
+        Instant earliest = null;
+        Instant latest = null;
+        for (var entry : entries) {
+            var playedAt = entry.playedAt();
+            if (playedAt == null) continue;
+            if (earliest == null || playedAt.isBefore(earliest)) earliest = playedAt;
+            if (latest == null || playedAt.isAfter(latest)) latest = playedAt;
         }
-        return playlistItemRepository
-                .findByPlaylistIdOrderByPositionAsc(assignment.getPlaylist().getId()).stream()
+        if (earliest == null) {
+            return new DeviceHistory(List.of(), maxClockSkew, assignmentGrace);
+        }
+
+        var region = device.getRegion();
+        var facility = device.getFacility();
+        var group = device.getDeviceGroup();
+        var assignments = assignmentRepository.findHistoricalCandidates(
+                region != null ? region.getId() : null,
+                facility != null ? facility.getId() : null,
+                group != null ? group.getId() : null,
+                earliest.minus(assignmentGrace),
+                latest);
+
+        // An exclusion takes a device off an assignment from the moment it is written, so for
+        // THIS device that assignment effectively ended then. Earliest wins if there are several.
+        var excludedFrom = new java.util.HashMap<Long, Instant>();
+        for (var exclusion : exclusionRepository.findByDeviceId(device.getId())) {
+            var assignment = exclusion.getAssignment();
+            if (assignment == null || assignment.getId() == null) continue;
+            excludedFrom.merge(assignment.getId(), exclusion.getCreatedAt(),
+                    (a, b) -> a == null || (b != null && b.isBefore(a)) ? b : a);
+        }
+
+        var filesByPlaylist = new java.util.HashMap<Long, Set<Long>>();
+        var candidates = new java.util.ArrayList<Candidate>(assignments.size());
+        for (var assignment : assignments) {
+            var playlist = assignment.getPlaylist();
+            if (playlist == null) continue;
+            var fileIds = filesByPlaylist.computeIfAbsent(playlist.getId(), this::contentFileIdsOf);
+            var excluded = excludedFrom.get(assignment.getId());
+            var end = assignment.effectiveEnd();
+            candidates.add(new Candidate(assignment,
+                    excluded != null && excluded.isBefore(end) ? excluded : end,
+                    fileIds));
+        }
+        return new DeviceHistory(List.copyOf(candidates), maxClockSkew, assignmentGrace);
+    }
+
+    private Set<Long> contentFileIdsOf(Long playlistId) {
+        return playlistItemRepository.findByPlaylistIdOrderByPositionAsc(playlistId).stream()
                 .map(PlaylistItem::getContentFile)
                 .filter(Objects::nonNull)
                 .map(ContentFile::getId)
                 .collect(Collectors.toSet());
+    }
+
+    /**
+     * One assignment this device could have been playing, with the instant it stopped applying
+     * <em>to this device</em> — its end, its deletion, or the exclusion that took the device off
+     * it, whichever came first.
+     */
+    private record Candidate(ContentAssignment assignment, Instant appliedUntil, Set<Long> fileIds) {
+
+        /** Live for this device at some instant in {@code [from, to]}. */
+        boolean appliedDuring(Instant from, Instant to, Duration skew) {
+            return assignment.wasLiveDuring(from, to, skew) && appliedUntil.isAfter(from);
+        }
+    }
+
+    /**
+     * The batch's view of what this device was playing, and the rule that attributes one play.
+     *
+     * <p>Why not simply re-resolve at {@code playedAt}: the live resolution path filters
+     * {@code deletedAt IS NULL} and ignores when an exclusion was written, so a play from a
+     * campaign that has since been cancelled, replaced or narrowed would find nothing and be
+     * thrown away — which is the undercount VG-03 is about.
+     */
+    private record DeviceHistory(List<Candidate> candidates, Duration skew, Duration grace) {
+
+        Attribution attribute(Long contentFileId, Instant playedAt) {
+            if (candidates.isEmpty()) {
+                // Nothing ever targeted this device in that span, so there is nothing to check
+                // the play against. Keep it, unattributed — the pre-VG-03 behaviour.
+                return Attribution.unknown();
+            }
+
+            // What the device SHOULD have been playing: the winner among the campaigns live at
+            // that instant, by the same precedence the device itself resolves with.
+            var winner = candidates.stream()
+                    .filter(c -> c.appliedDuring(playedAt, playedAt, skew))
+                    .max(java.util.Comparator.comparing(Candidate::assignment, ContentAssignment.PRECEDENCE));
+            if (winner.isPresent() && winner.get().fileIds().contains(contentFileId)) {
+                return Attribution.of(winner.get().assignment());
+            }
+
+            // Otherwise the device may still have been finishing the previous campaign: it keeps
+            // playing the old content until it has downloaded the new one and reached the shared
+            // cut-over. Credit the campaign that ended most recently and actually held this clip.
+            var fallback = candidates.stream()
+                    .filter(c -> c.fileIds().contains(contentFileId))
+                    .filter(c -> c.appliedDuring(playedAt.minus(grace), playedAt, skew))
+                    .max(java.util.Comparator.comparing(Candidate::appliedUntil)
+                            .thenComparing(Candidate::assignment, ContentAssignment.PRECEDENCE));
+            return fallback.map(c -> Attribution.of(c.assignment())).orElseGet(Attribution::refused);
+        }
+    }
+
+    /**
+     * The outcome for one entry: which campaign to credit, or a refusal. An accepted play with a
+     * null assignment is "kept but unattributed" — the device had no campaign we can check.
+     */
+    private record Attribution(ContentAssignment assignment, boolean rejected) {
+
+        static Attribution of(ContentAssignment assignment) { return new Attribution(assignment, false); }
+
+        static Attribution unknown() { return new Attribution(null, false); }
+
+        static Attribution refused() { return new Attribution(null, true); }
     }
 
     public record PlaybackEntry(Long contentFileId, Instant playedAt, Integer durationSeconds) {}
