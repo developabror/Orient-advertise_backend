@@ -2,7 +2,7 @@
 
 **Audience:** the OrientedTV Android signage client team.
 **Purpose:** everything the device must send, receive, parse, persist and tolerate when it talks to the backend: REST contracts, the WebSocket channel and every frame on it, the MinIO download, timers, limits, failure modes.
-**Backend baseline:** `1.0.156` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.156 in R22–R30 below).
+**Backend baseline:** `1.0.157` (registration rules updated in 1.0.137, see R21; source-IP handling in 1.0.138, §4; device-facing changes 1.0.139–1.0.157 in R22–R31 below). `1.0.157` itself changed nothing a device can observe — it fixed a server-side incident that would not close.
 **How this was verified:** every statement was checked against the backend source. The wire examples were captured from a live run of `1.0.135` (dev profile, real MinIO and Redis, real ffmpeg transcode, a real WebSocket client) on 2026-09-14. Rules marked *(verified)* were exercised end to end in that run.
 
 Where this document disagrees with the older `REGISTER_TO_PLAYBACK_FLOW.md`, or with an earlier revision of this file, **this document wins**. If you built against the previous revision, read the revision notes right below first.
@@ -34,8 +34,9 @@ Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always 
 | R28 | 1.0.153 | **A playlist edit now gets its own `activateAt`, in the future** (at least 2 min, more when the edit adds files to download), instead of reusing the assignment's original anchor whose instant had already passed. Every screen on the assignment switches together at that instant, and the loop restarts from the first item. `/sync` also answers **503 in about 3 s** when object storage hangs, rather than eventually. | **Apply the §7.3 formula to EVERY pending version, edits included**: keep playing the live version until `activateAt`, then switch, and keep the old files until you do. Do not special-case an edit as "switch as soon as confirmed" — that is what pulls one screen out of step with the rest of its site (§7.4). |
 | R29 | 1.0.155 | **`URGENT_CONTENT` is no longer sent at all.** It was broadcast to every connected device in the fleet on an "urgent" upload, carried nothing actionable, and this spec already told you to ignore it. `urgent` now means only what it always did on the server: that file jumps the transcode queue. | Nothing to do. If you kept a branch for this frame you may delete it; unknown frame types must still be ignored (§10), so an old client is unaffected either way. |
 | R30 | 1.0.156 | **A request with no (or an unsupported) `Content-Type` now answers 415**, naming the media type the endpoint consumes, instead of 500. An `Accept` header that excludes JSON answers 406. Separately, an operator group jump is pushed only **after** it is committed, so a member that syncs on the push can no longer read the group's state before the jump is visible and miss it. | Keep sending `Content-Type: application/json` (§1.2) — a 415 is now a clear client-side signal rather than a server error to retry blindly. Treat 415 and 406 as **final**: never retry them unchanged. The jump change needs nothing from the client. |
+| R31 | 1.0.154 | **The bytes of DELETED content are reclaimed** about a week after an operator deletes it (before, they were kept forever). A presigned URL you obtained and never used can therefore 404 — the object is genuinely gone, not temporarily missing. | Treat a download 404 as "my plan is out of date": re-run `/sync` and use the plan it returns. Do **not** delete your other media, do **not** re-register, and do not report it as a device fault. In practice `/sync` will already have told you to delete that file, because content in a live playlist cannot be deleted. |
 
-No other wire change between 1.0.138 and 1.0.156: request/response shapes, auth, timers and limits
+No other wire change between 1.0.138 and 1.0.157: request/response shapes, auth, timers and limits
 are unchanged (the dependency upgrade to Spring Boot 3.5 in 1.0.148 changed nothing on the wire).
 One behaviour change needs no client action but may surprise QA: since 1.0.142, when a short
 "Replace" campaign ends, screens go back to the booking underneath it instead of going blank. This
@@ -660,7 +661,7 @@ Volume stays out of band (heartbeat `desiredVolume`, §5.2). It is not a schedul
 
 ### 7.8 Free-run (no schedule)
 
-When the schedule fields are null, loop `playlistOrder` by `index`, holding each item for `slotDurationMs`. Start at index 0 only on a cold start with no remembered position.
+**Free-run is the only mode there is.** `/sync` carries no schedule fields at all — dayparting windows ("09:00–12:00 daily") exist in the operator database but never affected playback, and since 1.0.141 the UI no longer offers them, so nothing will ever arrive telling you to play only part of the day. Loop `playlistOrder` by `index`, holding each item for `slotDurationMs`. Start at index 0 only on a cold start with no remembered position. If you built a dayparting branch against an older spec, it is dead code — leave it unreachable or remove it, but do not wait for fields that are not coming.
 
 ---
 
