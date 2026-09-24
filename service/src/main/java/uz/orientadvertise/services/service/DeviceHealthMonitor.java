@@ -60,6 +60,7 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
     private final IncidentService incidentService;
     private final DashboardService dashboardService;
     private final DashboardEventBroadcaster dashboardBroadcaster;
+    private final ContentVersionService contentVersionService;
     private final DeviceHealthMonitor self;
 
     public DeviceHealthMonitor(DeviceRepository deviceRepository,
@@ -67,12 +68,14 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
                                 IncidentService incidentService,
                                 DashboardService dashboardService,
                                 DashboardEventBroadcaster dashboardBroadcaster,
+                                ContentVersionService contentVersionService,
                                 @Lazy DeviceHealthMonitor self) {
         this.deviceRepository = deviceRepository;
         this.incidentRepository = incidentRepository;
         this.incidentService = incidentService;
         this.dashboardService = dashboardService;
         this.dashboardBroadcaster = dashboardBroadcaster;
+        this.contentVersionService = contentVersionService;
         this.self = self;
     }
 
@@ -133,19 +136,61 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
         }
 
         int offlineRecovered = resolveRecoveredOffline(heartbeatThreshold);
+        int mismatchRecovered = resolveMismatchWithNoExpectedContent(now);
 
-        log.info("Health check: offline +{} (skipped {}, recovered {}); mismatch +{} (skipped {})",
-                offlineEmitted, offlineSkipped, offlineRecovered, mismatchEmitted, mismatchSkipped);
+        log.info("Health check: offline +{} (skipped {}, recovered {}); mismatch +{} (skipped {}, recovered {})",
+                offlineEmitted, offlineSkipped, offlineRecovered, mismatchEmitted, mismatchSkipped,
+                mismatchRecovered);
 
         // Dashboard summary (FE-11/FE-12) is cached for 30s. The counts derive from
         // device_status_view (live — computed from heartbeat age at query time), so the only
         // staleness is the cache itself; evict here so the next read reflects devices that
         // just crossed offline (or whose incident just closed) rather than waiting up to 30s.
-        if (offlineEmitted + mismatchEmitted + offlineRecovered > 0) {
+        if (offlineEmitted + mismatchEmitted + offlineRecovered + mismatchRecovered > 0) {
             dashboardService.invalidate();
         }
 
         return new HealthCheckResult(offlineEmitted, offlineSkipped, mismatchEmitted, mismatchSkipped);
+    }
+
+    /**
+     * Recovery sweep for mismatches the heartbeat path cannot close (VG-15): a device that was
+     * diverging when its assignment ended, and has not beaten since, keeps its anchor and its open
+     * incident forever. "Recovered" here means the server expects no particular content of it any
+     * more, so there is nothing left to diverge from.
+     *
+     * <p>Only ids are read and each resolve runs in its own transaction, like the offline sweep.
+     * Best-effort: a failure is logged and the health check still returns.
+     */
+    private int resolveMismatchWithNoExpectedContent(Instant now) {
+        int recovered = 0;
+        try {
+            for (Long deviceId : incidentRepository.findDeviceIdsWithOpenIncident(EVENT_CONTENT_MISMATCH)) {
+                try {
+                    if (self.hasNoExpectedContent(deviceId, now)
+                            && incidentService.autoResolveOnRecovery(deviceId, EVENT_CONTENT_MISMATCH)) {
+                        recovered++;
+                    }
+                } catch (Exception e) {
+                    log.warn("Mismatch recovery sweep failed for device {}: {}", deviceId, e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Mismatch recovery sweep failed: {}", e.getMessage());
+        }
+        return recovered;
+    }
+
+    /**
+     * True when no assignment resolves for this device any more. Its own transaction (through the
+     * {@code self} proxy) because resolving an assignment touches lazy associations, and the sweep
+     * above deliberately runs outside one.
+     */
+    @Transactional(readOnly = true)
+    public boolean hasNoExpectedContent(Long deviceId, Instant now) {
+        return deviceRepository.findByIdAndDeletedAtIsNull(deviceId)
+                .map(device -> contentVersionService.computeExpectedVersion(device, now) == null)
+                .orElse(false);
     }
 
     /**
@@ -221,8 +266,13 @@ public class DeviceHealthMonitor implements DeviceHealthChecker {
         return switch (eventType) {
             case EVENT_OFFLINE -> device.getLastHeartbeatAt() != null
                     && device.getLastHeartbeatAt().isBefore(now.minus(HEARTBEAT_THRESHOLD));
+            // VG-15: the anchor alone is not enough. A device that was mismatched when its
+            // assignment lapsed keeps the anchor (it may never heartbeat again to clear it), and
+            // escalating on it means raising — or re-raising, after an operator resolved it by hand
+            // — an incident about content the server no longer expects the device to have.
             case EVENT_CONTENT_MISMATCH -> device.getContentMismatchSince() != null
-                    && device.getContentMismatchSince().isBefore(now.minus(CONTENT_MISMATCH_THRESHOLD));
+                    && device.getContentMismatchSince().isBefore(now.minus(CONTENT_MISMATCH_THRESHOLD))
+                    && contentVersionService.computeExpectedVersion(device, now) != null;
             default -> false;
         };
     }

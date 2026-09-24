@@ -49,6 +49,17 @@ public interface IncidentRepository extends JpaRepository<Incident, Long> {
             @Param("eventType") String eventType,
             @Param("threshold") Instant threshold);
 
+    /**
+     * Ids of devices with an open {@code eventType} incident, whatever their heartbeat. Used by the
+     * mismatch sweep, whose recovery condition is "no content is expected any more" rather than
+     * anything about the heartbeat — the device may well never beat again (VG-15). Scalar ids for
+     * the same reason as above: the caller runs outside a transaction.
+     */
+    @Query("SELECT DISTINCT i.device.id FROM Incident i "
+           + "WHERE i.eventType = :eventType AND i.status <> 'RESOLVED' "
+           + "AND i.device.deletedAt IS NULL")
+    List<Long> findDeviceIdsWithOpenIncident(@Param("eventType") String eventType);
+
     List<Incident> findByDeviceIdOrderByUpdatedAtDesc(Long deviceId);
 
     /**

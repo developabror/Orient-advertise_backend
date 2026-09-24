@@ -219,6 +219,16 @@ public class DeviceHeartbeatService {
             if (wasMismatched && !mismatch) {
                 resolveIncidentTypes.add(DeviceHealthMonitor.EVENT_CONTENT_MISMATCH);
             }
+        } else if (device.getContentMismatchSince() != null) {
+            // VG-15: nothing is expected of this device any more — its campaign ended, or the
+            // assignment was cancelled. There is nothing left to diverge FROM, so the anchor has to
+            // go and any open incident with it. This branch used to be missing entirely: the whole
+            // block was gated on expectedVersion, so a device that was mismatched when its
+            // assignment lapsed kept the anchor forever. The incident stayed open, and because
+            // DeviceHealthMonitor re-checks the same anchor it would escalate again after an
+            // operator resolved it by hand.
+            device.recordContentMismatch(false);
+            resolveIncidentTypes.add(DeviceHealthMonitor.EVENT_CONTENT_MISMATCH);
         }
 
         // A device must sync when its content is stale (version mismatch) OR when an

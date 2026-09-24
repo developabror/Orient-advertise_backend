@@ -36,6 +36,7 @@ class DeviceHealthMonitorTest {
     private IncidentService incidentService;
     private DashboardService dashboardService;
     private DashboardEventBroadcaster dashboardBroadcaster;
+    private ContentVersionService contentVersionService;
     private DeviceHealthMonitor monitor;
 
     @BeforeEach
@@ -45,8 +46,12 @@ class DeviceHealthMonitorTest {
         incidentService = mock(IncidentService.class);
         dashboardService = mock(DashboardService.class);
         dashboardBroadcaster = mock(DashboardEventBroadcaster.class);
+        contentVersionService = mock(ContentVersionService.class);
+        // Default: the device still has content assigned, so a mismatch is a real divergence.
+        // VG-15 is the opposite case, and the tests for it stub this to null.
+        when(contentVersionService.computeExpectedVersion(any(), any())).thenReturn("v-expected");
         monitor = new DeviceHealthMonitor(deviceRepository, incidentRepository,
-                incidentService, dashboardService, dashboardBroadcaster, null);
+                incidentService, dashboardService, dashboardBroadcaster, contentVersionService, null);
         // Self-reference for the @Transactional(REQUIRES_NEW) escalate indirection. The unit
         // test points it at the same instance — that the proxy IS used is what
         // DeviceMonitorTransactionIntegrationTest proves against the real transaction manager.
@@ -101,6 +106,60 @@ class DeviceHealthMonitorTest {
         verify(incidentService).processEvent(captor.capture());
         assertEquals("CONTENT_VERSION_MISMATCH", captor.getValue().getEventType());
         assertEquals(Event.Priority.MEDIUM, captor.getValue().getPriority());
+    }
+
+    @Test
+    void staleMismatchButNoContentExpected_isNotEscalated() {
+        // VG-15. The device stopped beating while diverging and its assignment has since ended, so
+        // the anchor is still set but the server expects nothing of it. Escalating here raises an
+        // incident about content that is not assigned — and, since the anchor never clears, raises
+        // it again after an operator resolves it by hand.
+        Device d = mismatchDevice(20L, Duration.ofMinutes(45));
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of(d));
+        when(deviceRepository.findById(20L)).thenReturn(Optional.of(d));
+        when(incidentRepository.existsOpenByDeviceAndEventType(eq(20L), eq("CONTENT_VERSION_MISMATCH")))
+                .thenReturn(false);
+        when(contentVersionService.computeExpectedVersion(any(), any())).thenReturn(null);
+
+        var result = monitor.runHealthCheck();
+
+        assertEquals(0, result.mismatchEmitted());
+        assertEquals(1, result.mismatchSkipped());
+        verify(incidentService, never()).processEvent(any());
+    }
+
+    @Test
+    void openMismatchIncident_isClosedOnceNoContentIsExpected() {
+        // The other half of VG-15: a device that will never beat again cannot clear its own anchor,
+        // so the sweep closes the incident instead of leaving it open forever.
+        Device d = mismatchDevice(21L, Duration.ofMinutes(45));
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(incidentRepository.findDeviceIdsWithOpenIncident("CONTENT_VERSION_MISMATCH"))
+                .thenReturn(List.of(21L));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(21L)).thenReturn(Optional.of(d));
+        when(contentVersionService.computeExpectedVersion(any(), any())).thenReturn(null);
+        when(incidentService.autoResolveOnRecovery(21L, "CONTENT_VERSION_MISMATCH")).thenReturn(true);
+
+        monitor.runHealthCheck();
+
+        verify(incidentService).autoResolveOnRecovery(21L, "CONTENT_VERSION_MISMATCH");
+    }
+
+    @Test
+    void openMismatchIncident_staysOpenWhileContentIsStillExpected() {
+        // Negative: a device that really is diverging from assigned content keeps its incident.
+        Device d = mismatchDevice(22L, Duration.ofMinutes(45));
+        when(deviceRepository.findRegisteredWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(deviceRepository.findRegisteredWithStaleContentMismatch(any())).thenReturn(List.of());
+        when(incidentRepository.findDeviceIdsWithOpenIncident("CONTENT_VERSION_MISMATCH"))
+                .thenReturn(List.of(22L));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(22L)).thenReturn(Optional.of(d));
+
+        monitor.runHealthCheck();
+
+        verify(incidentService, never()).autoResolveOnRecovery(eq(22L), any());
     }
 
     @Test

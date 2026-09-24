@@ -428,6 +428,44 @@ class DeviceHeartbeatServiceTest {
     }
 
     @Test
+    void heartbeat_assignmentEndedWhileMismatched_clearsTheAnchorAndClosesTheIncident() {
+        // VG-15. The campaign ended (expected == null) while this device was still diverging. There
+        // is nothing left to diverge FROM, so the anchor must go and the incident with it. The whole
+        // mismatch block used to be gated on expected != null, so neither happened: the incident
+        // stayed open, and the health monitor — which re-checks the same anchor — would escalate it
+        // again after an operator resolved it by hand.
+        var device = mockDevice(30L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(device.getContentMismatchSince()).thenReturn(Instant.now().minus(2, ChronoUnit.HOURS));
+        when(deviceRepository.findByIdAndDeletedAtIsNull(30L)).thenReturn(Optional.of(device));
+        when(remoteActionRepository.findPendingByDevice(30L)).thenReturn(List.of());
+        when(contentVersionService.computeExpectedVersion(any(), any())).thenReturn(null);
+
+        var result = service.processHeartbeat(30L, "v-stale");
+
+        verify(device).recordContentMismatch(false);
+        assertTrue(result.resolveIncidentTypes().contains(DeviceHealthMonitor.EVENT_CONTENT_MISMATCH),
+                "an incident about content nobody expects any more has to close");
+        org.junit.jupiter.api.Assertions.assertFalse(result.syncRequired(),
+                "there is nothing to sync when no content is assigned");
+    }
+
+    @Test
+    void heartbeat_noContentAssignedAndNeverMismatched_writesNothing() {
+        // The common case for an unassigned device: no anchor to clear, so the row is not touched
+        // and no incident resolution is queued on every single beat.
+        var device = mockDevice(31L, Device.Status.ONLINE, Instant.now().minus(30, ChronoUnit.SECONDS));
+        when(device.getContentMismatchSince()).thenReturn(null);
+        when(deviceRepository.findByIdAndDeletedAtIsNull(31L)).thenReturn(Optional.of(device));
+        when(remoteActionRepository.findPendingByDevice(31L)).thenReturn(List.of());
+        when(contentVersionService.computeExpectedVersion(any(), any())).thenReturn(null);
+
+        var result = service.processHeartbeat(31L, null);
+
+        verify(device, never()).recordContentMismatch(anyBoolean());
+        assertTrue(result.resolveIncidentTypes().isEmpty());
+    }
+
+    @Test
     void heartbeat_blankReportedVersion_treatedAsNull_syncRequired() {
         // A blank reported version is normalized to null and must behave identically: sync
         // required when content is assigned, and the blank is never persisted as the version.

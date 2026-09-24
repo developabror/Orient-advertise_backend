@@ -4,7 +4,7 @@ Multi-module Spring Boot application with strict architectural layering enforced
 
 ## Version
 
-`1.0.156`
+`1.0.157`
 
 ## Architecture
 
@@ -1302,6 +1302,35 @@ The role split is enforced because the device-side endpoint can't carry a user J
 - **Unknown deviceId → 404 even for ADMIN.** The device-existence check fires before any range/page validation. Probing `400`/`403` cannot enumerate live device ids — only authenticated, authorized callers see whether a given id resolves.
 - **Date range > 90 days → 400.** Hard cap. Operators slicing audit trails do it in 90-day windows. Range exactly 90 days is allowed.
 - **`from > to` → 400.** Silent swap would mask a caller bug.
+
+### A content-mismatch incident closes when the campaign it was about ends (v1.0.157)
+
+> **VG-15 (review LOGIC-13).** The heartbeat's whole mismatch block was gated on
+> `expectedVersion != null`. When a device was diverging and its assignment then ended — the window
+> closed, or an operator cancelled it — the branch was skipped entirely: `content_mismatch_since`
+> stayed anchored forever, the open `CONTENT_VERSION_MISMATCH` incident never closed, and because
+> `DeviceHealthMonitor` re-checks that same anchor it would **escalate again after an operator
+> resolved it by hand**. An incident list operators are meant to work through kept an entry about
+> content the server no longer expects anybody to hold.
+
+**What changed**
+
+- **The heartbeat** now handles "nothing is expected": if the device has a mismatch anchor and the
+  expected version is null, the anchor is cleared and the incident queued for resolution (after
+  commit, like every other resolution on that path). A device that never had an anchor is not
+  written at all, so an unassigned device's beat still costs nothing.
+- **The monitor** no longer escalates on the anchor alone: `stillMatches` also requires that content
+  is still expected. That is what stops the re-escalation after a manual resolve.
+- **A recovery sweep** closes the incidents the heartbeat cannot reach — a device that stopped
+  beating while diverging will never clear its own anchor, so `resolveMismatchWithNoExpectedContent`
+  resolves those in their own transactions, mirroring the offline recovery sweep next to it. The
+  health-check log line now reports mismatch recoveries too.
+
+**Tests:** `DeviceHeartbeatServiceTest` (+2: the anchor and incident clear when the assignment ends;
+an unassigned device with no anchor is untouched), `DeviceHealthMonitorTest` (+3: a stale mismatch
+with no expected content is skipped, its open incident is swept closed, and one that is still
+diverging keeps its incident). Mutation-checked: restoring the old gate fails one heartbeat test, and
+dropping the monitor guard and sweep fails two.
 
 ### A group jump reaches its members, and a missing Content-Type is a 415 (v1.0.156)
 
