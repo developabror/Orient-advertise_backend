@@ -13,6 +13,16 @@ Conventions: **MUST / MUST NOT / SHOULD / MAY** are normative. `{id}` is always 
 
 ## What changed for the device since backend 1.0.138 (read this first)
 
+> **Coming from a copy older than 1.0.138?** Three earlier changes are not in this table because they
+> predate it, and they matter at least as much as anything below:
+> **(a) 1.0.137 — re-registering an already-registered serial is refused with `409`** unless an admin
+> opened a window for that device: on 409 keep your media and back off, never treat it as terminal
+> (R7, R21, §2). Serial and name limits now answer **400**, not 500, and the serial must match
+> `^[A-Za-z0-9][A-Za-z0-9._:-]*$`. **(b) 1.0.137 — two boxes sharing a serial no longer evict each
+> other**; the second gets 409 for as long as the first holds it (§2). **(c) 1.0.138 — the source IP
+> for rate limiting is the one the proxy sees**; an `X-Forwarded-For` you send yourself is ignored,
+> and re-registration attempts have their own budget of 60/hour per IP (§4).
+
 | # | Since | Change | Client action |
 |---|---|---|---|
 | R22 | 1.0.144 | `/sync` answers **503** when object storage is unreachable, instead of a plan with the unreachable files silently missing. | Treat it like any 5xx: keep playing cached content, **do not** apply it as "no content" and **do not** delete files, retry with backoff (§1.6, §6.2). |
